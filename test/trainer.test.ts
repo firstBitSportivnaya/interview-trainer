@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
-import { openTrainer, type OpenSessionResult } from "../src/trainer.ts";
+import { ModelFailure, type ModelCall, type ModelPort } from "../src/model.ts";
+import { openTrainer, type OpenSessionResult, type SpeechEvent } from "../src/trainer.ts";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -15,10 +16,34 @@ function tempDirectory(): string {
   return directory;
 }
 
-function start(directory = tempDirectory()) {
-  const trainer = openTrainer(directory);
+function start(directory = tempDirectory(), model?: ModelPort) {
+  const trainer = openTrainer(directory, model);
   opened.push(trainer);
   return trainer;
+}
+
+async function take(events: AsyncIterable<SpeechEvent>): Promise<SpeechEvent[]> {
+  const list: SpeechEvent[] = [];
+  for await (const event of events) {
+    list.push(event);
+  }
+  return list;
+}
+
+function remember(calls: ModelCall[]): ModelPort {
+  return {
+    async *complete(call) {
+      calls.push({
+        protocol: call.protocol,
+        baseAddress: call.baseAddress,
+        modelName: call.modelName,
+        secret: call.secret,
+        messages: call.messages.map((message) => ({ role: message.role, text: message.text })),
+      });
+      yield "Срок ";
+      yield "— июнь.";
+    },
+  };
 }
 
 after(() => {
@@ -682,4 +707,155 @@ test("сессия другой тройки создаётся", () => {
       },
     ],
   );
+});
+
+test("сессия зовёт модель тем ключом, которым её открыли", async () => {
+  const calls: ModelCall[] = [];
+  const directory = tempDirectory();
+  const trainer = start(directory, remember(calls));
+  const prepared = prepare(trainer);
+  assert.deepEqual(
+    trainer.saveKey({
+      protocol: "openai-compatible",
+      baseAddress: "https://api.deepseek.com",
+      modelName: "deepseek-chat",
+      secret: "sk-deepseek-secret-9876",
+    }),
+    { ok: true },
+  );
+  const openaiId = trainer.listKeys()[1]?.id;
+  assert.ok(openaiId);
+
+  const openedSession = openAnalyst(trainer, prepared);
+  assert.ok(openedSession.ok);
+  const other = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: prepared.dossierId,
+    side: "заказчик",
+    character: "заказчик",
+    role: "разработчик",
+    executorId: "владелец",
+    keyId: openaiId,
+  });
+  assert.ok(other.ok);
+
+  assert.deepEqual(await take(trainer.reply(openedSession.session.id, "Какой срок поставки?")), [
+    { kind: "speech", text: "Срок " },
+    { kind: "speech", text: "— июнь." },
+  ]);
+  assert.deepEqual(calls[0], {
+    protocol: "anthropic",
+    baseAddress: "https://api.anthropic.com",
+    modelName: "claude-sonnet",
+    secret: keyDraft.secret,
+    messages: [{ role: "user", text: "Какой срок поставки?" }],
+  });
+
+  await take(trainer.reply(other.session.id, "Где расчёт?"));
+  assert.deepEqual(calls[1], {
+    protocol: "openai-compatible",
+    baseAddress: "https://api.deepseek.com",
+    modelName: "deepseek-chat",
+    secret: "sk-deepseek-secret-9876",
+    messages: [{ role: "user", text: "Где расчёт?" }],
+  });
+
+  trainer.close();
+  const restartedCalls: ModelCall[] = [];
+  const restarted = start(directory, remember(restartedCalls));
+  assert.deepEqual(await take(restarted.reply(openedSession.session.id, "Какой срок поставки?")), [
+    { kind: "speech", text: "Срок " },
+    { kind: "speech", text: "— июнь." },
+  ]);
+  assert.deepEqual(restartedCalls[0], {
+    protocol: "anthropic",
+    baseAddress: "https://api.anthropic.com",
+    modelName: "claude-sonnet",
+    secret: keyDraft.secret,
+    messages: [{ role: "user", text: "Какой срок поставки?" }],
+  });
+});
+
+test("речь модели приходит потоком, не дожидаясь конца ответа", async () => {
+  let finished = false;
+  const trainer = start(tempDirectory(), {
+    async *complete() {
+      yield "Срок ";
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      finished = true;
+      yield "— июнь.";
+    },
+  });
+  const prepared = prepare(trainer);
+  const openedSession = openAnalyst(trainer, prepared);
+  assert.ok(openedSession.ok);
+
+  const iterator = trainer.reply(openedSession.session.id, "Какой срок поставки?")[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  assert.equal(finished, false);
+  assert.deepEqual(first.value, { kind: "speech", text: "Срок " });
+  const second = await iterator.next();
+  assert.equal(finished, true);
+  assert.deepEqual(second.value, { kind: "speech", text: "— июнь." });
+  await iterator.return?.();
+});
+
+test("обрыв чтения отменяет вызов модели", async () => {
+  let signal: AbortSignal | undefined;
+  const trainer = start(tempDirectory(), {
+    async *complete(_call, incoming) {
+      signal = incoming;
+      yield "Срок ";
+      await new Promise<void>((resolve) => {
+        if (incoming.aborted) {
+          resolve();
+          return;
+        }
+        incoming.addEventListener("abort", () => resolve(), { once: true });
+      });
+    },
+  });
+  const prepared = prepare(trainer);
+  const openedSession = openAnalyst(trainer, prepared);
+  assert.ok(openedSession.ok);
+
+  const iterator = trainer.reply(openedSession.session.id, "Какой срок поставки?")[Symbol.asyncIterator]();
+  assert.deepEqual((await iterator.next()).value, { kind: "speech", text: "Срок " });
+  await iterator.return?.();
+  assert.equal(signal?.aborted, true);
+});
+
+test("таймаут и ошибка модели не становятся речью", async () => {
+  const calls: string[] = [];
+  const trainer = start(tempDirectory(), {
+    async *complete(call) {
+      const line = call.messages[0]?.text ?? "";
+      calls.push(line);
+      if (line === "таймаут") {
+        throw new ModelFailure("timeout");
+      }
+      if (line === "сбой") {
+        yield "Срок ";
+        throw new Error("внутренний сбой поставщика");
+      }
+      yield "речь";
+    },
+  });
+  const prepared = prepare(trainer);
+  const openedSession = openAnalyst(trainer, prepared);
+  assert.ok(openedSession.ok);
+
+  assert.deepEqual(await take(trainer.reply(openedSession.session.id, "таймаут")), [
+    { kind: "failure", reason: "timeout", message: "Модель не ответила вовремя." },
+  ]);
+  const failed = await take(trainer.reply(openedSession.session.id, "сбой"));
+  assert.deepEqual(failed, [
+    { kind: "speech", text: "Срок " },
+    { kind: "failure", reason: "model", message: "Модель вернула ошибку." },
+  ]);
+  assert.equal(JSON.stringify(failed).includes("внутренний сбой поставщика"), false);
+  assert.deepEqual(await take(trainer.reply("нет-такой-сессии", "вопрос")), [
+    { kind: "failure", reason: "missing", message: "Сессия не найдена." },
+  ]);
+  assert.deepEqual(calls, ["таймаут", "сбой"]);
 });
