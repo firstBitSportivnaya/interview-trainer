@@ -109,6 +109,15 @@ function redirect(response: ServerResponse, location: string): void {
   response.end();
 }
 
+/** Страницу открывают только с этого компьютера, по адресу, который реально слушает сервер. */
+function allowsHost(host: string | string[] | undefined, port: number): boolean {
+  if (typeof host !== "string") {
+    return false;
+  }
+  const value = host.trim().toLowerCase();
+  return value === `127.0.0.1:${port}` || value === `localhost:${port}`;
+}
+
 /** Свой Origin и запрос без Origin проходят. Чужой Origin ключ не записывает. */
 function allowsKeyPost(origin: string | string[] | undefined, port: number): boolean {
   if (origin === undefined) {
@@ -131,8 +140,17 @@ function allowsKeyPost(origin: string | string[] | undefined, port: number): boo
   );
 }
 
-/** Отвечает на страницу ключей и на сохранение. Чужой Origin и сбой записи не роняют процесс. */
+/** Отвечает на страницу ключей и на сохранение. Чужой Host, чужой Origin и сбой записи не открывают ключи. */
 async function handle(server: Server, trainer: Trainer, request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const address = server.address();
+  const listenPort = address && typeof address === "object" ? address.port : undefined;
+  if (listenPort === undefined || !allowsHost(request.headers.host, listenPort)) {
+    request.resume();
+    response.writeHead(403);
+    response.end();
+    return;
+  }
+
   const url = new URL(request.url ?? "/", "http://127.0.0.1");
 
   if (request.method === "GET" && url.pathname === "/") {
@@ -143,9 +161,7 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
   }
 
   if (request.method === "POST" && url.pathname === "/keys") {
-    const address = server.address();
-    const listenPort = address && typeof address === "object" ? address.port : undefined;
-    if (listenPort === undefined || !allowsKeyPost(request.headers.origin, listenPort)) {
+    if (!allowsKeyPost(request.headers.origin, listenPort)) {
       request.resume();
       response.writeHead(403);
       response.end();

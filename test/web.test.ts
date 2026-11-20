@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import type { AddressInfo } from "node:net";
-import type { Server } from "node:http";
+import { request as httpRequest, type Server } from "node:http";
 
 import { openTrainer } from "../src/trainer.ts";
 import { startWeb } from "../src/web.ts";
@@ -22,6 +22,35 @@ after(() => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+function statusWithHost(url: string, host: string, method: string, body?: string): Promise<number> {
+  const target = new URL(url);
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        hostname: target.hostname,
+        port: target.port,
+        path: target.pathname,
+        method,
+        headers: {
+          host,
+          ...(body === undefined
+            ? {}
+            : {
+                "content-type": "application/x-www-form-urlencoded",
+                "content-length": Buffer.byteLength(body),
+              }),
+        },
+      },
+      (response) => {
+        response.resume();
+        resolve(response.statusCode ?? 0);
+      },
+    );
+    req.on("error", reject);
+    req.end(body);
+  });
+}
 
 async function close(server: Server): Promise<void> {
   await new Promise<void>((resolve, reject) => {
@@ -169,6 +198,34 @@ test("чужая страница не сохраняет ключ, своя с�
       body,
     });
     assert.equal(own.status, 200);
+    assert.equal(trainer.listKeys().length, 1);
+  } finally {
+    await close(server);
+  }
+});
+
+test("чужой Host не открывает страницу и не сохраняет ключ", async () => {
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const body = new URLSearchParams({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-WXYZ",
+    }).toString();
+
+    assert.equal(await statusWithHost(base, `evil.example:${address.port}`, "GET"), 403);
+    assert.equal(await statusWithHost(`${base}/keys`, `evil.example:${address.port}`, "POST", body), 403);
+    assert.equal(await statusWithHost(base, `127.0.0.1:1`, "GET"), 403);
+    assert.equal(trainer.listKeys().length, 0);
+
+    assert.equal(await statusWithHost(base, `127.0.0.1:${address.port}`, "GET"), 200);
+    assert.equal(await statusWithHost(`${base}/keys`, `localhost:${address.port}`, "POST", body), 303);
     assert.equal(trainer.listKeys().length, 1);
   } finally {
     await close(server);
