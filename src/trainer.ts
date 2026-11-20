@@ -3,6 +3,8 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync 
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { join } from "node:path";
 
+import { liveModel, ModelFailure, type ModelPort } from "./model.ts";
+
 /** Протокол ключа: родной Anthropic или совместимый с OpenAI. */
 export type Protocol = "anthropic" | "openai-compatible";
 
@@ -96,6 +98,11 @@ export type SessionDraft = {
   keyId: string;
 };
 
+/** Речь модели или отказ, который владельцу виден отдельно от речи. */
+export type SpeechEvent =
+  | { kind: "speech"; text: string }
+  | { kind: "failure"; reason: "timeout" | "model" | "missing"; message: string };
+
 /** Отказ открыть сессию: тройка уже открыта, записи нет или поле не из каталога. */
 export type OpenSessionResult =
   | { ok: true; session: SessionRecord }
@@ -131,6 +138,12 @@ type StoredKey = {
 };
 
 type Row = Record<string, SQLOutputValue>;
+
+const FAILURE_MESSAGE = {
+  timeout: "Модель не ответила вовремя.",
+  model: "Модель вернула ошибку.",
+  missing: "Сессия не найдена.",
+} as const;
 
 const LEGACY_KEYS = "keys.json";
 /** Снимок keys.json, уже снятый с пути, куда пишет прежний процесс. */
@@ -480,8 +493,9 @@ function readSessionRecord(row: Row): SessionRecord {
  * Список ключей секрет целиком не отдаёт. Одна открытая сессия на тройку
  * «дело + роль исполнителя + исполнитель» держится уникальным индексом.
  * Прежний процесс, который пишет keys.json, нужно остановить до этого запуска.
+ * Модель приходит портом: проверка подставляет записанную, запуск — живую.
  */
-export function openTrainer(directory: string) {
+export function openTrainer(directory: string, model: ModelPort = liveModel()) {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   chmodSync(directory, 0o700);
 
@@ -519,6 +533,20 @@ export function openTrainer(directory: string) {
       executorId,
       notes: rows.map((row) => textColumn(row, "note")),
     };
+  }
+
+  function loadSession(sessionId: string): SessionRecord | undefined {
+    const row = database.prepare(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE id = ?`).get(sessionId) as
+      | Row
+      | undefined;
+    return row ? readSessionRecord(row) : undefined;
+  }
+
+  function loadKey(keyId: string): StoredKey | undefined {
+    const row = database
+      .prepare("SELECT id, protocol, base_address, model_name, secret FROM keys WHERE id = ?")
+      .get(keyId) as Row | undefined;
+    return row ? readStoredKey(row, databaseFile) : undefined;
   }
 
   let closed = false;
@@ -689,12 +717,43 @@ export function openTrainer(directory: string) {
 
     /** Возвращает сессию. Нет идентификатора — сессии нет. */
     readSession(sessionId: string): SessionRecord | undefined {
-      const row = database
-        .prepare(
-          `SELECT ${SESSION_COLUMNS} FROM sessions WHERE id = ?`,
-        )
-        .get(sessionId) as Row | undefined;
-      return row ? readSessionRecord(row) : undefined;
+      return loadSession(sessionId);
+    },
+
+    /**
+     * Зовёт модель ключом, которым открыта сессия.
+     * Речь приходит кусками. Ошибка модели в речь не подмешивается.
+     */
+    async *reply(sessionId: string, line: string): AsyncIterable<SpeechEvent> {
+      const session = loadSession(sessionId);
+      const key = session ? loadKey(session.keyId) : undefined;
+      if (!session || !key) {
+        yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
+        return;
+      }
+
+      const controller = new AbortController();
+      try {
+        for await (const text of model.complete(
+          {
+            protocol: key.protocol,
+            baseAddress: key.baseAddress,
+            modelName: key.modelName,
+            secret: key.secret,
+            messages: [{ role: "user", text: line }],
+          },
+          controller.signal,
+        )) {
+          if (text) {
+            yield { kind: "speech", text };
+          }
+        }
+      } catch (error) {
+        const reason = error instanceof ModelFailure ? error.reason : "model";
+        yield { kind: "failure", reason, message: FAILURE_MESSAGE[reason] };
+      } finally {
+        controller.abort();
+      }
     },
 
     /** Возвращает открытые сессии в порядке открытия. */
