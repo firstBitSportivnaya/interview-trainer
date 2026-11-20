@@ -82,6 +82,29 @@ export type DossierLayers = {
   crib: string;
 };
 
+/** Имя слоя, которое владелец назначает файлу. Ядро другое имя слоем не считает. */
+export const DOSSIER_LAYER_NAMES = ["material", "serviceLayer", "crib"] as const;
+
+/** Слой файла проекта: материал проекта, служебный слой или шпаргалка проекта. */
+export type DossierLayerName = (typeof DOSSIER_LAYER_NAMES)[number];
+
+/**
+ * Файл проекта с уже извлечённым текстом.
+ * Слой записан так, как его назвал владелец. Имя файла слой не задаёт.
+ */
+export type SourceFileRecord = {
+  id: string;
+  caseId: string;
+  name: string;
+  layer: DossierLayerName;
+  extractedText: string;
+};
+
+/** Отказ записать файл: слоя нет в каталоге, поля пустые или проекта нет. */
+export type AddSourceFileResult =
+  | { ok: true; file: SourceFileRecord }
+  | { ok: false; reason: "layer" | "incomplete" | "missing" };
+
 /** Отказ собрать черновик. Текст модели в отказ не входит. */
 export type DraftDossierResult =
   | { ok: true; draft: DossierLayers }
@@ -272,6 +295,17 @@ function schemaSql(): string {
       crib TEXT NOT NULL
     ) STRICT;
 
+    CREATE TABLE IF NOT EXISTS source_files (
+      id TEXT PRIMARY KEY,
+      case_id TEXT NOT NULL REFERENCES cases(id),
+      name TEXT NOT NULL,
+      layer TEXT NOT NULL CHECK (layer IN ('material', 'serviceLayer', 'crib')),
+      extracted_text TEXT NOT NULL
+    ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS source_files_case
+      ON source_files(case_id);
+
     CREATE TABLE IF NOT EXISTS keys (
       id TEXT PRIMARY KEY,
       protocol TEXT NOT NULL,
@@ -333,6 +367,10 @@ function isPerformerRole(value: string): value is PerformerRole {
 
 function isSide(value: string): value is Side {
   return (SIDES as readonly string[]).includes(value);
+}
+
+function isDossierLayer(value: string): value is DossierLayerName {
+  return (DOSSIER_LAYER_NAMES as readonly string[]).includes(value);
 }
 
 function secretPreview(secret: string): string {
@@ -423,6 +461,27 @@ function ensureCaseShape(database: DatabaseSync): void {
   if (!names.has("portfolio_sent")) {
     database.exec("ALTER TABLE cases ADD COLUMN portfolio_sent INTEGER NOT NULL DEFAULT 0");
   }
+}
+
+/**
+ * Кладёт извлечённый текст в слой, который назвал владелец.
+ * Пустой список файлов оставляет вставленный текст как есть.
+ */
+function composeLayers(pasted: DossierLayers, files: readonly SourceFileRecord[]): DossierLayers {
+  const text = (layer: DossierLayerName, pastedText: string): string => {
+    const parts = [pastedText];
+    for (const file of files) {
+      if (file.layer === layer && file.extractedText) {
+        parts.push(file.extractedText);
+      }
+    }
+    return parts.filter((part) => part.length > 0).join("\n\n");
+  };
+  return {
+    material: text("material", pasted.material),
+    serviceLayer: text("serviceLayer", pasted.serviceLayer),
+    crib: text("crib", pasted.crib),
+  };
 }
 
 /** Просит модель разложить вставленные тексты по слоям и вернуть только JSON. */
@@ -737,6 +796,20 @@ function readDossierRecord(row: Row): DossierRecord {
   };
 }
 
+function readSourceFileRecord(row: Row): SourceFileRecord {
+  const layer = textColumn(row, "layer");
+  if (!isDossierLayer(layer)) {
+    throw new Error("Запись хранилища повреждена");
+  }
+  return {
+    id: textColumn(row, "id"),
+    caseId: textColumn(row, "case_id"),
+    name: textColumn(row, "name"),
+    layer,
+    extractedText: textColumn(row, "extracted_text"),
+  };
+}
+
 function readSessionRecord(row: Row): SessionRecord {
   const role = textColumn(row, "role");
   const side = textColumn(row, "side");
@@ -759,7 +832,7 @@ function readSessionRecord(row: Row): SessionRecord {
 
 /**
  * Ядро одного владельца.
- * Каталог — хранилище на этой машине: заказчики, проекты, профиль, досье, сессии, ход подготовки и ключи.
+ * Каталог — хранилище на этой машине: заказчики, проекты, файлы проекта, профиль, досье, сессии, ход подготовки и ключи.
  * Список ключей секрет целиком не отдаёт. Секрет в хранилище свёрнут средствами ОС.
  * Одна открытая сессия на тройку
  * «проект + роль исполнителя + исполнитель» держится уникальным индексом.
@@ -863,6 +936,16 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       return { unreadable: true };
     }
     return { key: { ...stored, secret } };
+  }
+
+  function loadSourceFiles(caseId: string): SourceFileRecord[] {
+    const rows = database
+      .prepare(
+        `SELECT id, case_id, name, layer, extracted_text
+         FROM source_files WHERE case_id = ? ORDER BY rowid`,
+      )
+      .all(caseId) as Row[];
+    return rows.map((row) => readSourceFileRecord(row));
   }
 
   function loadDossier(dossierId: string): DossierRecord | undefined {
@@ -1159,17 +1242,66 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     },
 
     /**
-     * Собирает черновик из вставленных текстов слоёв выбранным ключом.
+     * Записывает файл проекта в названный слой.
+     * Пустой или чужой слой файлом не становится: ядро слой по имени файла не выбирает.
+     * Запись не меняет утверждённое досье и сессию не открывает.
+     */
+    addSourceFile(draft: {
+      caseId: string;
+      name: string;
+      layer: string;
+      extractedText: string;
+    }): AddSourceFileResult {
+      const layer = draft.layer.trim();
+      if (!isDossierLayer(layer)) {
+        return { ok: false, reason: "layer" };
+      }
+      const caseId = draft.caseId.trim();
+      const name = draft.name.trim();
+      const extractedText = draft.extractedText.trim();
+      if (!caseId || !name || !extractedText) {
+        return { ok: false, reason: "incomplete" };
+      }
+      if (!caseExists(caseId)) {
+        return { ok: false, reason: "missing" };
+      }
+      const file: SourceFileRecord = {
+        id: randomUUID(),
+        caseId,
+        name,
+        layer,
+        extractedText,
+      };
+      database
+        .prepare("INSERT INTO source_files (id, case_id, name, layer, extracted_text) VALUES (?, ?, ?, ?, ?)")
+        .run(file.id, file.caseId, file.name, file.layer, file.extractedText);
+      return { ok: true, file };
+    },
+
+    /** Возвращает файлы проекта в порядке записи. Нет проекта — списка нет. */
+    listSourceFiles(caseId: string): SourceFileRecord[] {
+      if (!caseExists(caseId)) {
+        return [];
+      }
+      return loadSourceFiles(caseId);
+    },
+
+    /**
+     * Собирает черновик из вставленных текстов и файлов проекта выбранным ключом.
+     * Текст файла входит только в слой, который назвал владелец.
      * Черновик не записывается и сессию не открывает: в диалог он попадёт только после правки и утверждения.
      */
     async draftDossier(draft: { caseId: string; keyId: string } & DossierLayers): Promise<DraftDossierResult> {
       const caseId = draft.caseId.trim();
       const keyId = draft.keyId.trim();
-      const layers: DossierLayers = {
-        material: draft.material.trim(),
-        serviceLayer: draft.serviceLayer.trim(),
-        crib: draft.crib.trim(),
-      };
+      const layers = composeLayers(
+        {
+          material: draft.material.trim(),
+          serviceLayer: draft.serviceLayer.trim(),
+          crib: draft.crib.trim(),
+        },
+        caseId ? loadSourceFiles(caseId) : [],
+      );
       if (!caseId || !keyId || (!layers.material && !layers.serviceLayer && !layers.crib)) {
         return { ok: false, reason: "incomplete" };
       }

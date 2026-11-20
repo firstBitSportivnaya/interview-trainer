@@ -7,6 +7,8 @@ import {
   type ApproveDossierResult,
   type CaseRecord,
   type CustomerRecord,
+  type AddSourceFileResult,
+  type DossierLayerName,
   type DossierLayers,
   type DossierRecord,
   type DraftDossierResult,
@@ -17,6 +19,7 @@ import {
   type SaveCaseResult,
   type SaveKeyResult,
   type SessionRecord,
+  type SourceFileRecord,
   type SpeechEvent,
   type TranscriptLine,
 } from "./trainer.ts";
@@ -32,6 +35,13 @@ type Trainer = {
   readCase(caseId: string): CaseRecord | undefined;
   saveProfile(draft: OwnerProfile): void;
   readProfile(): OwnerProfile;
+  addSourceFile(draft: {
+    caseId: string;
+    name: string;
+    layer: string;
+    extractedText: string;
+  }): AddSourceFileResult;
+  listSourceFiles(caseId: string): SourceFileRecord[];
   draftDossier(draft: { caseId: string; keyId: string } & DossierLayers): Promise<DraftDossierResult>;
   approveDossier(draft: { caseId: string } & DossierLayers): ApproveDossierResult;
   readApprovedDossier(caseId: string): DossierRecord | undefined;
@@ -51,7 +61,7 @@ type Trainer = {
   listOpenSessions(): SessionRecord[];
 };
 
-type CaseAction = "draft" | "approve" | "session";
+type CaseAction = "draft" | "approve" | "session" | "file";
 type SessionAction = "opening" | "ask";
 
 const PROTOCOL_LABEL: Record<KeySummary["protocol"], string> = {
@@ -84,6 +94,18 @@ const DRAFT_ERROR: Record<Exclude<DraftDossierResult, { ok: true }>["reason"], s
   timeout: "Модель не ответила вовремя.",
   model: "Модель не собрала черновик.",
   secret: "Секрет ключа не читается.",
+};
+
+const FILE_ERROR: Record<Exclude<AddSourceFileResult, { ok: true }>["reason"], string> = {
+  layer: "Выберите слой. Тренажёр слой не назначает сам.",
+  incomplete: "Укажите имя файла и извлечённый текст.",
+  missing: "Проект не найден.",
+};
+
+const LAYER_LABEL: Record<DossierLayerName, string> = {
+  material: "Материал проекта",
+  serviceLayer: "Служебный слой",
+  crib: "Шпаргалка проекта",
 };
 
 const KEY_BODY_LIMIT = 64 * 1024;
@@ -488,12 +510,48 @@ function renderSession(trainer: Trainer, session: SessionRecord, error?: string)
   );
 }
 
+/** Список файлов и форма слоя. Первый пункт списка пустой: слой не выбран заранее. */
+function renderSourceFiles(trainer: Trainer, item: CaseRecord, error?: string): string {
+  const files = trainer.listSourceFiles(item.id);
+  const items =
+    files.length === 0
+      ? "<p>Файлов проекта пока нет.</p>"
+      : `<ul>${files
+          .map((file) => `<li>${escapeHtml(file.name)} — ${escapeHtml(LAYER_LABEL[file.layer])}</li>`)
+          .join("")}</ul>`;
+  const options = (Object.entries(LAYER_LABEL) as [DossierLayerName, string][])
+    .map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`)
+    .join("");
+  return `<section>
+    <h2>Файлы проекта</h2>
+    <p>Слой назначает владелец. Новый файл не меняет утверждённое досье и в сессию не попадает.</p>
+    ${notice(error)}
+    ${items}
+    <form method="post" action="${escapeHtml(casePath(item.id, "/file"))}">
+      <label>Имя файла
+        <input name="name" required>
+      </label>
+      <label>Слой
+        <select name="layer" required>
+          <option value="">Выберите слой</option>
+          ${options}
+        </select>
+      </label>
+      <label>Извлечённый текст
+        <textarea name="extractedText" required></textarea>
+      </label>
+      <button type="submit">Добавить файл</button>
+    </form>
+  </section>`;
+}
+
 function renderCase(
   trainer: Trainer,
   item: CaseRecord,
   error?: string,
   paste?: DossierLayers & { keyId: string },
   sessionError?: string,
+  fileError?: string,
 ): string {
   const keys = trainer.listKeys();
   const draftForm =
@@ -520,6 +578,7 @@ function renderCase(
     <p>${escapeHtml(`Голоса заказчика: ${customerVoices(item.characters).join(", ")}`)}</p>
     <p>${escapeHtml(item.portfolioSent ? "Отметка «портфолио уже отправлено» стоит." : "Отметка «портфолио уже отправлено» снята.")}</p>
     ${notice(error)}
+    ${renderSourceFiles(trainer, item, fileError)}
     ${approvedBlock(trainer, item, sessionError)}
     <section>
       <h2>Черновик</h2>
@@ -595,6 +654,13 @@ function knownSessionError(reason: string | null): string | undefined {
   return undefined;
 }
 
+function knownFileError(reason: string | null): string | undefined {
+  if (reason === "layer" || reason === "incomplete" || reason === "missing") {
+    return FILE_ERROR[reason];
+  }
+  return undefined;
+}
+
 function knownDraftError(reason: string | null): string | undefined {
   if (
     reason === "incomplete" ||
@@ -640,13 +706,13 @@ function allowsFormPost(origin: string | string[] | undefined, port: number): bo
 }
 
 function caseTarget(pathname: string): { id: string; action?: CaseAction } | undefined {
-  const match = pathname.match(/^\/cases\/([^/]+)(?:\/(draft|approve|session))?$/);
+  const match = pathname.match(/^\/cases\/([^/]+)(?:\/(draft|approve|session|file))?$/);
   const id = match?.[1];
   if (!id) {
     return undefined;
   }
   const action = match?.[2];
-  if (action !== undefined && action !== "draft" && action !== "approve" && action !== "session") {
+  if (action !== undefined && action !== "draft" && action !== "approve" && action !== "session" && action !== "file") {
     return undefined;
   }
   return { id: decodeURIComponent(id), action };
@@ -771,6 +837,7 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
         knownDraftError(url.searchParams.get("error")),
         undefined,
         knownSessionError(url.searchParams.get("sessionError")),
+        knownFileError(url.searchParams.get("fileError")),
       ),
     );
     return;
@@ -865,6 +932,22 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
       characters: characterLines(fields.get("characters") ?? ""),
     });
     redirect(response, saved.ok ? casePath(saved.caseRecord.id) : `/cases?error=${saved.reason}`);
+    return;
+  }
+
+  if (target?.action === "file") {
+    const item = trainer.readCase(target.id);
+    if (!item) {
+      refuse(request, response, 404);
+      return;
+    }
+    const saved = trainer.addSourceFile({
+      caseId: item.id,
+      name: fields.get("name") ?? "",
+      layer: fields.get("layer") ?? "",
+      extractedText: fields.get("extractedText") ?? "",
+    });
+    redirect(response, saved.ok ? casePath(item.id) : `${casePath(item.id)}?fileError=${saved.reason}`);
     return;
   }
 

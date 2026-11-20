@@ -1447,3 +1447,183 @@ test("таймаут и ошибка модели не становятся ре
   ]);
   assert.deepEqual(calls, ["таймаут", "сбой"]);
 });
+
+/** Собирает черновик из текста запроса: каждый слой остаётся между своими заголовками. */
+function draftFromPrompt(text: string): { material: string; serviceLayer: string; crib: string } {
+  const materialAt = text.indexOf("Материал проекта:\n");
+  const serviceAt = text.indexOf("\nСлужебный слой:\n");
+  const cribAt = text.indexOf("\nШпаргалка проекта:\n");
+  assert.ok(materialAt >= 0 && serviceAt > materialAt && cribAt > serviceAt);
+  return {
+    material: text.slice(materialAt + "Материал проекта:\n".length, serviceAt).trim(),
+    serviceLayer: text.slice(serviceAt + "\nСлужебный слой:\n".length, cribAt).trim(),
+    crib: text.slice(cribAt + "\nШпаргалка проекта:\n".length).trim(),
+  };
+}
+
+test("тренажёр не назначает слой файлу сам", () => {
+  const trainer = start();
+  const prepared = prepare(trainer);
+  const before = trainer.readApprovedDossier(prepared.caseId);
+  assert.ok(before);
+
+  assert.deepEqual(
+    trainer.addSourceFile({
+      caseId: prepared.caseId,
+      name: "служебный-слой.xlsx",
+      layer: "",
+      extractedText: "НЕ-УГАДЫВАТЬ",
+    }),
+    { ok: false, reason: "layer" },
+  );
+  assert.deepEqual(
+    trainer.addSourceFile({
+      caseId: prepared.caseId,
+      name: "служебный-слой.xlsx",
+      layer: "служебный",
+      extractedText: "НЕ-УГАДЫВАТЬ",
+    }),
+    { ok: false, reason: "layer" },
+  );
+  assert.deepEqual(trainer.listSourceFiles(prepared.caseId), []);
+  assert.deepEqual(trainer.readApprovedDossier(prepared.caseId), before);
+  assert.equal(JSON.stringify(trainer.readApprovedDossier(prepared.caseId)).includes("НЕ-УГАДЫВАТЬ"), false);
+});
+
+test("извлечённый текст входит в черновик слоя, который назвал владелец", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start(tempDirectory(), {
+    async *complete(call) {
+      const text = call.messages[0]?.text ?? "";
+      calls.push({
+        protocol: call.protocol,
+        baseAddress: call.baseAddress,
+        modelName: call.modelName,
+        secret: call.secret,
+        messages: [{ role: "user", text }],
+      });
+      yield JSON.stringify(draftFromPrompt(text));
+    },
+  });
+  const prepared = prepare(trainer);
+  const before = trainer.readApprovedDossier(prepared.caseId);
+  assert.ok(before);
+
+  assert.ok(
+    trainer.addSourceFile({
+      caseId: prepared.caseId,
+      name: "протокол.xlsx",
+      layer: "material",
+      extractedText: "ТЕКСТ-МАТЕРИАЛА",
+    }).ok,
+  );
+  assert.ok(
+    trainer.addSourceFile({
+      caseId: prepared.caseId,
+      name: "служебная-записка.xlsx",
+      layer: "serviceLayer",
+      extractedText: "ТЕКСТ-СЛУЖЕБНЫЙ",
+    }).ok,
+  );
+  assert.deepEqual(trainer.readApprovedDossier(prepared.caseId), before);
+
+  const drafted = await trainer.draftDossier({
+    caseId: prepared.caseId,
+    keyId: prepared.keyId,
+    material: "ВСТАВКА-МАТЕРИАЛ",
+    serviceLayer: "ВСТАВКА-СЛУЖЕБНЫЙ",
+    crib: "",
+  });
+  assert.ok(drafted.ok);
+  assert.equal(drafted.draft.material.includes("ТЕКСТ-МАТЕРИАЛА"), true);
+  assert.equal(drafted.draft.material.includes("ВСТАВКА-МАТЕРИАЛ"), true);
+  assert.equal(drafted.draft.material.includes("ТЕКСТ-СЛУЖЕБНЫЙ"), false);
+  assert.equal(drafted.draft.serviceLayer.includes("ТЕКСТ-СЛУЖЕБНЫЙ"), true);
+  assert.equal(drafted.draft.serviceLayer.includes("ВСТАВКА-СЛУЖЕБНЫЙ"), true);
+  assert.equal(drafted.draft.serviceLayer.includes("ТЕКСТ-МАТЕРИАЛА"), false);
+  assert.equal(drafted.draft.crib.includes("ТЕКСТ-СЛУЖЕБНЫЙ"), false);
+  assert.equal(drafted.draft.crib.includes("ТЕКСТ-МАТЕРИАЛА"), false);
+  assert.deepEqual(trainer.readApprovedDossier(prepared.caseId), before);
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  const materialHeading = prompt.indexOf("Материал проекта:");
+  const serviceHeading = prompt.indexOf("Служебный слой:");
+  const cribHeading = prompt.indexOf("Шпаргалка проекта:");
+  const marker = prompt.indexOf("ТЕКСТ-СЛУЖЕБНЫЙ");
+  assert.ok(materialHeading >= 0 && serviceHeading > materialHeading && cribHeading > serviceHeading);
+  assert.ok(marker > serviceHeading && marker < cribHeading);
+  assert.equal(prompt.slice(materialHeading, serviceHeading).includes("ТЕКСТ-СЛУЖЕБНЫЙ"), false);
+
+  const other = trainer.addCase({ customerId: prepared.customerId, title: "Касса" });
+  assert.ok(other.ok);
+  const otherDraft = await trainer.draftDossier({
+    caseId: other.caseRecord.id,
+    keyId: prepared.keyId,
+    material: "ТОЛЬКО-КАССА",
+    serviceLayer: "",
+    crib: "",
+  });
+  assert.ok(otherDraft.ok);
+  assert.equal(otherDraft.draft.material.includes("ТЕКСТ-СЛУЖЕБНЫЙ"), false);
+  assert.equal(otherDraft.draft.serviceLayer.includes("ТЕКСТ-СЛУЖЕБНЫЙ"), false);
+  assert.equal(calls.at(-1)?.messages[0]?.text.includes("ТЕКСТ-СЛУЖЕБНЫЙ"), false);
+});
+
+test("сессия получает утверждённый текст, а не исходный файл", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start(tempDirectory(), remember(calls));
+  const prepared = prepare(trainer);
+  const before = trainer.readApprovedDossier(prepared.caseId);
+  assert.ok(before);
+  const raw = "СЫРОЙ-ФАЙЛ-ПАЛЛЕТЫ";
+
+  assert.ok(
+    trainer.addSourceFile({
+      caseId: prepared.caseId,
+      name: "протокол.xlsx",
+      layer: "material",
+      extractedText: raw,
+    }).ok,
+  );
+  assert.deepEqual(trainer.readApprovedDossier(prepared.caseId), before);
+
+  const approved = trainer.approveDossier({
+    caseId: prepared.caseId,
+    material: "Паллеты принимают поштучно.",
+    serviceLayer: before.serviceLayer,
+    crib: before.crib,
+  });
+  assert.ok(approved.ok);
+  const opened = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "заказчик",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  assert.ok(opened.ok);
+  await take(trainer.openingQuestion(opened.session.id));
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes("Паллеты принимают поштучно."), true);
+  assert.equal(prompt.includes(raw), false);
+  assert.equal(prompt.includes("протокол.xlsx"), false);
+
+  const late = "ПОЗДНИЙ-ФАЙЛ-НА-ДИСКЕ";
+  assert.ok(
+    trainer.addSourceFile({
+      caseId: prepared.caseId,
+      name: "новый.txt",
+      layer: "serviceLayer",
+      extractedText: late,
+    }).ok,
+  );
+  assert.deepEqual(trainer.readApprovedDossier(prepared.caseId), approved.dossier);
+  calls.length = 0;
+  await take(trainer.reply(opened.session.id, "Какой срок?"));
+  const replyPrompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(replyPrompt.includes("Паллеты принимают поштучно."), true);
+  assert.equal(replyPrompt.includes(raw), false);
+  assert.equal(replyPrompt.includes(late), false);
+});
