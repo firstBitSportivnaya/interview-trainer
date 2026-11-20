@@ -4,6 +4,7 @@ import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { join } from "node:path";
 
 import { liveModel, ModelFailure, type ModelPort } from "./model.ts";
+import { isSealedSecret, openSecret, sealSecret } from "./os-secret.ts";
 
 /** Протокол ключа: родной Anthropic или совместимый с OpenAI. */
 export type Protocol = "anthropic" | "openai-compatible";
@@ -101,7 +102,7 @@ export type SessionDraft = {
 /** Речь модели или отказ, который владельцу виден отдельно от речи. */
 export type SpeechEvent =
   | { kind: "speech"; text: string }
-  | { kind: "failure"; reason: "timeout" | "model" | "missing"; message: string };
+  | { kind: "failure"; reason: "timeout" | "model" | "missing" | "secret"; message: string };
 
 /** Отказ открыть сессию: тройка уже открыта, записи нет или поле не из каталога. */
 export type OpenSessionResult =
@@ -143,6 +144,7 @@ const FAILURE_MESSAGE = {
   timeout: "Модель не ответила вовремя.",
   model: "Модель вернула ошибку.",
   missing: "Сессия не найдена.",
+  secret: "Секрет ключа не читается.",
 } as const;
 
 const LEGACY_KEYS = "keys.json";
@@ -242,6 +244,14 @@ function secretPreview(secret: string): string {
     return "••••";
   }
   return `••••${secret.slice(-4)}`;
+}
+
+/** Секрет из колонки. Открытый текст прошлого хранилища читается как есть, чужой свёрток — нет. */
+function revealSecret(stored: string): string | undefined {
+  if (!isSealedSecret(stored)) {
+    return stored;
+  }
+  return openSecret(stored);
 }
 
 function toSummary(key: StoredKey): KeySummary {
@@ -373,11 +383,13 @@ function restoreLegacy(legacy: string, staging: string): void {
 }
 
 function sameStoredKey(row: Row, key: StoredKey): boolean {
+  const secret = revealSecret(textColumn(row, "secret"));
   return (
+    secret !== undefined &&
     textColumn(row, "protocol") === key.protocol &&
     textColumn(row, "base_address") === key.baseAddress &&
     textColumn(row, "model_name") === key.modelName &&
-    textColumn(row, "secret") === key.secret
+    secret === key.secret
   );
 }
 
@@ -399,8 +411,25 @@ function importKeys(database: DatabaseSync, keys: readonly StoredKey[]): void {
       }
       continue;
     }
-    insert.run(key.id, key.protocol, key.baseAddress, key.modelName, key.secret);
+    insert.run(key.id, key.protocol, key.baseAddress, key.modelName, sealSecret(key.secret, key.id));
   }
+}
+
+/** Сворачивает открытый секрет прошлого хранилища. Уже свёрнутую колонку не трогает. */
+function sealPlaintextSecrets(database: DatabaseSync): boolean {
+  const rows = database.prepare("SELECT id, secret FROM keys").all() as Row[];
+  const update = database.prepare("UPDATE keys SET secret = ? WHERE id = ?");
+  let changed = false;
+  for (const row of rows) {
+    const stored = textColumn(row, "secret");
+    if (isSealedSecret(stored)) {
+      continue;
+    }
+    const id = textColumn(row, "id");
+    update.run(sealSecret(stored, id), id);
+    changed = true;
+  }
+  return changed;
 }
 
 /** Переносит снимки, пока они есть. Расхождение или порча списка оставляют файл владельцу. */
@@ -490,7 +519,8 @@ function readSessionRecord(row: Row): SessionRecord {
 /**
  * Ядро одного владельца.
  * Каталог — хранилище на этой машине: дела, досье, сессии, ход подготовки и ключи.
- * Список ключей секрет целиком не отдаёт. Одна открытая сессия на тройку
+ * Список ключей секрет целиком не отдаёт. Секрет в хранилище свёрнут средствами ОС.
+ * Одна открытая сессия на тройку
  * «дело + роль исполнителя + исполнитель» держится уникальным индексом.
  * Прежний процесс, который пишет keys.json, нужно остановить до этого запуска.
  * Модель приходит портом: проверка подставляет записанную, запуск — живую.
@@ -507,6 +537,11 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     database.exec("PRAGMA busy_timeout = 5000");
     database.exec(schemaSql());
     migrateLegacyKeys(database, directory);
+    const rewrotePlaintext = sealPlaintextSecrets(database);
+    if (rewrotePlaintext) {
+      database.exec("VACUUM");
+      chmodSync(databaseFile, 0o600);
+    }
   } catch (error) {
     database.close();
     throw error;
@@ -542,11 +577,19 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     return row ? readSessionRecord(row) : undefined;
   }
 
-  function loadKey(keyId: string): StoredKey | undefined {
+  function loadKey(keyId: string): { key: StoredKey } | { unreadable: true } | undefined {
     const row = database
       .prepare("SELECT id, protocol, base_address, model_name, secret FROM keys WHERE id = ?")
       .get(keyId) as Row | undefined;
-    return row ? readStoredKey(row, databaseFile) : undefined;
+    if (!row) {
+      return undefined;
+    }
+    const stored = readStoredKey(row, databaseFile);
+    const secret = revealSecret(stored.secret);
+    if (secret === undefined) {
+      return { unreadable: true };
+    }
+    return { key: { ...stored, secret } };
   }
 
   let closed = false;
@@ -574,9 +617,10 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
         return { ok: false, reason: "protocol" };
       }
 
+      const id = randomUUID();
       database
         .prepare("INSERT INTO keys (id, protocol, base_address, model_name, secret) VALUES (?, ?, ?, ?, ?)")
-        .run(randomUUID(), protocol, baseAddress, modelName, secret);
+        .run(id, protocol, baseAddress, modelName, sealSecret(secret, id));
       return { ok: true };
     },
 
@@ -585,7 +629,20 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       const rows = database
         .prepare("SELECT id, protocol, base_address, model_name, secret FROM keys ORDER BY rowid")
         .all() as Row[];
-      return rows.map((row) => toSummary(readStoredKey(row, databaseFile)));
+      return rows.map((row) => {
+        const stored = readStoredKey(row, databaseFile);
+        const secret = revealSecret(stored.secret);
+        if (secret === undefined) {
+          return {
+            id: stored.id,
+            protocol: stored.protocol,
+            baseAddress: stored.baseAddress,
+            modelName: stored.modelName,
+            secretPreview: "••••",
+          };
+        }
+        return toSummary({ ...stored, secret });
+      });
     },
 
     /** Заводит заказчика и его дело. Пустое имя или название дело не создают. */
@@ -726,11 +783,16 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
      */
     async *reply(sessionId: string, line: string): AsyncIterable<SpeechEvent> {
       const session = loadSession(sessionId);
-      const key = session ? loadKey(session.keyId) : undefined;
-      if (!session || !key) {
+      const loaded = session ? loadKey(session.keyId) : undefined;
+      if (!session || !loaded) {
         yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
         return;
       }
+      if (!("key" in loaded)) {
+        yield { kind: "failure", reason: "secret", message: FAILURE_MESSAGE.secret };
+        return;
+      }
+      const key = loaded.key;
 
       const controller = new AbortController();
       try {
