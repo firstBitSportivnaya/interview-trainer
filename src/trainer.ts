@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { join } from "node:path";
 
@@ -133,6 +133,8 @@ type StoredKey = {
 type Row = Record<string, SQLOutputValue>;
 
 const LEGACY_KEYS = "keys.json";
+/** Снимок keys.json, уже снятый с пути, куда пишет прежний процесс. */
+const LEGACY_STAGING = "keys.json.migrating";
 const STORE_FILE = "store.sqlite";
 const SESSION_COLUMNS = "id, case_id, dossier_id, side, character_name, role, executor_id, key_id, status";
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
@@ -310,7 +312,7 @@ function inTransaction(database: DatabaseSync, body: () => void): void {
   }
 }
 
-/** Удаляет прежний список. Повторное открытие застаёт файл уже удалённым. */
+/** Удаляет уже перенесённый снимок. Повторное открытие застаёт файл уже удалённым. */
 function removeLegacyKeys(file: string): void {
   try {
     unlinkSync(file);
@@ -322,15 +324,100 @@ function removeLegacyKeys(file: string): void {
   }
 }
 
-/** Переносит ключи. Повтор того же id не заводит вторую запись. */
-function migrateKeys(database: DatabaseSync, keys: readonly StoredKey[]): void {
+/**
+ * Забирает keys.json в снимок.
+ * Прежний процесс нужно остановить до запуска: запись после переименования
+ * создаёт новый keys.json, и его заберёт следующее открытие.
+ */
+function claimLegacy(legacy: string, staging: string): boolean {
+  if (existsSync(staging)) {
+    return true;
+  }
+  try {
+    renameSync(legacy, staging);
+    return true;
+  } catch (error) {
+    if (isMissingFile(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+/** Возвращает снимок на прежний путь, если новый список туда ещё не встал. */
+function restoreLegacy(legacy: string, staging: string): void {
+  if (!existsSync(staging) || existsSync(legacy)) {
+    return;
+  }
+  try {
+    renameSync(staging, legacy);
+  } catch (error) {
+    if (isMissingFile(error)) {
+      return;
+    }
+    throw error;
+  }
+}
+
+function sameStoredKey(row: Row, key: StoredKey): boolean {
+  return (
+    textColumn(row, "protocol") === key.protocol &&
+    textColumn(row, "base_address") === key.baseAddress &&
+    textColumn(row, "model_name") === key.modelName &&
+    textColumn(row, "secret") === key.secret
+  );
+}
+
+/**
+ * Переносит снимок.
+ * Тот же id с теми же полями пропускается, чтобы повтор после уже сделанной записи дошёл до удаления снимка.
+ * Тот же id с другим секретом откатывает перенос.
+ */
+function importKeys(database: DatabaseSync, keys: readonly StoredKey[]): void {
+  const find = database.prepare("SELECT protocol, base_address, model_name, secret FROM keys WHERE id = ?");
   const insert = database.prepare(
-    `INSERT INTO keys (id, protocol, base_address, model_name, secret)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(id) DO NOTHING`,
+    "INSERT INTO keys (id, protocol, base_address, model_name, secret) VALUES (?, ?, ?, ?, ?)",
   );
   for (const key of keys) {
+    const row = find.get(key.id) as Row | undefined;
+    if (row) {
+      if (!sameStoredKey(row, key)) {
+        throw new Error(`Ключ ${key.id} в списке расходится с хранилищем`);
+      }
+      continue;
+    }
     insert.run(key.id, key.protocol, key.baseAddress, key.modelName, key.secret);
+  }
+}
+
+/** Переносит снимки, пока они есть. Расхождение или порча списка оставляют файл владельцу. */
+function migrateLegacyKeys(database: DatabaseSync, directory: string): void {
+  const legacy = join(directory, LEGACY_KEYS);
+  const staging = join(directory, LEGACY_STAGING);
+  for (;;) {
+    if (!claimLegacy(legacy, staging)) {
+      return;
+    }
+
+    let keys: StoredKey[];
+    try {
+      const read = readLegacyKeys(staging);
+      if (read === undefined) {
+        return;
+      }
+      keys = read;
+    } catch (error) {
+      restoreLegacy(legacy, staging);
+      throw error;
+    }
+
+    try {
+      inTransaction(database, () => importKeys(database, keys));
+    } catch (error) {
+      restoreLegacy(legacy, staging);
+      throw error;
+    }
+    removeLegacyKeys(staging);
   }
 }
 
@@ -392,13 +479,12 @@ function readSessionRecord(row: Row): SessionRecord {
  * Каталог — хранилище на этой машине: дела, досье, сессии, ход подготовки и ключи.
  * Список ключей секрет целиком не отдаёт. Одна открытая сессия на тройку
  * «дело + роль исполнителя + исполнитель» держится уникальным индексом.
+ * Прежний процесс, который пишет keys.json, нужно остановить до этого запуска.
  */
 export function openTrainer(directory: string) {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   chmodSync(directory, 0o700);
 
-  const legacyFile = join(directory, LEGACY_KEYS);
-  const legacyKeys = readLegacyKeys(legacyFile);
   const databaseFile = join(directory, STORE_FILE);
   const database = new DatabaseSync(databaseFile, { enableForeignKeyConstraints: true });
 
@@ -406,10 +492,7 @@ export function openTrainer(directory: string) {
     chmodSync(databaseFile, 0o600);
     database.exec("PRAGMA busy_timeout = 5000");
     database.exec(schemaSql());
-    if (legacyKeys) {
-      inTransaction(database, () => migrateKeys(database, legacyKeys));
-      removeLegacyKeys(legacyFile);
-    }
+    migrateLegacyKeys(database, directory);
   } catch (error) {
     database.close();
     throw error;
@@ -550,8 +633,8 @@ export function openTrainer(directory: string) {
       const character = draft.character.trim();
       const role = draft.role.trim();
       const executorId = draft.executorId.trim();
-      const keyId = draft.keyId.trim();
-      if (!caseId || !dossierId || !side || !character || !role || !executorId || !keyId) {
+      const keyId = draft.keyId;
+      if (!caseId || !dossierId || !side || !character || !role || !executorId || !keyId.trim()) {
         return { ok: false, reason: "incomplete" };
       }
       if (!isPerformerRole(role)) {

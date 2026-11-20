@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -161,6 +161,7 @@ test("после перезапуска список ключей на мест�
     secret: "sk-deepseek-secret-9876",
   });
 
+  trainer.close();
   const keys = start(directory).listKeys();
   assert.deepEqual(
     keys.map((key) => ({
@@ -285,7 +286,8 @@ test("ключи из keys.json переносятся в хранилище и 
     ]),
   );
 
-  const keys = start(directory).listKeys();
+  const trainer = start(directory);
+  const keys = trainer.listKeys();
   assert.equal(keys.length, 1);
   assert.equal(keys[0]?.id, "key-1");
   assert.equal(keys[0]?.protocol, "anthropic");
@@ -295,11 +297,181 @@ test("ключи из keys.json переносятся в хранилище и 
   assert.equal(JSON.stringify(keys).includes(secret), false);
   assert.equal(existsSync(join(directory, "keys.json")), false);
 
+  trainer.close();
   const again = start(directory).listKeys();
   assert.equal(again.length, 1);
   assert.equal(again[0]?.id, "key-1");
   assert.equal(again[0]?.secretPreview, "••••WXYZ");
   assert.equal(JSON.stringify(again).includes(secret), false);
+});
+
+test("повторный перенос того же ключа не заводит вторую запись", () => {
+  const directory = tempDirectory();
+  const file = join(directory, "keys.json");
+  const raw = JSON.stringify([
+    {
+      id: "key-1",
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-WXYZ",
+    },
+  ]);
+  writeFileSync(file, raw);
+  start(directory).close();
+
+  writeFileSync(file, raw);
+  const keys = start(directory).listKeys();
+  assert.deepEqual(
+    keys.map((key) => key.id),
+    ["key-1"],
+  );
+  assert.equal(existsSync(file), false);
+});
+
+test("ключ с тем же id и другим секретом не затирает список", () => {
+  const directory = tempDirectory();
+  const file = join(directory, "keys.json");
+  const raw = JSON.stringify([
+    {
+      id: "key-1",
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-AAAA",
+    },
+    {
+      id: "key-1",
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-BBBB",
+    },
+  ]);
+  writeFileSync(file, raw);
+
+  assert.throws(() => openTrainer(directory));
+  assert.equal(readFileSync(file, "utf8"), raw);
+
+  writeFileSync(
+    file,
+    JSON.stringify([
+      {
+        id: "key-2",
+        protocol: "openai-compatible",
+        baseAddress: "https://api.deepseek.com",
+        modelName: "deepseek-chat",
+        secret: "sk-deepseek-secret-CCCC",
+      },
+    ]),
+  );
+  assert.deepEqual(
+    start(directory).listKeys().map((key) => key.id),
+    ["key-2"],
+  );
+});
+
+test("новый keys.json, появившийся после снимка, тоже переносится", () => {
+  const directory = tempDirectory();
+  const legacy = join(directory, "keys.json");
+  writeFileSync(
+    legacy,
+    JSON.stringify([
+      {
+        id: "key-old",
+        protocol: "anthropic",
+        baseAddress: "https://api.anthropic.com",
+        modelName: "claude-sonnet",
+        secret: "sk-ant-api03-secret-WXYZ",
+      },
+    ]),
+  );
+  renameSync(legacy, join(directory, "keys.json.migrating"));
+  writeFileSync(
+    legacy,
+    JSON.stringify([
+      {
+        id: "key-new",
+        protocol: "openai-compatible",
+        baseAddress: "https://api.deepseek.com",
+        modelName: "deepseek-chat",
+        secret: "sk-deepseek-secret-9876",
+      },
+    ]),
+  );
+
+  const keys = start(directory).listKeys();
+  assert.deepEqual(
+    keys.map((key) => key.id),
+    ["key-old", "key-new"],
+  );
+  assert.equal(existsSync(legacy), false);
+  assert.equal(existsSync(join(directory, "keys.json.migrating")), false);
+});
+
+test("сессия открывается ключом с тем id, который вернул список", () => {
+  const directory = tempDirectory();
+  writeFileSync(
+    join(directory, "keys.json"),
+    JSON.stringify([
+      {
+        id: " key-1 ",
+        protocol: "anthropic",
+        baseAddress: "https://api.anthropic.com",
+        modelName: "claude-sonnet",
+        secret: "sk-ant-api03-secret-WXYZ",
+      },
+    ]),
+  );
+  const trainer = start(directory);
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.equal(keyId, " key-1 ");
+
+  const savedCase = trainer.saveCase({ customerName: "Север", title: "Внедрение склада" });
+  assert.ok(savedCase.ok);
+  const approved = trainer.approveDossier({
+    caseId: savedCase.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: "Маржа подрядчика 12%.",
+    crib: "Спросить про сроки.",
+  });
+  assert.ok(approved.ok);
+
+  const opened = trainer.openSession({
+    caseId: savedCase.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "заказчик",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId: keyId ?? "",
+  });
+  assert.ok(opened.ok);
+  assert.equal(opened.session.keyId, " key-1 ");
+  assert.deepEqual(
+    trainer.openSession({
+      caseId: savedCase.caseRecord.id,
+      dossierId: approved.dossier.id,
+      side: "заказчик",
+      character: "заказчик",
+      role: "разработчик",
+      executorId: "владелец",
+      keyId: "key-1",
+    }),
+    { ok: false, reason: "missing" },
+  );
+  assert.deepEqual(
+    trainer.openSession({
+      caseId: savedCase.caseRecord.id,
+      dossierId: approved.dossier.id,
+      side: "заказчик",
+      character: "заказчик",
+      role: "разработчик",
+      executorId: "владелец",
+      keyId: "   ",
+    }),
+    { ok: false, reason: "incomplete" },
+  );
 });
 
 test("дело, досье, сессия, ход подготовки и ключ читаются после перезапуска", () => {
@@ -334,6 +506,7 @@ test("дело, досье, сессия, ход подготовки и клю�
     }).ok,
   );
 
+  trainer.close();
   const restarted = start(directory);
   assert.deepEqual(restarted.readCase(prepared.caseId), {
     id: prepared.caseId,
@@ -417,6 +590,7 @@ test("вторая открытая сессия той же тройки не �
 
   assert.deepEqual(openAnalyst(trainer, prepared), { ok: false, reason: "open" });
 
+  trainer.close();
   const sessions = start(directory).listOpenSessions();
   assert.deepEqual(
     sessions.map((session) => session.id),
