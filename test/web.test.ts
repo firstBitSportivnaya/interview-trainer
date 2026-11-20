@@ -6,8 +6,8 @@ import { after, test } from "node:test";
 import type { AddressInfo } from "node:net";
 import { request as httpRequest, type Server } from "node:http";
 
-import { openTrainer } from "../src/trainer.ts";
-import { startWeb } from "../src/web.ts";
+import { DRAFT_LIMIT, openTrainer } from "../src/trainer.ts";
+import { startWeb, TEXT_BODY_LIMIT } from "../src/web.ts";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -395,6 +395,87 @@ test("веб заводит заказчика, дело и утверждённ
       material: "УТВЕРЖДЕНО<script>",
       serviceLayer: "УТВЕРЖДЕНО-СЛУЖЕБНЫЙ",
       crib: "УТВЕРЖДЕНО-ШПАРГАЛКА",
+    });
+  } finally {
+    await close(server);
+  }
+});
+
+test("утверждение принимает показанный черновик с кириллицей", async () => {
+  const widest = new URLSearchParams({
+    material: "€".repeat(DRAFT_LIMIT),
+    serviceLayer: "",
+    crib: "",
+  }).toString();
+  assert.ok(Buffer.byteLength(widest) <= TEXT_BODY_LIMIT);
+
+  const draft = {
+    material: `Пример: \`\`\`sql SELECT 1; \`\`\` ${"Я".repeat(4000)}`,
+    serviceLayer: "Служебный слой €",
+    crib: "Спросить про срок",
+  };
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, {
+    async *complete() {
+      yield JSON.stringify(draft);
+    },
+  });
+  opened.push(trainer);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    await fetch(`${base}/keys`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({
+        protocol: "anthropic",
+        baseAddress: "https://api.anthropic.com",
+        modelName: "claude-sonnet",
+        secret: "sk-ant-api03-secret-WXYZ",
+      }),
+    });
+    const keyId = trainer.listKeys()[0]?.id;
+    assert.ok(keyId);
+    await fetch(`${base}/customers`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ customerName: "Север", title: "Касса" }),
+    });
+    const caseId = trainer.listCases()[0]?.id;
+    assert.ok(caseId);
+
+    const drafted = await fetch(`${base}/cases/${caseId}/draft`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({
+        material: "сырьё",
+        serviceLayer: "сырьё",
+        crib: "сырьё",
+        keyId,
+      }),
+    });
+    const draftPage = await drafted.text();
+    assert.equal(drafted.status, 200);
+    assert.equal(draftPage.includes("Я".repeat(4000)), true);
+    assert.equal(draftPage.includes("```sql SELECT 1;"), true);
+    assert.equal(draftPage.includes("сырьё"), false);
+    assert.equal(trainer.readApprovedDossier(caseId), undefined);
+
+    const body = new URLSearchParams(draft).toString();
+    assert.ok(Buffer.byteLength(body) <= TEXT_BODY_LIMIT);
+    const approved = await fetch(`${base}/cases/${caseId}/approve`, {
+      method: "POST",
+      headers,
+      body,
+    });
+    assert.equal(approved.status, 200);
+    assert.deepEqual(trainer.readApprovedDossier(caseId), {
+      id: trainer.readApprovedDossier(caseId)?.id,
+      caseId,
+      ...draft,
     });
   } finally {
     await close(server);

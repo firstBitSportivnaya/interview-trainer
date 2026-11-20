@@ -179,8 +179,11 @@ const FAILURE_MESSAGE = {
   secret: "Секрет ключа не читается.",
 } as const;
 
-/** Собранный черновик длиннее этого отбрасывается и досье не становится. Предел — 1 МиБ. */
-const DRAFT_LIMIT = 1024 * 1024;
+/**
+ * Предел текста черновика, в знаках.
+ * Форма утверждения кодирует один знак девятью байтами, поэтому предел короче тела запроса.
+ */
+export const DRAFT_LIMIT = 64 * 1024;
 
 const PLAINTEXT_VACUUM = "plaintext-vacuum";
 const LEGACY_KEYS = "keys.json";
@@ -408,17 +411,23 @@ function dossierDraftPrompt(layers: DossierLayers): string {
 
 /** Читает три слоя из ответа модели. Чужой текст черновиком не становится. */
 function parseDraft(text: string): DossierLayers | undefined {
-  const fenced = text.trim().match(/```(?:json)?\s*([\s\S]*?)```/);
-  const source = (fenced?.[1] ?? text).trim();
-  const start = source.indexOf("{");
-  const end = source.lastIndexOf("}");
-  if (start === -1 || end < start) {
+  const trimmed = text.trim();
+  const direct = layersFromJson(trimmed);
+  if (direct) {
+    return direct;
+  }
+  const wrapped = trimmed.match(/^```(?:json)?\s*([\s\S]*)```$/);
+  if (!wrapped?.[1]) {
     return undefined;
   }
+  return layersFromJson(wrapped[1].trim());
+}
 
+/** Берёт три строковых слоя из целого JSON. Обрывок объекта черновиком не становится. */
+function layersFromJson(source: string): DossierLayers | undefined {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(source.slice(start, end + 1)) as unknown;
+    parsed = JSON.parse(source) as unknown;
   } catch {
     return undefined;
   }

@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 
 import {
   customerVoices,
+  DRAFT_LIMIT,
   type ApproveDossierResult,
   type CaseRecord,
   type CustomerRecord,
@@ -57,7 +58,11 @@ const DRAFT_ERROR: Record<Exclude<DraftDossierResult, { ok: true }>["reason"], s
 };
 
 const KEY_BODY_LIMIT = 64 * 1024;
-const TEXT_BODY_LIMIT = 1024 * 1024;
+/** Байт на знак в теле формы: три байта UTF-8, каждый как `%XX`. Плюс имена полей. */
+const FORM_CHAR_BYTES = 9;
+const FORM_OVERHEAD = 512;
+/** Тело утверждения вмещает любой черновик, который ядро согласилось показать. */
+export const TEXT_BODY_LIMIT = DRAFT_LIMIT * FORM_CHAR_BYTES + FORM_OVERHEAD;
 
 /** Экранирует текст владельца, чтобы вставленный слой не стал разметкой. */
 function escapeHtml(value: string): string {

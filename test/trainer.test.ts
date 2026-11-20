@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 
 import { ModelFailure, type ModelCall, type ModelPort } from "../src/model.ts";
-import { customerVoices, openTrainer, type OpenSessionResult, type SpeechEvent } from "../src/trainer.ts";
+import { customerVoices, DRAFT_LIMIT, openTrainer, type OpenSessionResult, type SpeechEvent } from "../src/trainer.ts";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -549,6 +549,64 @@ test("черновик собирается из вставленных текс
   assert.equal(calls[0]?.messages[0]?.text.includes("СРОКИ-СЫРЬЁ"), true);
   assert.equal(calls[0]?.secret === keyDraft.secret, false);
   assert.equal(trainer.readApprovedDossier(saved.caseRecord.id), undefined);
+});
+
+test("черновик с блоком кода внутри слоя читается и в ограде, и без неё", async () => {
+  const layers = {
+    material: "Пример: ```sql SELECT 1; ```",
+    serviceLayer: "Слой €",
+    crib: "Шпаргалка",
+  };
+  const json = JSON.stringify(layers);
+  const trainer = start(tempDirectory(), {
+    async *complete(call) {
+      const line = call.messages[0]?.text ?? "";
+      yield line.includes("ограда") ? `\`\`\`json\n${json}\n\`\`\`` : json;
+    },
+  });
+  assert.deepEqual(trainer.saveKey(keyDraft), { ok: true });
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада" });
+  assert.ok(saved.ok);
+
+  const plain = await trainer.draftDossier({
+    caseId: saved.caseRecord.id,
+    keyId,
+    material: "сырьё",
+    serviceLayer: "",
+    crib: "",
+  });
+  assert.deepEqual(plain, { ok: true, draft: layers });
+
+  const fenced = await trainer.draftDossier({
+    caseId: saved.caseRecord.id,
+    keyId,
+    material: "ограда",
+    serviceLayer: "",
+    crib: "",
+  });
+  assert.deepEqual(fenced, { ok: true, draft: layers });
+  assert.equal(trainer.readApprovedDossier(saved.caseRecord.id), undefined);
+});
+
+test("черновик длиннее предела не становится досье", async () => {
+  const trainer = start(tempDirectory(), {
+    async *complete() {
+      yield "Я".repeat(DRAFT_LIMIT + 1);
+    },
+  });
+  const prepared = prepare(trainer);
+  const drafted = await trainer.draftDossier({
+    caseId: prepared.caseId,
+    keyId: prepared.keyId,
+    material: "текст",
+    serviceLayer: "",
+    crib: "",
+  });
+  assert.deepEqual(drafted, { ok: false, reason: "model" });
+  assert.equal(JSON.stringify(drafted).includes("Я"), false);
+  assert.equal(trainer.readApprovedDossier(prepared.caseId)?.material, "Склад принимает паллеты.");
 });
 
 test("сбой черновика не создаёт досье и не становится его текстом", async () => {
