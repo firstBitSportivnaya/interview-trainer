@@ -6,7 +6,7 @@ import { after, test } from "node:test";
 import type { AddressInfo } from "node:net";
 import { request as httpRequest, type Server } from "node:http";
 
-import { DRAFT_LIMIT, openTrainer } from "../src/trainer.ts";
+import { ABSENT_FACT, DRAFT_LIMIT, openTrainer } from "../src/trainer.ts";
 import { startWeb, TEXT_BODY_LIMIT } from "../src/web.ts";
 
 const directories: string[] = [];
@@ -179,6 +179,20 @@ test("ошибка записи не останавливает веб", async (
     },
     readApprovedDossier() {
       return undefined;
+    },
+    openSession() {
+      return { ok: false, reason: "missing" };
+    },
+    readSession() {
+      return undefined;
+    },
+    readTranscript() {
+      return undefined;
+    },
+    async *openingQuestion() {},
+    async *reply() {},
+    listOpenSessions() {
+      return [];
     },
   });
 
@@ -386,7 +400,8 @@ test("веб заводит заказчика, дело и утверждённ
     assert.equal(approved.status, 200);
     assert.equal(approvedPage.includes("УТВЕРЖДЕНО&lt;script&gt;"), true);
     assert.equal(approvedPage.includes("УТВЕРЖДЕНО<script>"), false);
-    assert.equal(approvedPage.includes("Сессия ещё не открывается."), true);
+    assert.equal(approvedPage.includes("Открыть сессию"), true);
+    assert.equal(approvedPage.includes("Сессия ещё не открывается."), false);
     assert.equal(approvedPage.includes("СЫРЬЁ-МАТЕРИАЛ"), false);
     assert.equal(approvedPage.includes("ЧЕРНОВИК-МАТЕРИАЛ"), false);
     assert.deepEqual(trainer.readApprovedDossier(first.id), {
@@ -477,6 +492,151 @@ test("утверждение принимает показанный черно�
       caseId,
       ...draft,
     });
+  } finally {
+    await close(server);
+  }
+});
+
+test("веб открывает сессию заказчика, и стенограмма читается на странице", async () => {
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, {
+    async *complete(call) {
+      const text = call.messages[0]?.text ?? "";
+      const task = text.split("\n\n").at(-1) ?? "";
+      if (task.startsWith("Задай один вопрос")) {
+        yield "Как ";
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        yield "принимаете паллеты?";
+        return;
+      }
+      const marker = "Материал дела:\n";
+      const start = text.indexOf(marker);
+      const end = text.indexOf("\n\nСтенограмма:");
+      const material = start < 0 || end < 0 ? "" : text.slice(start + marker.length, end);
+      if (material.includes("паллеты") && task.includes("паллет")) {
+        yield "Склад принимает паллеты.";
+        return;
+      }
+      yield ABSENT_FACT;
+    },
+  });
+  opened.push(trainer);
+  const server = await startWeb(trainer);
+
+  try {
+    const secret = "sk-ant-api03-secret-WXYZ";
+    assert.deepEqual(
+      trainer.saveKey({
+        protocol: "anthropic",
+        baseAddress: "https://api.anthropic.com",
+        modelName: "claude-sonnet",
+        secret,
+      }),
+      { ok: true },
+    );
+    const keyId = trainer.listKeys()[0]?.id;
+    assert.ok(keyId);
+    const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+    assert.ok(saved.ok);
+    const approved = trainer.approveDossier({
+      caseId: saved.caseRecord.id,
+      material: "Склад принимает паллеты.",
+      serviceLayer: "Маржа подрядчика 12%.",
+      crib: "Спросить про сроки.",
+    });
+    assert.ok(approved.ok);
+
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    const casePage = await (await fetch(`${base}/cases/${saved.caseRecord.id}`)).text();
+    assert.equal(casePage.includes("Открыть сессию"), true);
+    assert.equal(casePage.includes("Анна"), true);
+    assert.equal(casePage.includes(">аналитик<"), true);
+
+    const foreign = await fetch(`${base}/cases/${saved.caseRecord.id}/session`, {
+      method: "POST",
+      headers: { ...headers, origin: "https://evil.example" },
+      body: new URLSearchParams({ side: "заказчик", character: "Анна", role: "аналитик", keyId }),
+    });
+    assert.equal(foreign.status, 403);
+    assert.equal(trainer.listOpenSessions().length, 0);
+
+    const wrongCharacter = await fetch(`${base}/cases/${saved.caseRecord.id}/session`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ side: "заказчик", character: "Чужой", role: "аналитик", keyId }),
+    });
+    const wrongPage = await wrongCharacter.text();
+    assert.equal(wrongPage.includes("Выберите персонажа заказчика."), true);
+    assert.equal(trainer.listOpenSessions().length, 0);
+
+    const created = await fetch(`${base}/cases/${saved.caseRecord.id}/session`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ side: "заказчик", character: "Анна", role: "аналитик", keyId }),
+    });
+    assert.equal(created.status, 200);
+    const open = trainer.listOpenSessions()[0];
+    assert.ok(open);
+    assert.equal(open.keyId, keyId);
+    assert.equal(open.side, "заказчик");
+    assert.equal(new URL(created.url).pathname, `/sessions/${open.id}`);
+    const empty = await created.text();
+    assert.equal(empty.includes("Стенограмма пока пуста."), true);
+    assert.equal(empty.includes("Сессия помнит ключ: Anthropic — claude-sonnet"), true);
+    assert.equal(empty.includes(secret), false);
+    assert.equal(empty.includes("Маржа подрядчика 12%."), false);
+
+    const stream = await fetch(`${base}/sessions/${open.id}/opening`);
+    assert.equal(stream.headers.get("content-type"), "text/event-stream; charset=utf-8");
+    const reader = stream.body?.getReader();
+    assert.ok(reader);
+    const decoder = new TextDecoder();
+    let buffered = "";
+    let sawGap = false;
+    let finished = false;
+    while (!finished) {
+      const read = await reader.read();
+      if (read.value) {
+        buffered += decoder.decode(read.value, { stream: true });
+      }
+      if (buffered.includes("data: Как") && !buffered.includes("принимаете паллеты?")) {
+        sawGap = true;
+      }
+      finished = read.done || buffered.includes("event: done");
+    }
+    assert.equal(sawGap, true);
+    assert.equal(buffered.includes("принимаете паллеты?"), true);
+
+    const filled = await (await fetch(`${base}/sessions/${open.id}`)).text();
+    assert.equal(filled.includes("Как принимаете паллеты?"), true);
+    assert.equal(filled.includes(secret), false);
+
+    const again = await fetch(`${base}/sessions/${open.id}/opening`);
+    const second = await again.text();
+    assert.equal(second.includes("принимаете паллеты?"), false);
+    assert.equal(second.includes("event: done"), true);
+    assert.equal(trainer.readTranscript(open.id)?.filter((line) => line.kind === "вопрос").length, 1);
+
+    const answer = await fetch(`${base}/sessions/${open.id}/ask`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ line: "Какие паллеты принимает склад?" }),
+    });
+    const answerPage = await answer.text();
+    assert.equal(answerPage.includes("Склад принимает паллеты."), true);
+    assert.equal(answerPage.includes(secret), false);
+
+    const absent = await fetch(`${base}/sessions/${open.id}/ask`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ line: "Какая маржа?" }),
+    });
+    const absentPage = await absent.text();
+    assert.equal(absentPage.includes(ABSENT_FACT), true);
+    assert.equal(absentPage.includes("12%"), false);
+    assert.equal(trainer.readSession(open.id)?.keyId, keyId);
   } finally {
     await close(server);
   }

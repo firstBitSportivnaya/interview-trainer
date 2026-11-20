@@ -1335,22 +1335,19 @@ test("сессия зовёт модель тем ключом, которым �
     { kind: "speech", text: "Срок " },
     { kind: "speech", text: "— июнь." },
   ]);
-  assert.deepEqual(calls[0], {
-    protocol: "anthropic",
-    baseAddress: "https://api.anthropic.com",
-    modelName: "claude-sonnet",
-    secret: keyDraft.secret,
-    messages: [{ role: "user", text: "Какой срок поставки?" }],
-  });
+  assert.equal(calls[0]?.protocol, "anthropic");
+  assert.equal(calls[0]?.baseAddress, "https://api.anthropic.com");
+  assert.equal(calls[0]?.modelName, "claude-sonnet");
+  assert.equal(calls[0]?.secret, keyDraft.secret);
+  assert.equal(calls[0]?.messages[0]?.text.endsWith("Какой срок поставки?"), true);
+  assert.equal(calls[0]?.messages[0]?.text.includes("Срок — июнь."), false);
 
   await take(trainer.reply(other.session.id, "Где расчёт?"));
-  assert.deepEqual(calls[1], {
-    protocol: "openai-compatible",
-    baseAddress: "https://api.deepseek.com",
-    modelName: "deepseek-chat",
-    secret: "sk-deepseek-secret-9876",
-    messages: [{ role: "user", text: "Где расчёт?" }],
-  });
+  assert.equal(calls[1]?.protocol, "openai-compatible");
+  assert.equal(calls[1]?.baseAddress, "https://api.deepseek.com");
+  assert.equal(calls[1]?.modelName, "deepseek-chat");
+  assert.equal(calls[1]?.secret, "sk-deepseek-secret-9876");
+  assert.equal(calls[1]?.messages[0]?.text.endsWith("Где расчёт?"), true);
 
   trainer.close();
   const restartedCalls: ModelCall[] = [];
@@ -1359,13 +1356,12 @@ test("сессия зовёт модель тем ключом, которым �
     { kind: "speech", text: "Срок " },
     { kind: "speech", text: "— июнь." },
   ]);
-  assert.deepEqual(restartedCalls[0], {
-    protocol: "anthropic",
-    baseAddress: "https://api.anthropic.com",
-    modelName: "claude-sonnet",
-    secret: keyDraft.secret,
-    messages: [{ role: "user", text: "Какой срок поставки?" }],
-  });
+  assert.equal(restartedCalls[0]?.protocol, "anthropic");
+  assert.equal(restartedCalls[0]?.baseAddress, "https://api.anthropic.com");
+  assert.equal(restartedCalls[0]?.modelName, "claude-sonnet");
+  assert.equal(restartedCalls[0]?.secret, keyDraft.secret);
+  assert.equal(restartedCalls[0]?.messages[0]?.text.endsWith("Какой срок поставки?"), true);
+  assert.equal(restartedCalls[0]?.messages[0]?.text.includes("Срок — июнь."), true);
 });
 
 test("речь модели приходит потоком, не дожидаясь конца ответа", async () => {
@@ -1421,7 +1417,7 @@ test("таймаут и ошибка модели не становятся ре
   const calls: string[] = [];
   const trainer = start(tempDirectory(), {
     async *complete(call) {
-      const line = call.messages[0]?.text ?? "";
+      const line = (call.messages[0]?.text ?? "").split("\n\n").at(-1) ?? "";
       calls.push(line);
       if (line === "таймаут") {
         throw new ModelFailure("timeout");
