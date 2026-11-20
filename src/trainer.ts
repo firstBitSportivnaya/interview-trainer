@@ -65,9 +65,14 @@ export type SaveCaseResult =
   | { ok: true; caseRecord: CaseRecord }
   | { ok: false; reason: "incomplete" | "missing" };
 
+/** Отказ поставить отметку «портфолио уже отправлено»: проекта нет. */
+export type SetPortfolioSentResult =
+  | { ok: true; caseRecord: CaseRecord }
+  | { ok: false; reason: "missing" };
+
 /**
  * Профиль владельца: резюме, портфолио и кейсы.
- * Один на владельца и общий для всех дел.
+ * Один на владельца и общий для всех проектов.
  */
 export type OwnerProfile = {
   resume: string;
@@ -179,7 +184,18 @@ export type TranscriptLine = {
 export const ABSENT_FACT = "В материале проекта этого нет.";
 
 /** Один вопрос персонажа. После него персонаж ждёт и сам очередь не продолжает. */
-const OPENING_TASK = "Задай один вопрос исполнителю по материалу проекта и остановись.";
+function openingTask(role: string, askExperience: boolean): string {
+  if (askExperience) {
+    return `Задай один вопрос про опыт исполнителю в роли «${role}» и остановись. Формулировку профиля не произноси и не подсказывай.`;
+  }
+  return `Задай один вопрос исполнителю в роли «${role}» и остановись.`;
+}
+
+/** Обе версии в материале проекта остаются открытыми: персонаж не выбирает одну. */
+const FORK_RULE = "Если в материале проекта названы две версии, назови обе и не выбирай одну.";
+
+/** При стоящей отметке персонаж спрашивает про опыт и не цитирует профиль. */
+const PROFILE_RULE = "Спроси про опыт. Формулировку профиля не произноси и не подсказывай.";
 
 /** Отказ открыть сессию: тройка уже открыта, записи нет или поле не из каталога. */
 export type OpenSessionResult =
@@ -502,37 +518,92 @@ function dossierDraftPrompt(layers: DossierLayers): string {
   ].join("\n");
 }
 
+function historyText(history: readonly TranscriptLine[]): string {
+  if (history.length === 0) {
+    return "пока пусто";
+  }
+  return history.map((line) => `${line.speaker}: ${line.text}`).join("\n");
+}
+
 /**
  * Задание персонажу заказчика.
  * Факты — только материал проекта. Заметки хода подготовки — линия поведения, не источник фактов.
- * Служебный слой и шпаргалка в текст не входят: персонаж их не произносит.
+ * Служебный слой и шпаргалка проекта в текст не входят.
+ * Профиль входит только при стоящей отметке и не произносится.
  */
 function customerPrompt(input: {
   character: string;
+  role: string;
   material: string;
   notes: readonly string[];
   history: readonly TranscriptLine[];
+  profile?: OwnerProfile;
   task: string;
 }): string {
-  const historyText =
-    input.history.length === 0
-      ? "пока пусто"
-      : input.history.map((line) => `${line.speaker}: ${line.text}`).join("\n");
-  return [
+  const lines = [
     `Ты — персонаж «${input.character}», сторона «заказчик».`,
+    `Исполнитель в роли «${input.role}».`,
     "Факты бери только из материала проекта.",
     `Если факта в материале проекта нет, скажи дословно: ${ABSENT_FACT}`,
-    "Шпаргалку не произноси. Служебный слой не читай и не упоминай.",
+    "Шпаргалку проекта не произноси. Служебный слой не читай и не упоминай.",
+    FORK_RULE,
     "Линия поведения — не факты. Фактов из неё не произноси.",
     "",
     "Линия поведения:",
     input.notes.length === 0 ? "нет" : input.notes.join("\n"),
     "",
+  ];
+  if (input.profile) {
+    lines.push(
+      "Профиль не входит в материал проекта. Вопрос про опыт не заменяй фразой об отсутствии факта.",
+      PROFILE_RULE,
+      "",
+      "Профиль:",
+      "Резюме:",
+      input.profile.resume,
+      "Портфолио:",
+      input.profile.portfolio,
+      "Кейсы:",
+      input.profile.cases,
+      "",
+    );
+  }
+  lines.push("Материал проекта:", input.material, "", "Стенограмма:", historyText(input.history), "", input.task);
+  return lines.join("\n");
+}
+
+/**
+ * Задание персонажу внутренней команды.
+ * Он читает материал проекта и служебный слой. Шпаргалка проекта и профиль в текст не входят.
+ */
+function internalPrompt(input: {
+  character: string;
+  role: string;
+  material: string;
+  serviceLayer: string;
+  notes: readonly string[];
+  history: readonly TranscriptLine[];
+  task: string;
+}): string {
+  return [
+    `Ты — персонаж «${input.character}», сторона «внутренняя команда».`,
+    `Исполнитель в роли «${input.role}».`,
+    "Факты бери из материала проекта и служебного слоя.",
+    `Если факта нет ни в материале проекта, ни в служебном слое, скажи дословно: ${ABSENT_FACT}`,
+    "Шпаргалку проекта не произноси. Профиль не произноси.",
+    FORK_RULE,
+    "",
+    "Ход подготовки:",
+    input.notes.length === 0 ? "нет" : input.notes.join("\n"),
+    "",
+    "Служебный слой:",
+    input.serviceLayer,
+    "",
     "Материал проекта:",
     input.material,
     "",
     "Стенограмма:",
-    historyText,
+    historyText(input.history),
     "",
     input.task,
   ].join("\n");
@@ -1065,20 +1136,65 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     }
   }
 
-  /** Задание персонажу заказчика: материал проекта и линия поведения, без служебного слоя. */
-  function customerTask(session: SessionRecord, task: string): { ok: true; text: string } | { ok: false } {
+  function portfolioMarked(caseId: string): boolean {
+    const row = database.prepare("SELECT portfolio_sent FROM cases WHERE id = ?").get(caseId) as Row | undefined;
+    if (!row) {
+      return false;
+    }
+    return integerColumn(row, "portfolio_sent") === 1;
+  }
+
+  function loadProfile(): OwnerProfile {
+    const row = database
+      .prepare("SELECT resume, portfolio, cases_text FROM owner_profile WHERE id = 'owner'")
+      .get() as Row | undefined;
+    if (!row) {
+      return { resume: "", portfolio: "", cases: "" };
+    }
+    return {
+      resume: textColumn(row, "resume"),
+      portfolio: textColumn(row, "portfolio"),
+      cases: textColumn(row, "cases_text"),
+    };
+  }
+
+  /**
+   * Задание персонажу открытой сессии.
+   * Заказчик не получает служебный слой. Внутренняя команда получает его.
+   * Профиль заказчика входит только при стоящей отметке.
+   */
+  function characterTask(session: SessionRecord, task: string): { ok: true; text: string } | { ok: false } {
     const dossier = loadDossier(session.dossierId);
-    if (!dossier) {
+    const caseRow = database.prepare(`${caseQuery} WHERE cases.id = ?`).get(session.caseId) as Row | undefined;
+    if (!dossier || !caseRow) {
       return { ok: false };
     }
     const notes = readPreparationRecord(session.caseId, session.role, session.executorId)?.notes ?? [];
+    const history = readTranscriptRows(session.id);
+    if (session.side === "внутренняя команда") {
+      return {
+        ok: true,
+        text: internalPrompt({
+          character: session.character,
+          role: session.role,
+          material: dossier.material,
+          serviceLayer: dossier.serviceLayer,
+          notes,
+          history,
+          task,
+        }),
+      };
+    }
+    const caseRecord = loadCase(caseRow);
     return {
       ok: true,
       text: customerPrompt({
         character: session.character,
+        role: session.role,
         material: dossier.material,
         notes,
-        history: readTranscriptRows(session.id),
+        history,
+        profile: caseRecord.portfolioSent ? loadProfile() : undefined,
         task,
       }),
     };
@@ -1214,6 +1330,20 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     },
 
     /**
+     * Ставит или снимает отметку «портфолио уже отправлено».
+     * Другие поля проекта и досье не меняет. Неизвестного проекта нет.
+     */
+    setPortfolioSent(caseId: string, sent: boolean): SetPortfolioSentResult {
+      const id = caseId.trim();
+      if (!id || !caseExists(id)) {
+        return { ok: false, reason: "missing" };
+      }
+      database.prepare("UPDATE cases SET portfolio_sent = ? WHERE id = ?").run(sent ? 1 : 0, id);
+      const row = database.prepare(`${caseQuery} WHERE cases.id = ?`).get(id) as Row;
+      return { ok: true, caseRecord: loadCase(row) };
+    },
+
+    /**
      * Записывает профиль владельца.
      * Повторная запись заменяет ту же строку, вторую не создаёт.
      */
@@ -1228,17 +1358,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
 
     /** Возвращает профиль владельца. Пока его не сохраняли, поля пустые. */
     readProfile(): OwnerProfile {
-      const row = database
-        .prepare("SELECT resume, portfolio, cases_text FROM owner_profile WHERE id = 'owner'")
-        .get() as Row | undefined;
-      if (!row) {
-        return { resume: "", portfolio: "", cases: "" };
-      }
-      return {
-        resume: textColumn(row, "resume"),
-        portfolio: textColumn(row, "portfolio"),
-        cases: textColumn(row, "cases_text"),
-      };
+      return loadProfile();
     },
 
     /**
@@ -1467,9 +1587,8 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     },
 
     /**
-     * Персонаж заказчика задаёт один вопрос по материалу проекта и делает паузу.
+     * Персонаж задаёт один вопрос по роли исполнителя и делает паузу.
      * Повторный вызов модель не зовёт: очередь сама не продолжается.
-     * Сторону внутренней команды этот вызов не меняет.
      * signal обрывает генерацию, когда страница закрыла поток.
      */
     async *openingQuestion(sessionId: string, signal?: AbortSignal): AsyncIterable<SpeechEvent> {
@@ -1478,12 +1597,12 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
         yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
         return;
       }
-      if (session.side !== "заказчик" || hasOpeningQuestion(session.id) || openingReservations.has(session.id)) {
+      if (hasOpeningQuestion(session.id) || openingReservations.has(session.id)) {
         return;
       }
       openingReservations.add(session.id);
       try {
-        const task = customerTask(session, OPENING_TASK);
+        const task = characterTask(session, openingTask(session.role, session.side === "заказчик" && portfolioMarked(session.caseId)));
         if (!task.ok) {
           yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
           return;
@@ -1500,9 +1619,8 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
 
     /**
      * Зовёт модель ключом, которым открыта сессия.
-     * У заказчика ответ берётся из материала проекта и пишется в стенограмму.
+     * Ответ берётся из слоя, открытого стороне, и пишется в стенограмму.
      * Исполнитель может спросить, не дожидаясь вопроса персонажа.
-     * Внутренняя команда получает прежний вызов: одна реплика, без стенограммы.
      * Речь приходит кусками. Ошибка модели в речь не подмешивается.
      * signal обрывает генерацию, когда страница закрыла поток.
      */
@@ -1512,15 +1630,11 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
         yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
         return;
       }
-      if (session.side !== "заказчик") {
-        yield* streamKey(session, [{ role: "user", text: line }], { text: "", failed: false }, signal);
-        return;
-      }
       const text = line.trim();
       if (!text) {
         return;
       }
-      const task = customerTask(session, text);
+      const task = characterTask(session, text);
       if (!task.ok) {
         yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
         return;

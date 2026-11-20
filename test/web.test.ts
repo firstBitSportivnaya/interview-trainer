@@ -200,6 +200,9 @@ test("ошибка записи не останавливает веб", async (
     listOpenSessions() {
       return [];
     },
+    setPortfolioSent() {
+      return { ok: false, reason: "missing" };
+    },
   });
 
   try {
@@ -825,6 +828,80 @@ test("веб записывает файл в названный слой и н�
     assert.deepEqual(trainer.readApprovedDossier(item.id), approved);
     assert.equal(trainer.listSourceFiles(item.id)[0]?.layer, "serviceLayer");
     assert.equal(trainer.listSourceFiles(item.id)[0]?.extractedText, raw);
+  } finally {
+    await close(server);
+  }
+});
+
+test("страница проекта ставит и снимает отметку «портфолио уже отправлено»", async () => {
+  const directory = tempDirectory();
+  const trainer = start(directory);
+  const server = await startWeb(trainer);
+
+  try {
+    const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+    assert.ok(saved.ok);
+    const approved = trainer.approveDossier({
+      caseId: saved.caseRecord.id,
+      material: "Склад принимает паллеты.",
+      serviceLayer: "Маржа подрядчика 12%.",
+      crib: "Спросить про сроки.",
+    });
+    assert.ok(approved.ok);
+
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    const before = await (await fetch(`${base}/cases/${saved.caseRecord.id}`)).text();
+    assert.equal(before.includes("Отметка «портфолио уже отправлено» снята."), true);
+    assert.equal(before.includes("Поставить отметку «портфолио уже отправлено»"), true);
+
+    const foreign = await fetch(`${base}/cases/${saved.caseRecord.id}/portfolio`, {
+      method: "POST",
+      headers: { ...headers, origin: "https://evil.example" },
+      body: new URLSearchParams({ sent: "1" }),
+    });
+    assert.equal(foreign.status, 403);
+    assert.equal(trainer.readCase(saved.caseRecord.id)?.portfolioSent, false);
+
+    const unknown = await fetch(`${base}/cases/нет-такого-проекта/portfolio`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ sent: "1" }),
+    });
+    assert.equal(unknown.status, 404);
+
+    const noise = await fetch(`${base}/cases/${saved.caseRecord.id}/portfolio`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ sent: "позже" }),
+    });
+    const noisePage = await noise.text();
+    assert.equal(noise.status, 200);
+    assert.equal(noisePage.includes("Отметка «портфолио уже отправлено» снята."), true);
+    assert.equal(trainer.readCase(saved.caseRecord.id)?.portfolioSent, false);
+    assert.deepEqual(trainer.readApprovedDossier(saved.caseRecord.id), approved.dossier);
+
+    const marked = await fetch(`${base}/cases/${saved.caseRecord.id}/portfolio`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ sent: "1" }),
+    });
+    const markedPage = await marked.text();
+    assert.equal(marked.status, 200);
+    assert.equal(markedPage.includes("Отметка «портфолио уже отправлено» стоит."), true);
+    assert.equal(trainer.readCase(saved.caseRecord.id)?.portfolioSent, true);
+    assert.deepEqual(trainer.readApprovedDossier(saved.caseRecord.id), approved.dossier);
+
+    const cleared = await fetch(`${base}/cases/${saved.caseRecord.id}/portfolio`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ sent: "0" }),
+    });
+    const clearedPage = await cleared.text();
+    assert.equal(cleared.status, 200);
+    assert.equal(clearedPage.includes("Отметка «портфолио уже отправлено» снята."), true);
+    assert.equal(trainer.readCase(saved.caseRecord.id)?.portfolioSent, false);
   } finally {
     await close(server);
   }
