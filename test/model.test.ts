@@ -222,6 +222,39 @@ test("ошибка внутри потока не становится речь�
   }
 });
 
+test("чужой протокол не уходит в запрос", async () => {
+  let hits = 0;
+  const server = await listen((request, response) => {
+    hits += 1;
+    request.resume();
+    response.writeHead(204);
+    response.end();
+  });
+
+  try {
+    const chunks: string[] = [];
+    await assert.rejects(
+      async () => {
+        for await (const text of liveModel().complete(
+          { ...callFor("anthropic", origin(server)), protocol: "grpc" as Protocol },
+          new AbortController().signal,
+        )) {
+          chunks.push(text);
+        }
+      },
+      (error: unknown) => {
+        assert.ok(error instanceof ModelFailure);
+        assert.equal(error.reason, "model");
+        return true;
+      },
+    );
+    assert.equal(hits, 0);
+    assert.deepEqual(chunks, []);
+  } finally {
+    await close(server);
+  }
+});
+
 test("обрыв чтения останавливает адаптер", { timeout: 2000 }, async () => {
   let release = () => {};
   const gate = new Promise<void>((resolve) => {

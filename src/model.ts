@@ -60,6 +60,9 @@ export function liveModel(options: LiveModelOptions = {}): ModelPort {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   return {
     complete(call, signal) {
+      if (call.protocol !== "anthropic" && call.protocol !== "openai-compatible") {
+        return rejectedProtocol();
+      }
       const messages = call.messages.map((message) => ({ role: message.role, content: message.text }));
       if (call.protocol === "anthropic") {
         return streamReply(
@@ -84,6 +87,10 @@ export function liveModel(options: LiveModelOptions = {}): ModelPort {
       );
     },
   };
+}
+
+async function* rejectedProtocol(): AsyncGenerator<string> {
+  throw new ModelFailure("model");
 }
 
 function endpoint(baseAddress: string, path: string): string {

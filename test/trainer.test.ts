@@ -800,6 +800,31 @@ test("речь модели приходит потоком, не дожидая
   await iterator.return?.();
 });
 
+test("обрыв чтения отменяет вызов модели", async () => {
+  let signal: AbortSignal | undefined;
+  const trainer = start(tempDirectory(), {
+    async *complete(_call, incoming) {
+      signal = incoming;
+      yield "Срок ";
+      await new Promise<void>((resolve) => {
+        if (incoming.aborted) {
+          resolve();
+          return;
+        }
+        incoming.addEventListener("abort", () => resolve(), { once: true });
+      });
+    },
+  });
+  const prepared = prepare(trainer);
+  const openedSession = openAnalyst(trainer, prepared);
+  assert.ok(openedSession.ok);
+
+  const iterator = trainer.reply(openedSession.session.id, "Какой срок поставки?")[Symbol.asyncIterator]();
+  assert.deepEqual((await iterator.next()).value, { kind: "speech", text: "Срок " });
+  await iterator.return?.();
+  assert.equal(signal?.aborted, true);
+});
+
 test("таймаут и ошибка модели не становятся речью", async () => {
   const calls: string[] = [];
   const trainer = start(tempDirectory(), {
