@@ -42,7 +42,7 @@ export type PerformerRole =
 /** Сторона, напротив которой сидит исполнитель. */
 export type Side = "заказчик" | "внутренняя команда";
 
-/** Дело заказчика, которое можно прочитать после перезапуска. */
+/** Проект заказчика, который можно прочитать после перезапуска. */
 export type CaseRecord = {
   id: string;
   customerId: string;
@@ -50,17 +50,17 @@ export type CaseRecord = {
   title: string;
   /** Персонажи заказчика. Пустой список не хранит голос «заказчик»: его добавляет customerVoices. */
   characters: string[];
-  /** Отметка «портфолио уже отправлено». У нового дела снята. */
+  /** Отметка «портфолио уже отправлено». У нового проекта снята. */
   portfolioSent: boolean;
 };
 
-/** Заказчик. Второе дело ссылается на ту же запись и не заводит вторую компанию. */
+/** Заказчик. Второй проект ссылается на ту же запись и не заводит вторую компанию. */
 export type CustomerRecord = {
   id: string;
   name: string;
 };
 
-/** Отказ завести дело: нет имени заказчика или названия, либо заказчик для второго дела не найден. */
+/** Отказ завести проект: нет имени заказчика или названия, либо заказчик для второго проекта не найден. */
 export type SaveCaseResult =
   | { ok: true; caseRecord: CaseRecord }
   | { ok: false; reason: "incomplete" | "missing" };
@@ -87,19 +87,19 @@ export type DraftDossierResult =
   | { ok: true; draft: DossierLayers }
   | { ok: false; reason: "incomplete" | "missing" | "timeout" | "model" | "secret" };
 
-/** Утверждённое досье дела. Сессия хранит его идентификатор. */
+/** Утверждённое досье проекта. Сессия хранит его идентификатор. */
 export type DossierRecord = {
   id: string;
   caseId: string;
-  /** Материал дела. */
+  /** Материал проекта. */
   material: string;
   /** Служебный слой. */
   serviceLayer: string;
-  /** Шпаргалка дела. */
+  /** Шпаргалка проекта. */
   crib: string;
 };
 
-/** Отказ утвердить досье: дела нет. */
+/** Отказ утвердить досье: проекта нет. */
 export type ApproveDossierResult =
   | { ok: true; dossier: DossierRecord }
   | { ok: false; reason: "missing" };
@@ -141,7 +141,7 @@ export type OpenSessionResult =
   | { ok: true; session: SessionRecord }
   | { ok: false; reason: "open" | "missing" | "role" | "side" | "incomplete" };
 
-/** Ход подготовки одной тройки «дело + роль исполнителя + исполнитель». */
+/** Ход подготовки одной тройки «проект + роль исполнителя + исполнитель». */
 export type PreparationRecord = {
   caseId: string;
   role: PerformerRole;
@@ -157,7 +157,7 @@ export type PreparationDraft = {
   note: string;
 };
 
-/** Отказ дописать ход: дела нет, роль чужая или заметка пустая. */
+/** Отказ дописать ход: проекта нет, роль чужая или заметка пустая. */
 export type WritePreparationResult =
   | { ok: true; preparation: PreparationRecord }
   | { ok: false; reason: "missing" | "role" | "incomplete" };
@@ -375,14 +375,14 @@ function namedCharacters(names: readonly string[] | undefined): string[] {
 }
 
 /**
- * Голоса заказчика на деле.
+ * Голоса заказчика на проекте.
  * Пустой список даёт один голос «заказчик», не записывая его в персонажи.
  */
 export function customerVoices(characters: readonly string[]): string[] {
   return characters.length === 0 ? ["заказчик"] : [...characters];
 }
 
-/** Прежнее хранилище без отметки портфолио получает колонку. Уже записанное дело остаётся без отметки. */
+/** Прежнее хранилище без отметки портфолио получает колонку. Уже записанный проект остаётся без отметки. */
 function ensureCaseShape(database: DatabaseSync): void {
   const rows = database.prepare("PRAGMA table_info(cases)").all() as Row[];
   const names = new Set(rows.map((row) => textColumn(row, "name")));
@@ -398,13 +398,13 @@ function dossierDraftPrompt(layers: DossierLayers): string {
     "Не переноси текст между слоями. Не добавляй фактов, которых нет во вставленном тексте.",
     "Верни только JSON-объект с полями material, serviceLayer и crib. Значения — строки.",
     "",
-    "Материал дела:",
+    "Материал проекта:",
     layers.material,
     "",
     "Служебный слой:",
     layers.serviceLayer,
     "",
-    "Шпаргалка дела:",
+    "Шпаргалка проекта:",
     layers.crib,
   ].join("\n");
 }
@@ -689,10 +689,10 @@ function readSessionRecord(row: Row): SessionRecord {
 
 /**
  * Ядро одного владельца.
- * Каталог — хранилище на этой машине: заказчики, дела, профиль, досье, сессии, ход подготовки и ключи.
+ * Каталог — хранилище на этой машине: заказчики, проекты, профиль, досье, сессии, ход подготовки и ключи.
  * Список ключей секрет целиком не отдаёт. Секрет в хранилище свёрнут средствами ОС.
  * Одна открытая сессия на тройку
- * «дело + роль исполнителя + исполнитель» держится уникальным индексом.
+ * «проект + роль исполнителя + исполнитель» держится уникальным индексом.
  * Прежний процесс, который пишет keys.json, нужно остановить до этого запуска.
  * Модель приходит портом: проверка подставляет записанную, запуск — живую.
  */
@@ -849,8 +849,8 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     },
 
     /**
-     * Одним действием заводит заказчика и первое дело.
-     * Пустое имя или название дело не создают. Пустой список персонажей остаётся пустым.
+     * Одним действием заводит заказчика и первый проект.
+     * Пустое имя или название не создают проект. Пустой список персонажей остаётся пустым.
      */
     saveCase(draft: { customerName: string; title: string; characters?: readonly string[] }): SaveCaseResult {
       const customerName = draft.customerName.trim();
@@ -875,8 +875,8 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     },
 
     /**
-     * Добавляет ещё одно дело уже существующему заказчику.
-     * Новую компанию не создаёт. Неизвестный заказчик дело не создаёт.
+     * Добавляет ещё один проект уже существующему заказчику.
+     * Новую компанию не создаёт. Неизвестный заказчик проект не создаёт.
      */
     addCase(draft: { customerId: string; title: string; characters?: readonly string[] }): SaveCaseResult {
       const customerId = draft.customerId.trim();
@@ -910,13 +910,13 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       return rows.map((row) => ({ id: textColumn(row, "id"), name: textColumn(row, "name") }));
     },
 
-    /** Возвращает дела в порядке появления. */
+    /** Возвращает проекты в порядке появления. */
     listCases(): CaseRecord[] {
       const rows = database.prepare(`${caseQuery} ORDER BY cases.rowid`).all() as Row[];
       return rows.map((row) => loadCase(row));
     },
 
-    /** Возвращает дело. Нет идентификатора — дела нет. */
+    /** Возвращает проект. Нет идентификатора — проекта нет. */
     readCase(caseId: string): CaseRecord | undefined {
       const row = database.prepare(`${caseQuery} WHERE cases.id = ?`).get(caseId) as Row | undefined;
       return row ? loadCase(row) : undefined;
@@ -1035,7 +1035,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     },
 
     /**
-     * Возвращает последнее утверждённое досье дела.
+     * Возвращает последнее утверждённое досье проекта.
      * Черновик сюда не входит. Пока владелец не утвердил правку, досье нет.
      */
     readApprovedDossier(caseId: string): DossierRecord | undefined {

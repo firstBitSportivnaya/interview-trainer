@@ -270,7 +270,7 @@ test("чужой Host не открывает страницу и не сохр�
   }
 });
 
-test("веб заводит заказчика, дело и утверждённое досье тем же ядром", async () => {
+test("веб заводит заказчика, проект и утверждённое досье тем же ядром", async () => {
   const directory = tempDirectory();
   const trainer = openTrainer(directory, {
     async *complete() {
@@ -321,7 +321,7 @@ test("веб заводит заказчика, дело и утверждённ
     const foreign = await fetch(`${base}/customers`, {
       method: "POST",
       headers: { ...headers, origin: "https://evil.example" },
-      body: new URLSearchParams({ customerName: "Чужой", title: "Чужое дело" }),
+      body: new URLSearchParams({ customerName: "Чужой", title: "Чужой проект" }),
     });
     assert.equal(foreign.status, 403);
 

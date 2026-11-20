@@ -366,7 +366,7 @@ test("файл хранилища доступен только владельц
   assert.equal(statSync(join(directory, "store.sqlite")).mode & 0o777, 0o600);
 });
 
-test("пустое дело не создаётся", () => {
+test("пустой проект не создаётся", () => {
   const trainer = start();
   assert.deepEqual(trainer.saveCase({ customerName: "  ", title: "Склад" }), {
     ok: false,
@@ -376,10 +376,10 @@ test("пустое дело не создаётся", () => {
     ok: false,
     reason: "incomplete",
   });
-  assert.equal(trainer.readCase("нет-такого-дела"), undefined);
+  assert.equal(trainer.readCase("нет-такого-проекта"), undefined);
 });
 
-test("создание заказчика создаёт первое дело", () => {
+test("создание заказчика создаёт первый проект", () => {
   const trainer = start();
   const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада" });
   assert.ok(saved.ok);
@@ -391,7 +391,7 @@ test("создание заказчика создаёт первое дело",
   assert.deepEqual(trainer.readCase(saved.caseRecord.id), saved.caseRecord);
 });
 
-test("второе дело принадлежит тому же заказчику и не создаёт вторую компанию", () => {
+test("второй проект принадлежит тому же заказчику и не создаёт вторую компанию", () => {
   const trainer = start();
   const first = trainer.saveCase({ customerName: "Север", title: "Внедрение склада" });
   assert.ok(first.ok);
@@ -413,7 +413,7 @@ test("второе дело принадлежит тому же заказчи�
   );
 });
 
-test("пустой список персонажей даёт голос заказчик, названные хранятся на деле", () => {
+test("пустой список персонажей даёт голос заказчик, названные хранятся на проекте", () => {
   const directory = tempDirectory();
   const trainer = start(directory);
   const saved = trainer.saveCase({
@@ -443,7 +443,7 @@ test("пустой список персонажей даёт голос зак�
   assert.deepEqual(again.readCase(named.caseRecord.id)?.characters, ["Анна", "Борис"]);
 });
 
-test("профиль один на владельца, отметка портфолио у нового дела снята", () => {
+test("профиль один на владельца, отметка портфолио у нового проекта снята", () => {
   const directory = tempDirectory();
   const trainer = start(directory);
   assert.deepEqual(trainer.readProfile(), { resume: "", portfolio: "", cases: "" });
@@ -466,7 +466,7 @@ test("профиль один на владельца, отметка портф
   assert.deepEqual(again.listCustomers(), [{ id: first.caseRecord.customerId, name: "Север" }]);
 });
 
-test("дело прежнего хранилища читается без отметки портфолио и без персонажей", () => {
+test("проект прежнего хранилища читается без отметки портфолио и без персонажей", () => {
   const directory = tempDirectory();
   const database = new DatabaseSync(join(directory, "store.sqlite"));
   database.exec(`
@@ -1089,7 +1089,7 @@ test("сессия открывается ключом с тем id, котор�
   );
 });
 
-test("дело, досье, сессия, ход подготовки и ключ читаются после перезапуска", () => {
+test("проект, досье, сессия, ход подготовки и ключ читаются после перезапуска", () => {
   const directory = tempDirectory();
   const trainer = start(directory);
   const prepared = prepare(trainer);
@@ -1177,7 +1177,7 @@ test("дело, досье, сессия, ход подготовки и клю�
   assert.equal(JSON.stringify(keys).includes(keyDraft.secret), false);
 });
 
-test("сессия не открывается по досье другого дела", () => {
+test("сессия не открывается по досье другого проекта", () => {
   const trainer = start();
   const prepared = prepare(trainer);
   const other = trainer.saveCase({ customerName: "Юг", title: "Касса" });

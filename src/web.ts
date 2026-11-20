@@ -45,13 +45,13 @@ const KEY_ERROR: Record<Exclude<SaveKeyResult, { ok: true }>["reason"], string> 
 };
 
 const CASE_ERROR: Record<Exclude<SaveCaseResult, { ok: true }>["reason"], string> = {
-  incomplete: "Укажите заказчика и название дела.",
+  incomplete: "Укажите заказчика и название проекта.",
   missing: "Заказчик не найден.",
 };
 
 const DRAFT_ERROR: Record<Exclude<DraftDossierResult, { ok: true }>["reason"], string> = {
   incomplete: "Вставьте текст хотя бы одного слоя и выберите ключ.",
-  missing: "Дело или ключ не найдены.",
+  missing: "Проект или ключ не найдены.",
   timeout: "Модель не ответила вовремя.",
   model: "Модель не собрала черновик.",
   secret: "Секрет ключа не читается.",
@@ -94,7 +94,7 @@ function page(title: string, body: string): string {
   </style>
 </head>
 <body>
-  <nav><a href="/">Ключи</a><a href="/cases">Дела</a></nav>
+  <nav><a href="/">Ключи</a><a href="/cases">Проекты</a></nav>
   ${body}
 </body>
 </html>`;
@@ -164,7 +164,7 @@ function renderKeys(keys: KeySummary[], error?: string): string {
 function renderProfile(profile: OwnerProfile): string {
   return `<section>
     <h2>Профиль</h2>
-    <p>Резюме, портфолио и кейсы одни на владельца и общие для всех дел.</p>
+    <p>Резюме, портфолио и кейсы одни на владельца и общие для всех проектов.</p>
     <form method="post" action="/profile">
       <label>Резюме
         <textarea name="resume">${escapeHtml(profile.resume)}</textarea>
@@ -185,7 +185,7 @@ function renderCases(trainer: Trainer, error?: string): string {
   const cases = trainer.listCases();
   const items =
     cases.length === 0
-      ? "<p>Дел пока нет.</p>"
+      ? "<p>Проектов пока нет.</p>"
       : `<ul>${cases
           .map(
             (item) =>
@@ -203,19 +203,19 @@ function renderCases(trainer: Trainer, error?: string): string {
                 .join("")}
             </select>
           </label>
-          <label>Название дела
+          <label>Название проекта
             <input name="title" required>
           </label>
           <label>Персонажи заказчика, по одному в строке
             <textarea name="characters"></textarea>
           </label>
-          <button type="submit">Добавить дело</button>
+          <button type="submit">Добавить проект</button>
         </form>`;
 
   return page(
-    "Дела",
-    `<h1>Дела</h1>
-    <p>Заказчик и первое дело заводятся вместе. Следующее дело остаётся у того же заказчика.</p>
+    "Проекты",
+    `<h1>Проекты</h1>
+    <p>Заказчик и первый проект заводятся вместе. Следующий проект остаётся у того же заказчика.</p>
     ${notice(error)}
     ${renderProfile(trainer.readProfile())}
     <section>
@@ -224,32 +224,32 @@ function renderCases(trainer: Trainer, error?: string): string {
         <label>Заказчик
           <input name="customerName" required>
         </label>
-        <label>Название первого дела
+        <label>Название первого проекта
           <input name="title" required>
         </label>
         <label>Персонажи заказчика, по одному в строке
           <textarea name="characters"></textarea>
         </label>
-        <button type="submit">Завести заказчика и дело</button>
+        <button type="submit">Завести заказчика и проект</button>
       </form>
     </section>
     <section>
-      <h2>Ещё одно дело</h2>
+      <h2>Ещё один проект</h2>
       ${addCase}
     </section>
-    <h2>Все дела</h2>
+    <h2>Все проекты</h2>
     ${items}`,
   );
 }
 
 function layerAreas(layers: DossierLayers): string {
-  return `<label>Материал дела
+  return `<label>Материал проекта
       <textarea name="material">${escapeHtml(layers.material)}</textarea>
     </label>
     <label>Служебный слой
       <textarea name="serviceLayer">${escapeHtml(layers.serviceLayer)}</textarea>
     </label>
-    <label>Шпаргалка дела
+    <label>Шпаргалка проекта
       <textarea name="crib">${escapeHtml(layers.crib)}</textarea>
     </label>`;
 }
@@ -261,11 +261,11 @@ function approvedBlock(dossier: DossierRecord | undefined): string {
   return `<section>
     <h2>Утверждённое досье</h2>
     <p>Сессия ещё не открывается. В диалог позже попадёт только этот текст.</p>
-    <h3>Материал дела</h3>
+    <h3>Материал проекта</h3>
     <pre>${escapeHtml(dossier.material)}</pre>
     <h3>Служебный слой</h3>
     <pre>${escapeHtml(dossier.serviceLayer)}</pre>
-    <h3>Шпаргалка дела</h3>
+    <h3>Шпаргалка проекта</h3>
     <pre>${escapeHtml(dossier.crib)}</pre>
   </section>`;
 }
@@ -420,7 +420,7 @@ function refuse(request: IncomingMessage, response: ServerResponse, status: numb
   response.end();
 }
 
-/** Отвечает на ключи, дела и утверждение досье. Чужой Host и чужой Origin запись не открывают. */
+/** Отвечает на ключи, проекты и утверждение досье. Чужой Host и чужой Origin запись не открывают. */
 async function handle(server: Server, trainer: Trainer, request: IncomingMessage, response: ServerResponse): Promise<void> {
   const address = server.address();
   const listenPort = address && typeof address === "object" ? address.port : undefined;
