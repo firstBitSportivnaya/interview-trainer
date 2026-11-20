@@ -10,6 +10,7 @@ import { openTrainer } from "../src/trainer.ts";
 import { startWeb } from "../src/web.ts";
 
 const directories: string[] = [];
+const opened: Array<ReturnType<typeof openTrainer>> = [];
 
 function tempDirectory(): string {
   const directory = mkdtempSync(join(tmpdir(), "trainer-web-"));
@@ -17,7 +18,16 @@ function tempDirectory(): string {
   return directory;
 }
 
+function start(directory: string) {
+  const trainer = openTrainer(directory);
+  opened.push(trainer);
+  return trainer;
+}
+
 after(() => {
+  for (const trainer of opened) {
+    trainer.close();
+  }
   for (const directory of directories) {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -60,7 +70,7 @@ async function close(server: Server): Promise<void> {
 
 test("веб слушает только этот компьютер, без пароля, и сохраняет ключи через ядро", async () => {
   const directory = tempDirectory();
-  const trainer = openTrainer(directory);
+  const trainer = start(directory);
   const server = await startWeb(trainer);
 
   try {
@@ -107,7 +117,7 @@ test("веб слушает только этот компьютер, без п�
     await close(server);
   }
 
-  const keys = openTrainer(directory).listKeys();
+  const keys = start(directory).listKeys();
   assert.deepEqual(
     keys.map((key) => ({
       protocol: key.protocol,
@@ -166,7 +176,7 @@ test("ошибка записи не останавливает веб", async (
 
 test("чужая страница не сохраняет ключ, своя сохраняет", async () => {
   const directory = tempDirectory();
-  const trainer = openTrainer(directory);
+  const trainer = start(directory);
   const server = await startWeb(trainer);
 
   try {
@@ -206,7 +216,7 @@ test("чужая страница не сохраняет ключ, своя с�
 
 test("чужой Host не открывает страницу и не сохраняет ключ", async () => {
   const directory = tempDirectory();
-  const trainer = openTrainer(directory);
+  const trainer = start(directory);
   const server = await startWeb(trainer);
 
   try {
