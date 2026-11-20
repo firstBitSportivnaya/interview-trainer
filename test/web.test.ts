@@ -171,6 +171,12 @@ test("ошибка записи не останавливает веб", async (
     readProfile() {
       return { resume: "", portfolio: "", cases: "" };
     },
+    addSourceFile() {
+      return { ok: false, reason: "missing" };
+    },
+    listSourceFiles() {
+      return [];
+    },
     async draftDossier() {
       return { ok: false, reason: "missing" };
     },
@@ -728,6 +734,97 @@ test("закрытие потока первого вопроса останав
       trainer.readTranscript(openedSession.session.id)?.some((line) => line.kind === "вопрос"),
       false,
     );
+  } finally {
+    await close(server);
+  }
+});
+
+test("веб записывает файл в названный слой и не меняет утверждённое досье", async () => {
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, {
+    async *complete() {
+      yield JSON.stringify({ material: "черновик", serviceLayer: "", crib: "" });
+    },
+  });
+  opened.push(trainer);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    await fetch(`${base}/keys`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({
+        protocol: "anthropic",
+        baseAddress: "https://api.anthropic.com",
+        modelName: "claude-sonnet",
+        secret: "sk-ant-api03-secret-WXYZ",
+      }),
+    });
+    await fetch(`${base}/customers`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ customerName: "Север", title: "Внедрение склада", characters: "" }),
+    });
+    const item = trainer.listCases()[0];
+    assert.ok(item);
+
+    const bare = await (await fetch(`${base}/cases/${item.id}`)).text();
+    assert.equal(bare.includes('<option value="">Выберите слой</option>'), true);
+    assert.equal(bare.includes('value="material" selected'), false);
+    assert.equal(bare.includes('value="serviceLayer" selected'), false);
+    assert.equal(bare.includes('value="crib" selected'), false);
+
+    await fetch(`${base}/cases/${item.id}/approve`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({
+        material: "УТВЕРЖДЁННЫЙ-МАТЕРИАЛ",
+        serviceLayer: "УТВЕРЖДЁННЫЙ-СЛУЖЕБНЫЙ",
+        crib: "УТВЕРЖДЁННАЯ-ШПАРГАЛКА",
+      }),
+    });
+    const approved = trainer.readApprovedDossier(item.id);
+    assert.ok(approved);
+
+    const refused = await fetch(`${base}/cases/${item.id}/file`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({
+        name: "служебный-слой.xlsx",
+        layer: "",
+        extractedText: "НЕ-УГАДЫВАТЬ",
+      }),
+    });
+    const refusedPage = await refused.text();
+    assert.equal(refused.status, 200);
+    assert.equal(refusedPage.includes("Выберите слой. Тренажёр слой не назначает сам."), true);
+    assert.equal(refusedPage.includes("Файлов проекта пока нет."), true);
+    assert.equal(refusedPage.includes("НЕ-УГАДЫВАТЬ"), false);
+    assert.deepEqual(trainer.listSourceFiles(item.id), []);
+    assert.deepEqual(trainer.readApprovedDossier(item.id), approved);
+
+    const raw = "СЫРОЙ-ТЕКСТ-ФАЙЛА";
+    const saved = await fetch(`${base}/cases/${item.id}/file`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({
+        name: "протокол.xlsx",
+        layer: "serviceLayer",
+        extractedText: raw,
+      }),
+    });
+    const page = await saved.text();
+    assert.equal(saved.status, 200);
+    assert.equal(page.includes("протокол.xlsx — Служебный слой"), true);
+    const approvedHtml = page.split("<h2>Утверждённое досье</h2>")[1] ?? "";
+    assert.equal(approvedHtml.includes(raw), false);
+    assert.equal(approvedHtml.includes("УТВЕРЖДЁННЫЙ-МАТЕРИАЛ"), true);
+    assert.deepEqual(trainer.readApprovedDossier(item.id), approved);
+    assert.equal(trainer.listSourceFiles(item.id)[0]?.layer, "serviceLayer");
+    assert.equal(trainer.listSourceFiles(item.id)[0]?.extractedText, raw);
   } finally {
     await close(server);
   }
