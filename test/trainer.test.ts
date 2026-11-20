@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 
 import { ModelFailure, type ModelCall, type ModelPort } from "../src/model.ts";
-import { openTrainer, type OpenSessionResult, type SpeechEvent } from "../src/trainer.ts";
+import { customerVoices, openTrainer, type OpenSessionResult, type SpeechEvent } from "../src/trainer.ts";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -377,6 +377,286 @@ test("пустое дело не создаётся", () => {
     reason: "incomplete",
   });
   assert.equal(trainer.readCase("нет-такого-дела"), undefined);
+});
+
+test("создание заказчика создаёт первое дело", () => {
+  const trainer = start();
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада" });
+  assert.ok(saved.ok);
+  assert.equal(saved.caseRecord.customerName, "Север");
+  assert.equal(saved.caseRecord.title, "Внедрение склада");
+  assert.equal(saved.caseRecord.portfolioSent, false);
+  assert.deepEqual(trainer.listCustomers(), [{ id: saved.caseRecord.customerId, name: "Север" }]);
+  assert.deepEqual(trainer.listCases().map((item) => item.id), [saved.caseRecord.id]);
+  assert.deepEqual(trainer.readCase(saved.caseRecord.id), saved.caseRecord);
+});
+
+test("второе дело принадлежит тому же заказчику и не создаёт вторую компанию", () => {
+  const trainer = start();
+  const first = trainer.saveCase({ customerName: "Север", title: "Внедрение склада" });
+  assert.ok(first.ok);
+  assert.deepEqual(trainer.addCase({ customerId: " ", title: "Касса" }), { ok: false, reason: "incomplete" });
+  assert.deepEqual(trainer.addCase({ customerId: "нет-такого-заказчика", title: "Касса" }), {
+    ok: false,
+    reason: "missing",
+  });
+
+  const second = trainer.addCase({ customerId: first.caseRecord.customerId, title: "Касса" });
+  assert.ok(second.ok);
+  assert.equal(second.caseRecord.customerId, first.caseRecord.customerId);
+  assert.equal(second.caseRecord.customerName, "Север");
+  assert.notEqual(second.caseRecord.id, first.caseRecord.id);
+  assert.deepEqual(trainer.listCustomers(), [{ id: first.caseRecord.customerId, name: "Север" }]);
+  assert.deepEqual(
+    trainer.listCases().map((item) => item.title),
+    ["Внедрение склада", "Касса"],
+  );
+});
+
+test("пустой список персонажей даёт голос заказчик, названные хранятся на деле", () => {
+  const directory = tempDirectory();
+  const trainer = start(directory);
+  const saved = trainer.saveCase({
+    customerName: "Север",
+    title: "Внедрение склада",
+    characters: ["  ", ""],
+  });
+  assert.ok(saved.ok);
+  assert.deepEqual(saved.caseRecord.characters, []);
+  assert.deepEqual(customerVoices(saved.caseRecord.characters), ["заказчик"]);
+
+  const named = trainer.addCase({
+    customerId: saved.caseRecord.customerId,
+    title: "Касса",
+    characters: [" Анна ", "", "Борис"],
+  });
+  assert.ok(named.ok);
+  assert.deepEqual(named.caseRecord.characters, ["Анна", "Борис"]);
+  assert.deepEqual(customerVoices(named.caseRecord.characters), ["Анна", "Борис"]);
+
+  trainer.close();
+  const again = start(directory);
+  const empty = again.readCase(saved.caseRecord.id);
+  assert.ok(empty);
+  assert.deepEqual(empty.characters, []);
+  assert.deepEqual(customerVoices(empty.characters), ["заказчик"]);
+  assert.deepEqual(again.readCase(named.caseRecord.id)?.characters, ["Анна", "Борис"]);
+});
+
+test("профиль один на владельца, отметка портфолио у нового дела снята", () => {
+  const directory = tempDirectory();
+  const trainer = start(directory);
+  assert.deepEqual(trainer.readProfile(), { resume: "", portfolio: "", cases: "" });
+  trainer.saveProfile({ resume: "Резюме", portfolio: "Портфолио", cases: "Кейс склада" });
+  trainer.saveProfile({ resume: "  Резюме 2  ", portfolio: "Портфолио 2", cases: "Кейс кассы" });
+
+  const first = trainer.saveCase({ customerName: "Север", title: "Внедрение склада" });
+  assert.ok(first.ok);
+  const second = trainer.addCase({ customerId: first.caseRecord.customerId, title: "Касса" });
+  assert.ok(second.ok);
+  assert.equal(first.caseRecord.portfolioSent, false);
+  assert.equal(second.caseRecord.portfolioSent, false);
+  assert.deepEqual(trainer.readProfile(), { resume: "Резюме 2", portfolio: "Портфолио 2", cases: "Кейс кассы" });
+
+  trainer.close();
+  const again = start(directory);
+  assert.deepEqual(again.readProfile(), { resume: "Резюме 2", portfolio: "Портфолио 2", cases: "Кейс кассы" });
+  assert.equal(again.readCase(first.caseRecord.id)?.portfolioSent, false);
+  assert.equal(again.readCase(second.caseRecord.id)?.portfolioSent, false);
+  assert.deepEqual(again.listCustomers(), [{ id: first.caseRecord.customerId, name: "Север" }]);
+});
+
+test("дело прежнего хранилища читается без отметки портфолио и без персонажей", () => {
+  const directory = tempDirectory();
+  const database = new DatabaseSync(join(directory, "store.sqlite"));
+  database.exec(`
+    CREATE TABLE customers (id TEXT PRIMARY KEY, name TEXT NOT NULL) STRICT;
+    CREATE TABLE cases (
+      id TEXT PRIMARY KEY,
+      customer_id TEXT NOT NULL REFERENCES customers(id),
+      title TEXT NOT NULL
+    ) STRICT;
+    INSERT INTO customers (id, name) VALUES ('c1', 'Север');
+    INSERT INTO cases (id, customer_id, title) VALUES ('case-1', 'c1', 'Склад');
+  `);
+  database.close();
+
+  const trainer = start(directory);
+  assert.deepEqual(trainer.readCase("case-1"), {
+    id: "case-1",
+    customerId: "c1",
+    customerName: "Север",
+    title: "Склад",
+    characters: [],
+    portfolioSent: false,
+  });
+  assert.deepEqual(customerVoices([]), ["заказчик"]);
+});
+
+test("черновик собирается из вставленных текстов выбранным ключом", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start(tempDirectory(), {
+    async *complete(call) {
+      calls.push({
+        protocol: call.protocol,
+        baseAddress: call.baseAddress,
+        modelName: call.modelName,
+        secret: call.secret,
+        messages: call.messages.map((message) => ({ role: message.role, text: message.text })),
+      });
+      const raw = JSON.stringify({
+        material: "Паллеты принимают.",
+        serviceLayer: "Маржа 12%.",
+        crib: "Спросить срок.",
+      });
+      yield raw.slice(0, 12);
+      yield raw.slice(12);
+    },
+  });
+  assert.deepEqual(trainer.saveKey(keyDraft), { ok: true });
+  assert.deepEqual(
+    trainer.saveKey({
+      protocol: "openai-compatible",
+      baseAddress: "https://api.deepseek.com",
+      modelName: "deepseek-chat",
+      secret: "sk-deepseek-secret-9876",
+    }),
+    { ok: true },
+  );
+  const selectedId = trainer.listKeys()[1]?.id;
+  assert.ok(selectedId);
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада" });
+  assert.ok(saved.ok);
+
+  const drafted = await trainer.draftDossier({
+    caseId: saved.caseRecord.id,
+    keyId: selectedId,
+    material: "ПАЛЛЕТЫ-СЫРЬЁ",
+    serviceLayer: "МАРЖА-СЫРЬЁ",
+    crib: "СРОКИ-СЫРЬЁ",
+  });
+  assert.deepEqual(drafted, {
+    ok: true,
+    draft: { material: "Паллеты принимают.", serviceLayer: "Маржа 12%.", crib: "Спросить срок." },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.protocol, "openai-compatible");
+  assert.equal(calls[0]?.baseAddress, "https://api.deepseek.com");
+  assert.equal(calls[0]?.modelName, "deepseek-chat");
+  assert.equal(calls[0]?.secret, "sk-deepseek-secret-9876");
+  assert.equal(calls[0]?.messages[0]?.text.includes("ПАЛЛЕТЫ-СЫРЬЁ"), true);
+  assert.equal(calls[0]?.messages[0]?.text.includes("МАРЖА-СЫРЬЁ"), true);
+  assert.equal(calls[0]?.messages[0]?.text.includes("СРОКИ-СЫРЬЁ"), true);
+  assert.equal(calls[0]?.secret === keyDraft.secret, false);
+  assert.equal(trainer.readApprovedDossier(saved.caseRecord.id), undefined);
+});
+
+test("сбой черновика не создаёт досье и не становится его текстом", async () => {
+  const trainer = start(tempDirectory(), {
+    async *complete(call) {
+      const line = call.messages[0]?.text ?? "";
+      if (line.includes("таймаут")) {
+        throw new ModelFailure("timeout");
+      }
+      if (line.includes("поставщик")) {
+        throw new Error("секрет поставщика не для досье");
+      }
+      yield "это не досье";
+    },
+  });
+  const prepared = prepare(trainer);
+  const layers = { material: "таймаут", serviceLayer: "", crib: "" };
+
+  assert.deepEqual(
+    await trainer.draftDossier({ caseId: prepared.caseId, keyId: prepared.keyId, ...layers }),
+    { ok: false, reason: "timeout" },
+  );
+  assert.deepEqual(
+    await trainer.draftDossier({
+      caseId: prepared.caseId,
+      keyId: prepared.keyId,
+      material: "поставщик",
+      serviceLayer: "",
+      crib: "",
+    }),
+    { ok: false, reason: "model" },
+  );
+  const rejected = await trainer.draftDossier({
+    caseId: prepared.caseId,
+    keyId: prepared.keyId,
+    material: "просто текст",
+    serviceLayer: "",
+    crib: "",
+  });
+  assert.deepEqual(rejected, { ok: false, reason: "model" });
+  assert.equal(JSON.stringify(rejected).includes("это не досье"), false);
+  assert.equal(JSON.stringify(rejected).includes("секрет поставщика"), false);
+  assert.equal(trainer.readApprovedDossier(prepared.caseId)?.material, "Склад принимает паллеты.");
+});
+
+test("в диалог попадает только досье после правки и утверждения", async () => {
+  const trainer = start(tempDirectory(), {
+    async *complete() {
+      yield JSON.stringify({
+        material: "Паллеты принимают.",
+        serviceLayer: "Маржа 12%.",
+        crib: "Спросить срок.",
+      });
+    },
+  });
+  const prepared = prepare(trainer);
+  assert.equal(trainer.readApprovedDossier(prepared.caseId)?.material, "Склад принимает паллеты.");
+
+  const drafted = await trainer.draftDossier({
+    caseId: prepared.caseId,
+    keyId: prepared.keyId,
+    material: "ПАЛЛЕТЫ-СЫРЬЁ",
+    serviceLayer: "МАРЖА-СЫРЬЁ",
+    crib: "СРОКИ-СЫРЬЁ",
+  });
+  assert.ok(drafted.ok);
+  assert.equal(
+    trainer.openSession({
+      caseId: prepared.caseId,
+      dossierId: "черновик-без-утверждения",
+      side: "заказчик",
+      character: "заказчик",
+      role: "аналитик",
+      executorId: "владелец",
+      keyId: prepared.keyId,
+    }).ok,
+    false,
+  );
+
+  const approved = trainer.approveDossier({
+    caseId: prepared.caseId,
+    material: "Паллеты принимают поштучно.",
+    serviceLayer: drafted.draft.serviceLayer,
+    crib: drafted.draft.crib,
+  });
+  assert.ok(approved.ok);
+  assert.deepEqual(trainer.readApprovedDossier(prepared.caseId), {
+    id: approved.dossier.id,
+    caseId: prepared.caseId,
+    material: "Паллеты принимают поштучно.",
+    serviceLayer: "Маржа 12%.",
+    crib: "Спросить срок.",
+  });
+  assert.equal(trainer.readDossier(prepared.dossierId)?.material, "Склад принимает паллеты.");
+  assert.equal(JSON.stringify(trainer.readApprovedDossier(prepared.caseId)).includes("ПАЛЛЕТЫ-СЫРЬЁ"), false);
+
+  const opened = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "заказчик",
+    role: "разработчик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  assert.ok(opened.ok);
+  assert.equal(opened.session.dossierId, approved.dossier.id);
+  assert.equal(trainer.readDossier(opened.session.dossierId)?.material, "Паллеты принимают поштучно.");
 });
 
 test("ключи из keys.json переносятся в хранилище и читаются после перезапуска", () => {
@@ -790,6 +1070,8 @@ test("дело, досье, сессия, ход подготовки и клю�
     customerId: prepared.customerId,
     customerName: "Север",
     title: "Внедрение склада",
+    characters: [],
+    portfolioSent: false,
   });
   assert.deepEqual(restarted.readDossier(prepared.dossierId), {
     id: prepared.dossierId,

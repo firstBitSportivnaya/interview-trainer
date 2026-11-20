@@ -152,6 +152,34 @@ test("ошибка записи не останавливает веб", async (
     listKeys() {
       return [];
     },
+    saveCase() {
+      return { ok: false, reason: "incomplete" };
+    },
+    addCase() {
+      return { ok: false, reason: "incomplete" };
+    },
+    listCustomers() {
+      return [];
+    },
+    listCases() {
+      return [];
+    },
+    readCase() {
+      return undefined;
+    },
+    saveProfile() {},
+    readProfile() {
+      return { resume: "", portfolio: "", cases: "" };
+    },
+    async draftDossier() {
+      return { ok: false, reason: "missing" };
+    },
+    approveDossier() {
+      return { ok: false, reason: "missing" };
+    },
+    readApprovedDossier() {
+      return undefined;
+    },
   });
 
   try {
@@ -237,6 +265,137 @@ test("чужой Host не открывает страницу и не сохр�
     assert.equal(await statusWithHost(base, `127.0.0.1:${address.port}`, "GET"), 200);
     assert.equal(await statusWithHost(`${base}/keys`, `localhost:${address.port}`, "POST", body), 303);
     assert.equal(trainer.listKeys().length, 1);
+  } finally {
+    await close(server);
+  }
+});
+
+test("веб заводит заказчика, дело и утверждённое досье тем же ядром", async () => {
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, {
+    async *complete() {
+      yield JSON.stringify({
+        material: "ЧЕРНОВИК-МАТЕРИАЛ",
+        serviceLayer: "ЧЕРНОВИК-СЛУЖЕБНЫЙ",
+        crib: "ЧЕРНОВИК-ШПАРГАЛКА",
+      });
+    },
+  });
+  opened.push(trainer);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    const secret = "sk-ant-api03-secret-WXYZ";
+
+    await fetch(`${base}/keys`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({
+        protocol: "anthropic",
+        baseAddress: "https://api.anthropic.com",
+        modelName: "claude-sonnet",
+        secret,
+      }),
+    });
+    const keyId = trainer.listKeys()[0]?.id;
+    assert.ok(keyId);
+
+    await fetch(`${base}/profile`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ resume: "Резюме", portfolio: "Портфолио", cases: "Кейс склада" }),
+    });
+    const created = await fetch(`${base}/customers`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ customerName: "Север", title: "Внедрение склада", characters: "" }),
+    });
+    assert.equal(created.status, 200);
+    const first = trainer.listCases()[0];
+    assert.ok(first);
+    assert.equal(new URL(created.url).pathname, `/cases/${first.id}`);
+
+    const foreign = await fetch(`${base}/customers`, {
+      method: "POST",
+      headers: { ...headers, origin: "https://evil.example" },
+      body: new URLSearchParams({ customerName: "Чужой", title: "Чужое дело" }),
+    });
+    assert.equal(foreign.status, 403);
+
+    await fetch(`${base}/cases`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({
+        customerId: first.customerId,
+        title: "Касса",
+        characters: "Анна\nБорис",
+      }),
+    });
+
+    assert.deepEqual(trainer.listCustomers(), [{ id: first.customerId, name: "Север" }]);
+    assert.deepEqual(
+      trainer.listCases().map((item) => ({
+        title: item.title,
+        customerId: item.customerId,
+        characters: item.characters,
+        portfolioSent: item.portfolioSent,
+      })),
+      [
+        { title: "Внедрение склада", customerId: first.customerId, characters: [], portfolioSent: false },
+        { title: "Касса", customerId: first.customerId, characters: ["Анна", "Борис"], portfolioSent: false },
+      ],
+    );
+    assert.deepEqual(trainer.readProfile(), { resume: "Резюме", portfolio: "Портфолио", cases: "Кейс склада" });
+
+    const firstPage = await (await fetch(`${base}/cases/${first.id}`)).text();
+    assert.equal(firstPage.includes("Голоса заказчика: заказчик"), true);
+    assert.equal(firstPage.includes("Отметка «портфолио уже отправлено» снята."), true);
+    assert.equal(firstPage.includes("Сессия не открывается."), true);
+    assert.equal(firstPage.includes(secret), false);
+
+    const drafted = await fetch(`${base}/cases/${first.id}/draft`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({
+        material: "СЫРЬЁ-МАТЕРИАЛ",
+        serviceLayer: "СЫРЬЁ-СЛУЖЕБНЫЙ",
+        crib: "СЫРЬЁ-ШПАРГАЛКА",
+        keyId,
+      }),
+    });
+    const draftPage = await drafted.text();
+    assert.equal(drafted.status, 200);
+    assert.equal(draftPage.includes("ЧЕРНОВИК-МАТЕРИАЛ"), true);
+    assert.equal(draftPage.includes("СЫРЬЁ-МАТЕРИАЛ"), false);
+    assert.equal(draftPage.includes(secret), false);
+    assert.equal(trainer.readApprovedDossier(first.id), undefined);
+
+    const approved = await fetch(`${base}/cases/${first.id}/approve`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({
+        material: "УТВЕРЖДЕНО<script>",
+        serviceLayer: "УТВЕРЖДЕНО-СЛУЖЕБНЫЙ",
+        crib: "УТВЕРЖДЕНО-ШПАРГАЛКА",
+      }),
+    });
+    const approvedPage = await approved.text();
+    assert.equal(approved.status, 200);
+    assert.equal(approvedPage.includes("УТВЕРЖДЕНО&lt;script&gt;"), true);
+    assert.equal(approvedPage.includes("УТВЕРЖДЕНО<script>"), false);
+    assert.equal(approvedPage.includes("Сессия ещё не открывается."), true);
+    assert.equal(approvedPage.includes("СЫРЬЁ-МАТЕРИАЛ"), false);
+    assert.equal(approvedPage.includes("ЧЕРНОВИК-МАТЕРИАЛ"), false);
+    assert.deepEqual(trainer.readApprovedDossier(first.id), {
+      id: trainer.readApprovedDossier(first.id)?.id,
+      caseId: first.id,
+      material: "УТВЕРЖДЕНО<script>",
+      serviceLayer: "УТВЕРЖДЕНО-СЛУЖЕБНЫЙ",
+      crib: "УТВЕРЖДЕНО-ШПАРГАЛКА",
+    });
   } finally {
     await close(server);
   }

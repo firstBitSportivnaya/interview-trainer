@@ -48,12 +48,44 @@ export type CaseRecord = {
   customerId: string;
   customerName: string;
   title: string;
+  /** Персонажи заказчика. Пустой список не хранит голос «заказчик»: его добавляет customerVoices. */
+  characters: string[];
+  /** Отметка «портфолио уже отправлено». У нового дела снята. */
+  portfolioSent: boolean;
 };
 
-/** Отказ завести дело: нет имени заказчика или названия. */
+/** Заказчик. Второе дело ссылается на ту же запись и не заводит вторую компанию. */
+export type CustomerRecord = {
+  id: string;
+  name: string;
+};
+
+/** Отказ завести дело: нет имени заказчика или названия, либо заказчик для второго дела не найден. */
 export type SaveCaseResult =
   | { ok: true; caseRecord: CaseRecord }
-  | { ok: false; reason: "incomplete" };
+  | { ok: false; reason: "incomplete" | "missing" };
+
+/**
+ * Профиль владельца: резюме, портфолио и кейсы.
+ * Один на владельца и общий для всех дел.
+ */
+export type OwnerProfile = {
+  resume: string;
+  portfolio: string;
+  cases: string;
+};
+
+/** Три слоя досье. Черновик ещё без идентификатора: сессия его не читает. */
+export type DossierLayers = {
+  material: string;
+  serviceLayer: string;
+  crib: string;
+};
+
+/** Отказ собрать черновик. Текст модели в отказ не входит. */
+export type DraftDossierResult =
+  | { ok: true; draft: DossierLayers }
+  | { ok: false; reason: "incomplete" | "missing" | "timeout" | "model" | "secret" };
 
 /** Утверждённое досье дела. Сессия хранит его идентификатор. */
 export type DossierRecord = {
@@ -147,6 +179,9 @@ const FAILURE_MESSAGE = {
   secret: "Секрет ключа не читается.",
 } as const;
 
+/** Собранный черновик длиннее этого отбрасывается и досье не становится. Предел — 1 МиБ. */
+const DRAFT_LIMIT = 1024 * 1024;
+
 const PLAINTEXT_VACUUM = "plaintext-vacuum";
 const LEGACY_KEYS = "keys.json";
 /** Снимок keys.json, уже снятый с пути, куда пишет прежний процесс. */
@@ -183,7 +218,25 @@ function schemaSql(): string {
     CREATE TABLE IF NOT EXISTS cases (
       id TEXT PRIMARY KEY,
       customer_id TEXT NOT NULL REFERENCES customers(id),
-      title TEXT NOT NULL
+      title TEXT NOT NULL,
+      portfolio_sent INTEGER NOT NULL DEFAULT 0
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS case_characters (
+      id TEXT PRIMARY KEY,
+      case_id TEXT NOT NULL REFERENCES cases(id),
+      name TEXT NOT NULL,
+      position INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS case_characters_case
+      ON case_characters(case_id, position);
+
+    CREATE TABLE IF NOT EXISTS owner_profile (
+      id TEXT PRIMARY KEY CHECK (id = 'owner'),
+      resume TEXT NOT NULL,
+      portfolio TEXT NOT NULL,
+      cases_text TEXT NOT NULL
     ) STRICT;
 
     CREATE TABLE IF NOT EXISTS dossiers (
@@ -299,6 +352,92 @@ function textColumn(row: Row, column: string): string {
     throw new Error("Запись хранилища повреждена");
   }
   return value;
+}
+
+/** Берёт целое. Текст или NULL значит, что файл хранилища разошёлся со схемой. */
+function integerColumn(row: Row, column: string): number {
+  const value = row[column];
+  if (typeof value !== "number") {
+    throw new Error("Запись хранилища повреждена");
+  }
+  return value;
+}
+
+/** Оставляет названных персонажей. Пробелы и пустые строки в список не входят. */
+function namedCharacters(names: readonly string[] | undefined): string[] {
+  if (!names) {
+    return [];
+  }
+  return names.map((name) => name.trim()).filter((name) => name.length > 0);
+}
+
+/**
+ * Голоса заказчика на деле.
+ * Пустой список даёт один голос «заказчик», не записывая его в персонажи.
+ */
+export function customerVoices(characters: readonly string[]): string[] {
+  return characters.length === 0 ? ["заказчик"] : [...characters];
+}
+
+/** Прежнее хранилище без отметки портфолио получает колонку. Уже записанное дело остаётся без отметки. */
+function ensureCaseShape(database: DatabaseSync): void {
+  const rows = database.prepare("PRAGMA table_info(cases)").all() as Row[];
+  const names = new Set(rows.map((row) => textColumn(row, "name")));
+  if (!names.has("portfolio_sent")) {
+    database.exec("ALTER TABLE cases ADD COLUMN portfolio_sent INTEGER NOT NULL DEFAULT 0");
+  }
+}
+
+/** Просит модель разложить вставленные тексты по слоям и вернуть только JSON. */
+function dossierDraftPrompt(layers: DossierLayers): string {
+  return [
+    "Собери черновик досье из вставленных текстов. Каждый текст остаётся в своём слое.",
+    "Не переноси текст между слоями. Не добавляй фактов, которых нет во вставленном тексте.",
+    "Верни только JSON-объект с полями material, serviceLayer и crib. Значения — строки.",
+    "",
+    "Материал дела:",
+    layers.material,
+    "",
+    "Служебный слой:",
+    layers.serviceLayer,
+    "",
+    "Шпаргалка дела:",
+    layers.crib,
+  ].join("\n");
+}
+
+/** Читает три слоя из ответа модели. Чужой текст черновиком не становится. */
+function parseDraft(text: string): DossierLayers | undefined {
+  const fenced = text.trim().match(/```(?:json)?\s*([\s\S]*?)```/);
+  const source = (fenced?.[1] ?? text).trim();
+  const start = source.indexOf("{");
+  const end = source.lastIndexOf("}");
+  if (start === -1 || end < start) {
+    return undefined;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source.slice(start, end + 1)) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return undefined;
+  }
+  const record = parsed as Record<string, unknown>;
+  if (
+    typeof record.material !== "string" ||
+    typeof record.serviceLayer !== "string" ||
+    typeof record.crib !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    material: record.material,
+    serviceLayer: record.serviceLayer,
+    crib: record.crib,
+  };
 }
 
 /** Читает прежний список. Нет файла — переносить нечего. Битый файл не подменяем пустым списком. */
@@ -498,12 +637,14 @@ function readStoredKey(row: Row, file: string): StoredKey {
   };
 }
 
-function readCaseRecord(row: Row): CaseRecord {
+function readCaseRecord(row: Row, characters: readonly string[]): CaseRecord {
   return {
     id: textColumn(row, "id"),
     customerId: textColumn(row, "customer_id"),
     customerName: textColumn(row, "customer_name"),
     title: textColumn(row, "title"),
+    characters: [...characters],
+    portfolioSent: integerColumn(row, "portfolio_sent") === 1,
   };
 }
 
@@ -539,7 +680,7 @@ function readSessionRecord(row: Row): SessionRecord {
 
 /**
  * Ядро одного владельца.
- * Каталог — хранилище на этой машине: дела, досье, сессии, ход подготовки и ключи.
+ * Каталог — хранилище на этой машине: заказчики, дела, профиль, досье, сессии, ход подготовки и ключи.
  * Список ключей секрет целиком не отдаёт. Секрет в хранилище свёрнут средствами ОС.
  * Одна открытая сессия на тройку
  * «дело + роль исполнителя + исполнитель» держится уникальным индексом.
@@ -557,6 +698,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     chmodSync(databaseFile, 0o600);
     database.exec("PRAGMA busy_timeout = 5000");
     database.exec(schemaSql());
+    ensureCaseShape(database);
     migrateLegacyKeys(database, directory);
     if (hasPlaintextSecret(database) || vacuumPending(database)) {
       setVacuumPending(database, true);
@@ -572,6 +714,35 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
 
   function caseExists(caseId: string): boolean {
     return database.prepare("SELECT id FROM cases WHERE id = ?").get(caseId) !== undefined;
+  }
+
+  const caseQuery = `
+    SELECT cases.id, cases.customer_id, customers.name AS customer_name, cases.title, cases.portfolio_sent
+    FROM cases
+    JOIN customers ON customers.id = cases.customer_id
+  `;
+
+  function readCharacterNames(caseId: string): string[] {
+    const rows = database
+      .prepare("SELECT name FROM case_characters WHERE case_id = ? ORDER BY position, rowid")
+      .all(caseId) as Row[];
+    return rows.map((row) => textColumn(row, "name"));
+  }
+
+  function loadCase(row: Row): CaseRecord {
+    return readCaseRecord(row, readCharacterNames(textColumn(row, "id")));
+  }
+
+  function insertCase(caseRecord: CaseRecord): void {
+    database
+      .prepare("INSERT INTO cases (id, customer_id, title, portfolio_sent) VALUES (?, ?, ?, 0)")
+      .run(caseRecord.id, caseRecord.customerId, caseRecord.title);
+    const insertCharacter = database.prepare(
+      "INSERT INTO case_characters (id, case_id, name, position) VALUES (?, ?, ?, ?)",
+    );
+    caseRecord.characters.forEach((name, position) => {
+      insertCharacter.run(randomUUID(), caseRecord.id, name, position);
+    });
   }
 
   function readPreparationRecord(caseId: string, role: PerformerRole, executorId: string): PreparationRecord | undefined {
@@ -668,8 +839,11 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       });
     },
 
-    /** Заводит заказчика и его дело. Пустое имя или название дело не создают. */
-    saveCase(draft: { customerName: string; title: string }): SaveCaseResult {
+    /**
+     * Одним действием заводит заказчика и первое дело.
+     * Пустое имя или название дело не создают. Пустой список персонажей остаётся пустым.
+     */
+    saveCase(draft: { customerName: string; title: string; characters?: readonly string[] }): SaveCaseResult {
       const customerName = draft.customerName.trim();
       const title = draft.title.trim();
       if (!customerName || !title) {
@@ -681,30 +855,151 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
         customerId: randomUUID(),
         customerName,
         title,
+        characters: namedCharacters(draft.characters),
+        portfolioSent: false,
       };
       inTransaction(database, () => {
         database.prepare("INSERT INTO customers (id, name) VALUES (?, ?)").run(caseRecord.customerId, customerName);
-        database
-          .prepare("INSERT INTO cases (id, customer_id, title) VALUES (?, ?, ?)")
-          .run(caseRecord.id, caseRecord.customerId, title);
+        insertCase(caseRecord);
       });
       return { ok: true, caseRecord };
     },
 
-    /** Возвращает дело. Нет идентификатора — дела нет. */
-    readCase(caseId: string): CaseRecord | undefined {
-      const row = database
-        .prepare(
-          `SELECT cases.id, cases.customer_id, customers.name AS customer_name, cases.title
-           FROM cases
-           JOIN customers ON customers.id = cases.customer_id
-           WHERE cases.id = ?`,
-        )
-        .get(caseId) as Row | undefined;
-      return row ? readCaseRecord(row) : undefined;
+    /**
+     * Добавляет ещё одно дело уже существующему заказчику.
+     * Новую компанию не создаёт. Неизвестный заказчик дело не создаёт.
+     */
+    addCase(draft: { customerId: string; title: string; characters?: readonly string[] }): SaveCaseResult {
+      const customerId = draft.customerId.trim();
+      const title = draft.title.trim();
+      if (!customerId || !title) {
+        return { ok: false, reason: "incomplete" };
+      }
+
+      const nameRow = database.prepare("SELECT name FROM customers WHERE id = ?").get(customerId) as Row | undefined;
+      if (!nameRow) {
+        return { ok: false, reason: "missing" };
+      }
+
+      const caseRecord: CaseRecord = {
+        id: randomUUID(),
+        customerId,
+        customerName: textColumn(nameRow, "name"),
+        title,
+        characters: namedCharacters(draft.characters),
+        portfolioSent: false,
+      };
+      inTransaction(database, () => {
+        insertCase(caseRecord);
+      });
+      return { ok: true, caseRecord };
     },
 
-    /** Утверждает досье новой записью. Открытая сессия держит то досье, с которым её открыли. */
+    /** Возвращает заказчиков в порядке появления. */
+    listCustomers(): CustomerRecord[] {
+      const rows = database.prepare("SELECT id, name FROM customers ORDER BY rowid").all() as Row[];
+      return rows.map((row) => ({ id: textColumn(row, "id"), name: textColumn(row, "name") }));
+    },
+
+    /** Возвращает дела в порядке появления. */
+    listCases(): CaseRecord[] {
+      const rows = database.prepare(`${caseQuery} ORDER BY cases.rowid`).all() as Row[];
+      return rows.map((row) => loadCase(row));
+    },
+
+    /** Возвращает дело. Нет идентификатора — дела нет. */
+    readCase(caseId: string): CaseRecord | undefined {
+      const row = database.prepare(`${caseQuery} WHERE cases.id = ?`).get(caseId) as Row | undefined;
+      return row ? loadCase(row) : undefined;
+    },
+
+    /**
+     * Записывает профиль владельца.
+     * Повторная запись заменяет ту же строку, вторую не создаёт.
+     */
+    saveProfile(draft: OwnerProfile): void {
+      database
+        .prepare(
+          `INSERT INTO owner_profile (id, resume, portfolio, cases_text) VALUES ('owner', ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET resume = excluded.resume, portfolio = excluded.portfolio, cases_text = excluded.cases_text`,
+        )
+        .run(draft.resume.trim(), draft.portfolio.trim(), draft.cases.trim());
+    },
+
+    /** Возвращает профиль владельца. Пока его не сохраняли, поля пустые. */
+    readProfile(): OwnerProfile {
+      const row = database
+        .prepare("SELECT resume, portfolio, cases_text FROM owner_profile WHERE id = 'owner'")
+        .get() as Row | undefined;
+      if (!row) {
+        return { resume: "", portfolio: "", cases: "" };
+      }
+      return {
+        resume: textColumn(row, "resume"),
+        portfolio: textColumn(row, "portfolio"),
+        cases: textColumn(row, "cases_text"),
+      };
+    },
+
+    /**
+     * Собирает черновик из вставленных текстов слоёв выбранным ключом.
+     * Черновик не записывается и сессию не открывает: в диалог он попадёт только после правки и утверждения.
+     */
+    async draftDossier(draft: { caseId: string; keyId: string } & DossierLayers): Promise<DraftDossierResult> {
+      const caseId = draft.caseId.trim();
+      const keyId = draft.keyId.trim();
+      const layers: DossierLayers = {
+        material: draft.material.trim(),
+        serviceLayer: draft.serviceLayer.trim(),
+        crib: draft.crib.trim(),
+      };
+      if (!caseId || !keyId || (!layers.material && !layers.serviceLayer && !layers.crib)) {
+        return { ok: false, reason: "incomplete" };
+      }
+      if (!caseExists(caseId)) {
+        return { ok: false, reason: "missing" };
+      }
+      const loaded = loadKey(keyId);
+      if (!loaded) {
+        return { ok: false, reason: "missing" };
+      }
+      if (!("key" in loaded)) {
+        return { ok: false, reason: "secret" };
+      }
+
+      const controller = new AbortController();
+      let text = "";
+      try {
+        for await (const chunk of model.complete(
+          {
+            protocol: loaded.key.protocol,
+            baseAddress: loaded.key.baseAddress,
+            modelName: loaded.key.modelName,
+            secret: loaded.key.secret,
+            messages: [{ role: "user", text: dossierDraftPrompt(layers) }],
+          },
+          controller.signal,
+        )) {
+          text += chunk;
+          if (text.length > DRAFT_LIMIT) {
+            return { ok: false, reason: "model" };
+          }
+        }
+      } catch (error) {
+        const reason = error instanceof ModelFailure ? error.reason : "model";
+        return { ok: false, reason };
+      } finally {
+        controller.abort();
+      }
+
+      const parsed = parseDraft(text);
+      if (!parsed) {
+        return { ok: false, reason: "model" };
+      }
+      return { ok: true, draft: parsed };
+    },
+
+    /** Утверждает досье новой записью. В запись входит текст после правки, не черновик модели. Открытая сессия держит то досье, с которым её открыли. */
     approveDossier(draft: { caseId: string; material: string; serviceLayer: string; crib: string }): ApproveDossierResult {
       if (!caseExists(draft.caseId)) {
         return { ok: false, reason: "missing" };
@@ -727,6 +1022,20 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       const row = database
         .prepare("SELECT id, case_id, material, service_layer, crib FROM dossiers WHERE id = ?")
         .get(dossierId) as Row | undefined;
+      return row ? readDossierRecord(row) : undefined;
+    },
+
+    /**
+     * Возвращает последнее утверждённое досье дела.
+     * Черновик сюда не входит. Пока владелец не утвердил правку, досье нет.
+     */
+    readApprovedDossier(caseId: string): DossierRecord | undefined {
+      const row = database
+        .prepare(
+          `SELECT id, case_id, material, service_layer, crib
+           FROM dossiers WHERE case_id = ? ORDER BY rowid DESC LIMIT 1`,
+        )
+        .get(caseId) as Row | undefined;
       return row ? readDossierRecord(row) : undefined;
     },
 
