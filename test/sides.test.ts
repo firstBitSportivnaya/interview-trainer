@@ -58,7 +58,8 @@ function remember(calls: ModelCall[]): ModelPort {
       });
       const text = call.messages[0]?.text ?? "";
       const task = text.split("\n\n").at(-1) ?? "";
-      if (text.includes(PROFILE) && text.includes(PROFILE_RULE)) {
+      const withholds = text.includes("Формулировку профиля не произноси и не подсказывай.");
+      if (text.includes(PROFILE) && withholds && (task.includes("про опыт") || task.includes("формулировку"))) {
         yield EXPERIENCE;
         return;
       }
@@ -240,6 +241,7 @@ test("при стоящей отметке персонаж заказчика �
   assert.equal(opening.includes(PROFILE), false);
   assert.equal(openingCall.includes(PROFILE), true);
   assert.equal(openingCall.includes(PROFILE_RULE), true);
+  assert.equal(openingCall.split("\n\n").at(-1)?.includes("про опыт"), true);
   assert.equal(openingCall.includes(SERVICE), false);
   assert.equal(openingCall.includes(CRIB), false);
 

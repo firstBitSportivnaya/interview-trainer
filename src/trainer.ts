@@ -184,7 +184,10 @@ export type TranscriptLine = {
 export const ABSENT_FACT = "В материале проекта этого нет.";
 
 /** Один вопрос персонажа. После него персонаж ждёт и сам очередь не продолжает. */
-function openingTask(role: string): string {
+function openingTask(role: string, askExperience: boolean): string {
+  if (askExperience) {
+    return `Задай один вопрос про опыт исполнителю в роли «${role}» и остановись. Формулировку профиля не произноси и не подсказывай.`;
+  }
   return `Задай один вопрос исполнителю в роли «${role}» и остановись.`;
 }
 
@@ -552,6 +555,7 @@ function customerPrompt(input: {
   ];
   if (input.profile) {
     lines.push(
+      "Профиль не входит в материал проекта. Вопрос про опыт не заменяй фразой об отсутствии факта.",
       PROFILE_RULE,
       "",
       "Профиль:",
@@ -1132,6 +1136,14 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     }
   }
 
+  function portfolioMarked(caseId: string): boolean {
+    const row = database.prepare("SELECT portfolio_sent FROM cases WHERE id = ?").get(caseId) as Row | undefined;
+    if (!row) {
+      return false;
+    }
+    return integerColumn(row, "portfolio_sent") === 1;
+  }
+
   function loadProfile(): OwnerProfile {
     const row = database
       .prepare("SELECT resume, portfolio, cases_text FROM owner_profile WHERE id = 'owner'")
@@ -1590,7 +1602,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       }
       openingReservations.add(session.id);
       try {
-        const task = characterTask(session, openingTask(session.role));
+        const task = characterTask(session, openingTask(session.role, session.side === "заказчик" && portfolioMarked(session.caseId)));
         if (!task.ok) {
           yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
           return;
