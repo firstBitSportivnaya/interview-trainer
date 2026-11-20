@@ -4,6 +4,8 @@ import type { Protocol } from "./trainer.ts";
 const REPLY_TOKENS = 4096;
 const ANTHROPIC_VERSION = "2023-06-01";
 const DEFAULT_TIMEOUT_MS = 60_000;
+/** Незавершённый кадр длиннее этого отбрасывается. Предел — 64 КиБ. */
+const FRAME_LIMIT = 64 * 1024;
 
 /** Сбой вызова. Текст поставщика сюда не кладётся, чтобы он не стал речью. */
 export class ModelFailure extends Error {
@@ -51,6 +53,12 @@ type ModelBody = {
   max_tokens?: number;
 };
 
+/** Кусок речи или конечное событие протокола. */
+type StreamPiece = {
+  text?: string;
+  done?: boolean;
+};
+
 /**
  * Живой порт: родной протокол Anthropic и протокол, совместимый с OpenAI.
  * Базовый адрес — корень без пути метода, например https://api.anthropic.com.
@@ -72,7 +80,7 @@ export function liveModel(options: LiveModelOptions = {}): ModelPort {
             "anthropic-version": ANTHROPIC_VERSION,
           },
           { model: call.modelName, max_tokens: REPLY_TOKENS, stream: true, messages },
-          anthropicText,
+          anthropicPiece,
           timeoutMs,
           signal,
         );
@@ -81,7 +89,7 @@ export function liveModel(options: LiveModelOptions = {}): ModelPort {
         endpoint(call.baseAddress, "/v1/chat/completions"),
         { authorization: `Bearer ${call.secret}` },
         { model: call.modelName, stream: true, messages },
-        openaiText,
+        openaiPiece,
         timeoutMs,
         signal,
       );
@@ -109,7 +117,7 @@ async function* streamReply(
   url: string,
   headers: Record<string, string>,
   body: ModelBody,
-  take: (data: string) => string | undefined,
+  readPiece: (data: string) => StreamPiece,
   timeoutMs: number,
   caller: AbortSignal,
 ): AsyncGenerator<string> {
@@ -135,16 +143,19 @@ async function* streamReply(
     throw new ModelFailure("model");
   }
 
+  let stopped = false;
   try {
     for await (const data of sseData(response.body)) {
-      if (data === "[DONE]") return;
-      const text = take(data);
-      if (text) yield text;
+      const piece = readPiece(data);
+      if (piece.done) return;
+      if (piece.text) yield piece.text;
     }
   } catch (error) {
     const failure = failureFor(error, caller, timeout);
     if (failure) throw failure;
+    stopped = true;
   }
+  if (!stopped) throw new ModelFailure("model");
 }
 
 function readJson(data: string): unknown {
@@ -155,34 +166,36 @@ function readJson(data: string): unknown {
   }
 }
 
-function anthropicText(data: string): string | undefined {
+function anthropicPiece(data: string): StreamPiece {
   const parsed = readJson(data);
-  if (!parsed || typeof parsed !== "object") return undefined;
+  if (!parsed || typeof parsed !== "object") return {};
   const event = parsed as {
     type?: unknown;
     error?: unknown;
     delta?: { type?: unknown; text?: unknown };
   };
+  if (event.type === "message_stop") return { done: true };
   if (event.type === "error" || event.error !== undefined) throw new ModelFailure("model");
-  if (event.type !== "content_block_delta" || event.delta?.type !== "text_delta") return undefined;
+  if (event.type !== "content_block_delta" || event.delta?.type !== "text_delta") return {};
   if (typeof event.delta.text !== "string") throw new ModelFailure("model");
-  return event.delta.text;
+  return { text: event.delta.text };
 }
 
-function openaiText(data: string): string | undefined {
+function openaiPiece(data: string): StreamPiece {
+  if (data === "[DONE]") return { done: true };
   const parsed = readJson(data);
-  if (!parsed || typeof parsed !== "object") return undefined;
+  if (!parsed || typeof parsed !== "object") return {};
   const event = parsed as { error?: unknown; choices?: unknown };
   if (event.error !== undefined) throw new ModelFailure("model");
-  if (!Array.isArray(event.choices)) return undefined;
+  if (!Array.isArray(event.choices)) return {};
   const choice = event.choices[0];
-  if (!choice || typeof choice !== "object") return undefined;
+  if (!choice || typeof choice !== "object") return {};
   const delta = (choice as { delta?: unknown }).delta;
-  if (!delta || typeof delta !== "object") return undefined;
+  if (!delta || typeof delta !== "object") return {};
   const content = (delta as { content?: unknown }).content;
-  if (content === undefined || content === null) return undefined;
+  if (content === undefined || content === null) return {};
   if (typeof content !== "string") throw new ModelFailure("model");
-  return content;
+  return { text: content };
 }
 
 /** Достаёт поле data из потока server-sent events. Неполное событие ждёт следующий кусок. */
@@ -201,11 +214,14 @@ async function* sseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string
       buffer = buffer.replaceAll("\r", "");
       let splitAt = buffer.indexOf("\n\n");
       while (splitAt !== -1) {
-        const data = eventData(buffer.slice(0, splitAt));
+        const raw = buffer.slice(0, splitAt);
+        if (raw.length > FRAME_LIMIT) throw new ModelFailure("model");
+        const data = eventData(raw);
         buffer = buffer.slice(splitAt + 2);
         if (data !== undefined) yield data;
         splitAt = buffer.indexOf("\n\n");
       }
+      if (buffer.length > FRAME_LIMIT) throw new ModelFailure("model");
       if (done) {
         if (buffer.trim()) {
           const data = eventData(buffer);
@@ -215,7 +231,7 @@ async function* sseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string
       }
     }
   } finally {
-    reader.releaseLock();
+    await reader.cancel().catch(() => undefined);
   }
 }
 

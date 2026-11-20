@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -14,6 +16,34 @@ function tempDirectory(): string {
   const directory = mkdtempSync(join(tmpdir(), "trainer-"));
   directories.push(directory);
   return directory;
+}
+
+/** Свой вызов DPAPI, отдельно от ядра: ожидаемый секрет берётся из средств ОС, не из реализации. */
+function openDpapi(blob: string): string {
+  const root = process.env.SystemRoot ?? "C:\\Windows";
+  const script = `
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Security
+$protected = [Convert]::FromBase64String($env:DPAPI_BLOB)
+$clear = [Security.Cryptography.ProtectedData]::Unprotect($protected, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+[Console]::Out.Write([Convert]::ToBase64String($clear))
+`;
+  const result = spawnSync(
+    `${root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+    ["-NoProfile", "-NonInteractive", "-Command", script],
+    { encoding: "utf8", env: { ...process.env, DPAPI_BLOB: blob } },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  return Buffer.from(result.stdout.trim(), "base64").toString("utf8");
+}
+
+/** Ищет секрет в любом файле каталога: и в хранилище, и во временном файле, который SQLite ещё не стёр. */
+function storeHasSecret(directory: string, secret: string): boolean {
+  const needle = Buffer.from(secret, "utf8");
+  return readdirSync(directory).some((name) => {
+    const path = join(directory, name);
+    return statSync(path).isFile() && readFileSync(path).includes(needle);
+  });
 }
 
 function start(directory = tempDirectory(), model?: ModelPort) {
@@ -260,6 +290,60 @@ test("короткий секрет в списке не раскрыт цели
   assert.equal(JSON.stringify(keys).includes(secret), false);
 });
 
+test("после сохранения ключа в хранилище нет открытого секрета", async () => {
+  const directory = tempDirectory();
+  const secret = "sk-test-not-a-live-key-WXYZ";
+  const calls: ModelCall[] = [];
+  const trainer = start(directory, remember(calls));
+
+  assert.deepEqual(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret,
+    }),
+    { ok: true },
+  );
+  trainer.close();
+
+  assert.equal(storeHasSecret(directory, secret), false);
+  assert.equal(existsSync(join(directory, "keys.json")), false);
+
+  const again = start(directory, remember(calls));
+  const keys = again.listKeys();
+  const keyId = keys[0]?.id;
+  assert.ok(keyId);
+  assert.equal(keys[0]?.secretPreview, "••••WXYZ");
+  assert.equal(JSON.stringify(keys).includes(secret), false);
+
+  const savedCase = again.saveCase({ customerName: "Север", title: "Внедрение склада" });
+  assert.ok(savedCase.ok);
+  const approved = again.approveDossier({
+    caseId: savedCase.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: "Маржа подрядчика 12%.",
+    crib: "Спросить про сроки.",
+  });
+  assert.ok(approved.ok);
+  const openedSession = again.openSession({
+    caseId: savedCase.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "заказчик",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.ok(openedSession.ok);
+
+  await take(again.reply(openedSession.session.id, "Какой срок поставки?"));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.secret, secret);
+  again.close();
+  assert.equal(storeHasSecret(directory, secret), false);
+});
+
 test("повреждённый список ключей не затирается", () => {
   const directory = tempDirectory();
   const file = join(directory, "keys.json");
@@ -323,11 +407,179 @@ test("ключи из keys.json переносятся в хранилище и 
   assert.equal(existsSync(join(directory, "keys.json")), false);
 
   trainer.close();
+  assert.equal(storeHasSecret(directory, secret), false);
   const again = start(directory).listKeys();
   assert.equal(again.length, 1);
   assert.equal(again[0]?.id, "key-1");
   assert.equal(again[0]?.secretPreview, "••••WXYZ");
   assert.equal(JSON.stringify(again).includes(secret), false);
+});
+
+test("открытый секрет прошлого хранилища сворачивается при открытии", () => {
+  const directory = tempDirectory();
+  const secret = "sk-test-not-a-live-key-PAST";
+  start(directory).close();
+
+  const database = new DatabaseSync(join(directory, "store.sqlite"));
+  database
+    .prepare("INSERT INTO keys (id, protocol, base_address, model_name, secret) VALUES (?, ?, ?, ?, ?)")
+    .run("key-past", "anthropic", "https://api.anthropic.com", "claude-sonnet", secret);
+  database.close();
+
+  const trainer = start(directory);
+  assert.equal(trainer.listKeys()[0]?.secretPreview, "••••PAST");
+  trainer.close();
+  assert.equal(storeHasSecret(directory, secret), false);
+});
+
+test("незавершённая очистка хранилища повторяется при открытии", () => {
+  const directory = tempDirectory();
+  const secret = "sk-test-not-a-live-key-LEFT";
+  start(directory).close();
+
+  const database = new DatabaseSync(join(directory, "store.sqlite"));
+  const insert = database.prepare(
+    "INSERT INTO keys (id, protocol, base_address, model_name, secret) VALUES (?, ?, ?, ?, ?)",
+  );
+  insert.run("key-left", "anthropic", "https://api.anthropic.com", "claude-sonnet", "sealed:dpapi:already-sealed");
+  insert.run("key-gone", "anthropic", "https://api.anthropic.com", "claude-sonnet", secret);
+  database.prepare("DELETE FROM keys WHERE id = ?").run("key-gone");
+  database.prepare("INSERT INTO store_flags (name, value) VALUES ('plaintext-vacuum', 'pending')").run();
+  database.close();
+  assert.equal(storeHasSecret(directory, secret), true);
+
+  const trainer = start(directory);
+  assert.equal(trainer.listKeys()[0]?.secretPreview, "••••");
+  trainer.close();
+  assert.equal(storeHasSecret(directory, secret), false);
+
+  const again = new DatabaseSync(join(directory, "store.sqlite"));
+  const flag = again.prepare("SELECT value FROM store_flags WHERE name = 'plaintext-vacuum'").get();
+  again.close();
+  assert.equal(flag, undefined);
+});
+
+test("текст, зашифрованный другой учётной записью, секретом не становится", async () => {
+  const directory = tempDirectory();
+  const secret = "sk-test-not-a-live-key-WXYZ";
+  const calls: ModelCall[] = [];
+  const trainer = start(directory, remember(calls));
+  assert.deepEqual(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret,
+    }),
+    { ok: true },
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  trainer.close();
+
+  const database = new DatabaseSync(join(directory, "store.sqlite"));
+  const row = database.prepare("SELECT secret FROM keys WHERE id = ?").get(keyId) as { secret: string };
+  const stored = row.secret;
+  const at = stored.length - 5;
+  const flipped = `${stored.slice(0, at)}${stored[at] === "A" ? "B" : "A"}${stored.slice(at + 1)}`;
+  database.prepare("UPDATE keys SET secret = ? WHERE id = ?").run(flipped, keyId);
+  database.close();
+
+  const again = start(directory, remember(calls));
+  const keys = again.listKeys();
+  assert.equal(keys[0]?.id, keyId);
+  assert.equal(keys[0]?.secretPreview, "••••");
+  assert.equal(JSON.stringify(keys).includes(secret), false);
+  assert.equal(JSON.stringify(keys).includes(flipped), false);
+
+  const savedCase = again.saveCase({ customerName: "Север", title: "Внедрение склада" });
+  assert.ok(savedCase.ok);
+  const approved = again.approveDossier({
+    caseId: savedCase.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: "Маржа подрядчика 12%.",
+    crib: "Спросить про сроки.",
+  });
+  assert.ok(approved.ok);
+  const openedSession = again.openSession({
+    caseId: savedCase.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "заказчик",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.ok(openedSession.ok);
+
+  const events = await take(again.reply(openedSession.session.id, "Какой срок поставки?"));
+  assert.deepEqual(events, [{ kind: "failure", reason: "secret", message: "Секрет ключа не читается." }]);
+  assert.equal(calls.length, 0);
+  assert.equal(JSON.stringify(events).includes(secret), false);
+  assert.equal(JSON.stringify(events).includes(flipped), false);
+  again.close();
+  assert.equal(storeHasSecret(directory, secret), false);
+});
+
+test("на Windows секрет читается через DPAPI той же учётной записи", { skip: process.platform !== "win32" }, () => {
+  const directory = tempDirectory();
+  const secret = "sk-test-not-a-live-key-WXYZ";
+  const trainer = start(directory);
+  assert.deepEqual(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret,
+    }),
+    { ok: true },
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  trainer.close();
+
+  assert.equal(storeHasSecret(directory, secret), false);
+  const database = new DatabaseSync(join(directory, "store.sqlite"));
+  const row = database.prepare("SELECT secret FROM keys WHERE id = ?").get(keyId) as { secret: string };
+  database.close();
+  const magic = "AQAAANCMnd8BFdERjHoAw";
+  const at = row.secret.indexOf(magic);
+  assert.ok(at >= 0);
+  const blob = row.secret.slice(at).match(/^[A-Za-z0-9+/=]+/)?.[0];
+  assert.ok(blob);
+  assert.equal(openDpapi(blob), secret);
+});
+
+test("на macOS секрет читается через keychain той же учётной записи", { skip: process.platform !== "darwin" }, () => {
+  const directory = tempDirectory();
+  const secret = "sk-test-not-a-live-key-WXYZ";
+  const trainer = start(directory);
+  assert.deepEqual(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret,
+    }),
+    { ok: true },
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  trainer.close();
+
+  assert.equal(storeHasSecret(directory, secret), false);
+  const database = new DatabaseSync(join(directory, "store.sqlite"));
+  const row = database.prepare("SELECT secret FROM keys WHERE id = ?").get(keyId) as { secret: string };
+  database.close();
+  const prefix = "sealed:keychain:";
+  assert.equal(row.secret.startsWith(prefix), true);
+  const account = row.secret.slice(prefix.length);
+  assert.notEqual(account, keyId);
+  const result = spawnSync("security", ["find-generic-password", "-s", "interview-trainer", "-a", account, "-w"], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout.trim(), secret);
 });
 
 test("повторный перенос того же ключа не заводит вторую запись", () => {
