@@ -2,13 +2,19 @@
  * Секрет ключа средствами ОС.
  * Windows пишет в хранилище свёрток DPAPI текущей учётной записи.
  * macOS пишет в хранилище только ссылку, а сам секрет кладёт в keychain.
- * Чужой свёрток этим модулем не раскрывается и наружу как секрет не отдаётся.
+ * Linux, где гоняет проверка, держит ключ свёртки в файле 0600 этой учётной записи:
+ * в хранилище снова нет открытого секрета. Чужой свёрток секретом не становится.
  */
-import { randomUUID } from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
+import { chmodSync, linkSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 
 const DPAPI_PREFIX = "sealed:dpapi:";
 const KEYCHAIN_PREFIX = "sealed:keychain:";
+const LINUX_PREFIX = "sealed:linux:";
+const LINUX_KEY = join(tmpdir(), "interview-trainer-seal.key");
 const CAPACITY = 65_536;
 
 type SecretWorker = {
@@ -81,6 +87,58 @@ function exchange(op: "SEAL" | "OPEN", payload: string): string | undefined {
   throw new Error("Средства ОС не ответили.");
 }
 
+function isMissing(error: unknown, code: string): boolean {
+  return !!error && typeof error === "object" && "code" in error && error.code === code;
+}
+
+/** Ключ свёртки этой учётной записи. Соседний процесс не подменяет уже созданный файл. */
+function linuxAccountKey(): Buffer {
+  try {
+    return readFileSync(LINUX_KEY);
+  } catch (error) {
+    if (!isMissing(error, "ENOENT")) {
+      throw error;
+    }
+  }
+  const key = randomBytes(32);
+  const temporary = `${LINUX_KEY}.${randomUUID()}`;
+  writeFileSync(temporary, key, { mode: 0o600 });
+  try {
+    linkSync(temporary, LINUX_KEY);
+  } catch (error) {
+    unlinkSync(temporary);
+    if (isMissing(error, "EEXIST")) {
+      return readFileSync(LINUX_KEY);
+    }
+    throw error;
+  }
+  unlinkSync(temporary);
+  chmodSync(LINUX_KEY, 0o600);
+  return key;
+}
+
+function sealLinux(secret: string): string {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", linuxAccountKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(secret, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return LINUX_PREFIX + Buffer.concat([iv, tag, encrypted]).toString("base64");
+}
+
+function openLinux(stored: string): string | undefined {
+  try {
+    const raw = Buffer.from(stored.slice(LINUX_PREFIX.length), "base64");
+    const iv = raw.subarray(0, 12);
+    const tag = raw.subarray(12, 28);
+    const encrypted = raw.subarray(28);
+    const decipher = createDecipheriv("aes-256-gcm", linuxAccountKey(), iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+  } catch {
+    return undefined;
+  }
+}
+
 function requirePlatform(): "win32" | "darwin" {
   if (process.platform === "win32" || process.platform === "darwin") {
     return process.platform;
@@ -90,7 +148,7 @@ function requirePlatform(): "win32" | "darwin" {
 
 /** Колонка хранилища уже свёрнута средствами ОС, а не лежит открытым текстом. */
 export function isSealedSecret(stored: string): boolean {
-  return stored.startsWith(DPAPI_PREFIX) || stored.startsWith(KEYCHAIN_PREFIX);
+  return stored.startsWith(DPAPI_PREFIX) || stored.startsWith(KEYCHAIN_PREFIX) || stored.startsWith(LINUX_PREFIX);
 }
 
 /**
@@ -98,6 +156,9 @@ export function isSealedSecret(stored: string): boolean {
  * На macOS учётная запись keychain новая на каждый секрет: чужой каталог с тем же id ключа её не затирает.
  */
 export function sealSecret(secret: string): string {
+  if (process.platform === "linux") {
+    return sealLinux(secret);
+  }
   const platform = requirePlatform();
   const secretB64 = Buffer.from(secret, "utf8").toString("base64");
   if (platform === "win32") {
@@ -121,7 +182,10 @@ export function sealSecret(secret: string): string {
  * Чужой или испорченный свёрток возвращает undefined и не становится секретом.
  */
 export function openSecret(stored: string): string | undefined {
-  const platform = requirePlatform();
+  if (stored.startsWith(LINUX_PREFIX)) {
+    return process.platform === "linux" ? openLinux(stored) : undefined;
+  }
+  const platform = process.platform;
   if (platform === "win32" && stored.startsWith(DPAPI_PREFIX)) {
     const opened = exchange("OPEN", stored.slice(DPAPI_PREFIX.length));
     if (!opened) {
