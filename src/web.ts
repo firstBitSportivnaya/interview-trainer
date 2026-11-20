@@ -109,44 +109,87 @@ function redirect(response: ServerResponse, location: string): void {
   response.end();
 }
 
+/** Свой Origin и запрос без Origin проходят. Чужой Origin ключ не записывает. */
+function allowsKeyPost(origin: string | string[] | undefined, port: number): boolean {
+  if (origin === undefined) {
+    return true;
+  }
+  if (Array.isArray(origin)) {
+    return false;
+  }
+  let url: URL;
+  try {
+    url = new URL(origin);
+  } catch {
+    return false;
+  }
+  const originPort = url.port === "" ? (url.protocol === "https:" ? "443" : "80") : url.port;
+  return (
+    url.protocol === "http:" &&
+    originPort === String(port) &&
+    (url.hostname === "127.0.0.1" || url.hostname === "localhost")
+  );
+}
+
+/** Отвечает на страницу ключей и на сохранение. Чужой Origin и сбой записи не роняют процесс. */
+async function handle(server: Server, trainer: Trainer, request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const url = new URL(request.url ?? "/", "http://127.0.0.1");
+
+  if (request.method === "GET" && url.pathname === "/") {
+    const reason = url.searchParams.get("error");
+    const error = reason === "incomplete" || reason === "protocol" ? ERROR_TEXT[reason] : undefined;
+    sendPage(response, trainer, error);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/keys") {
+    const address = server.address();
+    const listenPort = address && typeof address === "object" ? address.port : undefined;
+    if (listenPort === undefined || !allowsKeyPost(request.headers.origin, listenPort)) {
+      request.resume();
+      response.writeHead(403);
+      response.end();
+      return;
+    }
+
+    let body = "";
+    try {
+      body = await readBody(request);
+    } catch {
+      response.writeHead(413);
+      response.end();
+      return;
+    }
+
+    const fields = new URLSearchParams(body);
+    const saved = trainer.saveKey({
+      protocol: fields.get("protocol") ?? "",
+      baseAddress: fields.get("baseAddress") ?? "",
+      modelName: fields.get("modelName") ?? "",
+      secret: fields.get("secret") ?? "",
+    });
+    redirect(response, saved.ok ? "/" : `/?error=${saved.reason}`);
+    return;
+  }
+
+  response.writeHead(404);
+  response.end();
+}
+
 /**
  * Веб-адаптер ядра.
  * Слушает только 127.0.0.1 и не проверяет пароль: дверь — учётная запись машины.
  */
 export function startWeb(trainer: Trainer, port = 0): Promise<Server> {
-  const server = createServer(async (request, response) => {
-    const url = new URL(request.url ?? "/", "http://127.0.0.1");
-
-    if (request.method === "GET" && url.pathname === "/") {
-      const reason = url.searchParams.get("error");
-      const error = reason === "incomplete" || reason === "protocol" ? ERROR_TEXT[reason] : undefined;
-      sendPage(response, trainer, error);
-      return;
-    }
-
-    if (request.method === "POST" && url.pathname === "/keys") {
-      let body = "";
-      try {
-        body = await readBody(request);
-      } catch {
-        response.writeHead(413);
-        response.end();
+  const server = createServer((request, response) => {
+    handle(server, trainer, request, response).catch(() => {
+      if (response.headersSent || response.writableEnded) {
+        response.destroy();
         return;
       }
-
-      const fields = new URLSearchParams(body);
-      const saved = trainer.saveKey({
-        protocol: fields.get("protocol") ?? "",
-        baseAddress: fields.get("baseAddress") ?? "",
-        modelName: fields.get("modelName") ?? "",
-        secret: fields.get("secret") ?? "",
-      });
-      redirect(response, saved.ok ? "/" : `/?error=${saved.reason}`);
-      return;
-    }
-
-    response.writeHead(404);
-    response.end();
+      response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+      response.end("Не удалось записать ключ.");
+    });
   });
 
   return new Promise((resolve, reject) => {

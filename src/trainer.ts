@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** Протокол ключа: родной Anthropic или совместимый с OpenAI. */
@@ -100,11 +100,13 @@ function readKeys(file: string): StoredKey[] {
   return parsed;
 }
 
-/** Пишет список целиком: сначала временный файл, затем подмена, чтобы обрыв не стёр ключи. */
+/** Пишет список целиком: временный файл только для владельца, затем подмена. */
 function writeKeys(file: string, stored: StoredKey[]): void {
   const temporary = `${file}.tmp`;
-  writeFileSync(temporary, JSON.stringify(stored), "utf8");
+  writeFileSync(temporary, JSON.stringify(stored), { encoding: "utf8", mode: 0o600 });
+  chmodSync(temporary, 0o600);
   renameSync(temporary, file);
+  chmodSync(file, 0o600);
 }
 
 /**
@@ -112,7 +114,8 @@ function writeKeys(file: string, stored: StoredKey[]): void {
  * Каталог — место ключа на этой машине. Список ключей секрет целиком не отдаёт.
  */
 export function openTrainer(directory: string) {
-  mkdirSync(directory, { recursive: true });
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  chmodSync(directory, 0o700);
   const file = join(directory, FILE_NAME);
   const stored = readKeys(file);
 
@@ -130,14 +133,18 @@ export function openTrainer(directory: string) {
         return { ok: false, reason: "protocol" };
       }
 
-      stored.push({
-        id: randomUUID(),
-        protocol,
-        baseAddress,
-        modelName,
-        secret,
-      });
-      writeKeys(file, stored);
+      const candidate = [
+        ...stored,
+        {
+          id: randomUUID(),
+          protocol,
+          baseAddress,
+          modelName,
+          secret,
+        },
+      ];
+      writeKeys(file, candidate);
+      stored.splice(0, stored.length, ...candidate);
       return { ok: true };
     },
 

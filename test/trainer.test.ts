@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -181,4 +181,60 @@ test("повреждённый список ключей не затираетс
 
   assert.throws(() => openTrainer(directory));
   assert.equal(readFileSync(file, "utf8"), "{");
+});
+
+test("неудачная запись не оставляет ключ в списке", () => {
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory);
+  trainer.saveKey({
+    protocol: "anthropic",
+    baseAddress: "https://api.anthropic.com",
+    modelName: "claude-sonnet",
+    secret: "sk-ant-api03-secret-WXYZ",
+  });
+  mkdirSync(join(directory, "keys.json.tmp"));
+
+  assert.throws(() =>
+    trainer.saveKey({
+      protocol: "openai-compatible",
+      baseAddress: "https://api.deepseek.com",
+      modelName: "deepseek-chat",
+      secret: "sk-deepseek-secret-9876",
+    }),
+  );
+  assert.deepEqual(
+    trainer.listKeys().map((key) => key.modelName),
+    ["claude-sonnet"],
+  );
+
+  rmSync(join(directory, "keys.json.tmp"), { recursive: true, force: true });
+  trainer.saveKey({
+    protocol: "openai-compatible",
+    baseAddress: "https://api.deepseek.com",
+    modelName: "deepseek-chat",
+    secret: "sk-deepseek-secret-9876",
+  });
+
+  assert.deepEqual(
+    openTrainer(directory).listKeys().map((key) => key.modelName),
+    ["claude-sonnet", "deepseek-chat"],
+  );
+});
+
+test("файл ключа доступен только владельцу", () => {
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory);
+  trainer.saveKey({
+    protocol: "anthropic",
+    baseAddress: "https://api.anthropic.com",
+    modelName: "claude-sonnet",
+    secret: "sk-ant-api03-secret-WXYZ",
+  });
+
+  assert.equal(trainer.listKeys().length, 1);
+  if (process.platform === "win32") {
+    return;
+  }
+  assert.equal(statSync(directory).mode & 0o777, 0o700);
+  assert.equal(statSync(join(directory, "keys.json")).mode & 0o777, 0o600);
 });

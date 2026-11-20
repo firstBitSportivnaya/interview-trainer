@@ -105,6 +105,76 @@ test("веб слушает только этот компьютер, без п�
   assert.equal(JSON.stringify(keys).includes("sk-deepseek-secret-9876"), false);
 });
 
+test("ошибка записи не останавливает веб", async () => {
+  const server = await startWeb({
+    saveKey() {
+      throw new Error("disk full");
+    },
+    listKeys() {
+      return [];
+    },
+  });
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const failed = await fetch(`${base}/keys`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        protocol: "anthropic",
+        baseAddress: "https://api.anthropic.com",
+        modelName: "claude-sonnet",
+        secret: "sk-ant-api03-secret-WXYZ",
+      }),
+    });
+    assert.equal(failed.status, 500);
+    assert.equal((await fetch(base)).status, 200);
+  } finally {
+    await close(server);
+  }
+});
+
+test("чужая страница не сохраняет ключ, своя сохраняет", async () => {
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const body = new URLSearchParams({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-WXYZ",
+    });
+    const foreign = await fetch(`${base}/keys`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: "https://evil.example",
+      },
+      body,
+    });
+    assert.equal(foreign.status, 403);
+    assert.equal(trainer.listKeys().length, 0);
+
+    const own = await fetch(`${base}/keys`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: base,
+      },
+      body,
+    });
+    assert.equal(own.status, 200);
+    assert.equal(trainer.listKeys().length, 1);
+  } finally {
+    await close(server);
+  }
+});
+
 test("каталог данных владельца не входит в git", () => {
   const ignore = readFileSync(new URL("../.gitignore", import.meta.url), "utf8");
   assert.match(ignore, /(^|\n)data\/\r?\n/);
