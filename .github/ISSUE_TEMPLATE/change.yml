@@ -1,0 +1,51 @@
+name: Доработка или ошибка
+description: Что поменять в тренажёре и как понять, что сделано
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Область
+      description: От области зависит, какой ADR агент читает перед правкой (AGENTS.md)
+      multiple: true
+      options:
+        - session — сессия, сторона, персонаж, разбор
+        - dossier — дело, досье, материалы, шпаргалка
+        - model — ключ и два протокола
+        - access — локальный веб и каталог владельца
+        - docs — документация и процесс
+    validations:
+      required: true
+  - type: dropdown
+    id: role
+    attributes:
+      label: Кто сталкивается
+      description: Не заполнять, если роль ни при чём, например для docs
+      multiple: true
+      options:
+        - владелец
+        - исполнитель
+    validations:
+      required: false
+  - type: textarea
+    id: now
+    attributes:
+      label: Что сейчас
+      description: Для ошибки — шаги и что видно на экране или в выводе команды
+    validations:
+      required: true
+  - type: textarea
+    id: want
+    attributes:
+      label: Что должно быть
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Критерии приёмки
+      description: 2–5 пунктов «Дано / Когда / Тогда». Хотя бы один — про ошибочный ввод, отказ или запрещённое состояние. Для поведения тренажёра каждый пункт станет тестом в test/
+      placeholder: |
+        1. Дано: владелец открыл сессию. Когда: персонаж отвечает. Тогда: сессия читает досье, с которым её открыли.
+        2. Дано: протокол ключа не из двух допустимых. Когда: владелец сохраняет ключ. Тогда: ключ не записан.
+    validations:
+      required: true
