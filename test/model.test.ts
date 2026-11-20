@@ -75,7 +75,7 @@ test("адаптер Anthropic отдаёт речь потоком", { timeout:
     response.write(
       'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"— июнь."}}\n\n',
     );
-    response.end();
+    response.end('data: {"type":"message_stop"}\n\n');
   });
 
   try {
@@ -255,17 +255,92 @@ test("чужой протокол не уходит в запрос", async () =
   }
 });
 
+test("обрыв потока без конца протокола остаётся отказом", async () => {
+  const server = await listen(async (request, response) => {
+    await readBody(request);
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    if (request.url === "/v1/messages") {
+      response.end('data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Срок "}}\n\n');
+      return;
+    }
+    response.end('data: {"choices":[{"delta":{"content":"Срок "}}]}\n\n');
+  });
+
+  try {
+    for (const protocol of ["anthropic", "openai-compatible"] as const) {
+      const chunks: string[] = [];
+      await assert.rejects(
+        async () => {
+          for await (const text of liveModel().complete(callFor(protocol, origin(server)), new AbortController().signal)) {
+            chunks.push(text);
+          }
+        },
+        (error: unknown) => {
+          assert.ok(error instanceof ModelFailure);
+          assert.equal(error.reason, "model");
+          assert.equal(error.message.includes("Срок"), false);
+          return true;
+        },
+      );
+      assert.deepEqual(chunks, ["Срок "]);
+    }
+  } finally {
+    await close(server);
+  }
+});
+
+test("неполный кадр длиннее 64 КиБ не становится речью", async () => {
+  const payload = `секрет-кадра${"x".repeat(64 * 1024)}`;
+  const server = await listen(async (request, response) => {
+    await readBody(request);
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(`data: ${payload}`);
+  });
+
+  try {
+    const chunks: string[] = [];
+    await assert.rejects(
+      async () => {
+        for await (const text of liveModel().complete(
+          callFor("openai-compatible", origin(server)),
+          new AbortController().signal,
+        )) {
+          chunks.push(text);
+        }
+      },
+      (error: unknown) => {
+        assert.ok(error instanceof ModelFailure);
+        assert.equal(error.reason, "model");
+        assert.equal(error.message.includes("секрет-кадра"), false);
+        return true;
+      },
+    );
+    assert.deepEqual(chunks, []);
+  } finally {
+    await close(server);
+  }
+});
+
 test("обрыв чтения останавливает адаптер", { timeout: 2000 }, async () => {
   let release = () => {};
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
+  let markClosed = () => {};
+  const dropped = new Promise<void>((resolve) => {
+    markClosed = resolve;
+  });
   const server = await listen(async (request, response) => {
     await readBody(request);
+    let finished = false;
+    response.on("close", () => {
+      if (!finished) markClosed();
+    });
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.write('data: {"choices":[{"delta":{"content":"Срок "}}]}\n\n');
     await gate;
-    response.end('data: {"choices":[{"delta":{"content":"— июнь."}}]}\n\n');
+    finished = true;
+    response.end('data: {"choices":[{"delta":{"content":"— июнь."}}]}\n\ndata: [DONE]\n\n');
   });
 
   try {
@@ -274,6 +349,7 @@ test("обрыв чтения останавливает адаптер", { time
       [Symbol.asyncIterator]();
     assert.equal((await iterator.next()).value, "Срок ");
     await iterator.return?.();
+    await dropped;
   } finally {
     release();
     await close(server);
