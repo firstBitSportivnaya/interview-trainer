@@ -147,6 +147,7 @@ const FAILURE_MESSAGE = {
   secret: "Секрет ключа не читается.",
 } as const;
 
+const PLAINTEXT_VACUUM = "plaintext-vacuum";
 const LEGACY_KEYS = "keys.json";
 /** Снимок keys.json, уже снятый с пути, куда пишет прежний процесс. */
 const LEGACY_STAGING = "keys.json.migrating";
@@ -199,6 +200,11 @@ function schemaSql(): string {
       base_address TEXT NOT NULL,
       model_name TEXT NOT NULL,
       secret TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS store_flags (
+      name TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     ) STRICT;
 
     CREATE TABLE IF NOT EXISTS sessions (
@@ -411,25 +417,40 @@ function importKeys(database: DatabaseSync, keys: readonly StoredKey[]): void {
       }
       continue;
     }
-    insert.run(key.id, key.protocol, key.baseAddress, key.modelName, sealSecret(key.secret, key.id));
+    insert.run(key.id, key.protocol, key.baseAddress, key.modelName, sealSecret(key.secret));
   }
 }
 
+function vacuumPending(database: DatabaseSync): boolean {
+  const row = database.prepare("SELECT value FROM store_flags WHERE name = ?").get(PLAINTEXT_VACUUM);
+  return row !== undefined;
+}
+
+function setVacuumPending(database: DatabaseSync, pending: boolean): void {
+  if (pending) {
+    database.prepare("INSERT OR REPLACE INTO store_flags (name, value) VALUES (?, 'pending')").run(PLAINTEXT_VACUUM);
+    return;
+  }
+  database.prepare("DELETE FROM store_flags WHERE name = ?").run(PLAINTEXT_VACUUM);
+}
+
+function hasPlaintextSecret(database: DatabaseSync): boolean {
+  const rows = database.prepare("SELECT secret FROM keys").all() as Row[];
+  return rows.some((row) => !isSealedSecret(textColumn(row, "secret")));
+}
+
 /** Сворачивает открытый секрет прошлого хранилища. Уже свёрнутую колонку не трогает. */
-function sealPlaintextSecrets(database: DatabaseSync): boolean {
+function sealPlaintextSecrets(database: DatabaseSync): void {
   const rows = database.prepare("SELECT id, secret FROM keys").all() as Row[];
   const update = database.prepare("UPDATE keys SET secret = ? WHERE id = ?");
-  let changed = false;
   for (const row of rows) {
     const stored = textColumn(row, "secret");
     if (isSealedSecret(stored)) {
       continue;
     }
     const id = textColumn(row, "id");
-    update.run(sealSecret(stored, id), id);
-    changed = true;
+    update.run(sealSecret(stored), id);
   }
-  return changed;
 }
 
 /** Переносит снимки, пока они есть. Расхождение или порча списка оставляют файл владельцу. */
@@ -537,10 +558,12 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     database.exec("PRAGMA busy_timeout = 5000");
     database.exec(schemaSql());
     migrateLegacyKeys(database, directory);
-    const rewrotePlaintext = sealPlaintextSecrets(database);
-    if (rewrotePlaintext) {
+    if (hasPlaintextSecret(database) || vacuumPending(database)) {
+      setVacuumPending(database, true);
+      sealPlaintextSecrets(database);
       database.exec("VACUUM");
       chmodSync(databaseFile, 0o600);
+      setVacuumPending(database, false);
     }
   } catch (error) {
     database.close();
@@ -620,7 +643,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       const id = randomUUID();
       database
         .prepare("INSERT INTO keys (id, protocol, base_address, model_name, secret) VALUES (?, ?, ?, ?, ?)")
-        .run(id, protocol, baseAddress, modelName, sealSecret(secret, id));
+        .run(id, protocol, baseAddress, modelName, sealSecret(secret));
       return { ok: true };
     },
 

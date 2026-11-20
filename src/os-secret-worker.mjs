@@ -94,10 +94,18 @@ function ensurePowershell() {
     windowsHide: true,
   });
   pending = "";
-  powershell.stdout.on("data", onStdout);
-  powershell.on("exit", failWaiters);
-  powershell.stdin.on("error", () => {});
-  return powershell;
+  const child = powershell;
+  child.stdout.on("data", onStdout);
+  const dropChild = () => {
+    failWaiters();
+    if (powershell === child) {
+      powershell = undefined;
+    }
+  };
+  child.on("error", dropChild);
+  child.on("exit", dropChild);
+  child.stdin.on("error", () => {});
+  return child;
 }
 
 function askPowershell(line) {
@@ -105,9 +113,14 @@ function askPowershell(line) {
   return new Promise((resolve) => {
     waiters.push(resolve);
     child.stdin.write(`${line}\n`, (error) => {
-      if (error) {
-        resolve("ERR");
+      if (!error) {
+        return;
       }
+      const index = waiters.indexOf(resolve);
+      if (index !== -1) {
+        waiters.splice(index, 1);
+      }
+      resolve("ERR");
     });
   });
 }
@@ -129,17 +142,14 @@ function run(argv) {
     var found = Ref();
     var status = $.SecItemCopyMatching(query, found);
     if (Number(status) !== 0) {
-      console.log("ERR");
-      return;
+      return "ERR";
     }
     var text = ObjC.unwrap($.NSString.alloc.initWithDataEncoding(found[0], $.NSUTF8StringEncoding));
     if (!text) {
-      console.log("ERR");
-      return;
+      return "ERR";
     }
     var encoded = $.NSString.alloc.initWithUTF8String(String(text)).dataUsingEncoding($.NSUTF8StringEncoding).base64EncodedStringWithOptions(0);
-    console.log("OK " + ObjC.unwrap(encoded));
-    return;
+    return "OK " + ObjC.unwrap(encoded);
   }
   var raw = $.NSString.alloc.initWithDataEncoding(
     $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile,
@@ -147,14 +157,13 @@ function run(argv) {
   );
   var secret = ObjC.unwrap(raw);
   if (!secret) {
-    console.log("ERR");
-    return;
+    return "ERR";
   }
   $.SecItemDelete(query);
   query.setObjectForKey($(String(secret)).dataUsingEncoding($.NSUTF8StringEncoding), $.kSecValueData);
   query.setObjectForKey($.kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly, $.kSecAttrAccessible);
   var added = $.SecItemAdd(query, null);
-  console.log(Number(added) === 0 ? "OK " : "ERR");
+  return Number(added) === 0 ? "OK " : "ERR";
 }
 `;
 

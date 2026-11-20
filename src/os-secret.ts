@@ -4,54 +4,58 @@
  * macOS пишет в хранилище только ссылку, а сам секрет кладёт в keychain.
  * Чужой свёрток этим модулем не раскрывается и наружу как секрет не отдаётся.
  */
+import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 
 const DPAPI_PREFIX = "sealed:dpapi:";
 const KEYCHAIN_PREFIX = "sealed:keychain:";
 const CAPACITY = 65_536;
 
-const shared = new SharedArrayBuffer(8 + CAPACITY);
-const meta = new Int32Array(shared, 0, 2);
+type SecretWorker = {
+  worker: Worker;
+  shared: SharedArrayBuffer;
+  meta: Int32Array;
+};
 
-let worker: Worker | undefined;
+let active: SecretWorker | undefined;
 
-function ensureWorker(): Worker {
-  if (worker) {
-    return worker;
+function ensureWorker(): SecretWorker {
+  if (active) {
+    return active;
   }
+  const shared = new SharedArrayBuffer(8 + CAPACITY);
+  const meta = new Int32Array(shared, 0, 2);
   const spawned = new Worker(new URL("./os-secret-worker.mjs", import.meta.url), {
     workerData: shared,
     execArgv: [],
   });
   spawned.unref();
-  spawned.on("error", () => {
-    if (worker === spawned) {
-      worker = undefined;
+  const session: SecretWorker = { worker: spawned, shared, meta };
+  const drop = () => {
+    if (active?.worker === spawned) {
+      active = undefined;
     }
-  });
-  spawned.on("exit", () => {
-    if (worker === spawned) {
-      worker = undefined;
-    }
-  });
-  worker = spawned;
-  return spawned;
+  };
+  spawned.on("error", drop);
+  spawned.on("exit", drop);
+  active = session;
+  return session;
 }
 
 function stopWorker(): void {
-  const current = worker;
-  worker = undefined;
+  const current = active;
+  active = undefined;
   if (!current) {
     return;
   }
   try {
-    Atomics.store(meta, 0, 0);
-    current.postMessage({ op: "QUIT", payload: "" });
-    Atomics.wait(meta, 0, 0, 2_000);
+    Atomics.store(current.meta, 0, 0);
+    current.worker.postMessage({ op: "QUIT", payload: "" });
+    Atomics.wait(current.meta, 0, 0, 2_000);
   } catch {
     // Процесс и так завершается: секрет в эту ошибку не попадает.
   }
-  void current.terminate();
+  void current.worker.terminate();
 }
 
 process.once("beforeExit", stopWorker);
@@ -59,15 +63,15 @@ process.once("beforeExit", stopWorker);
 /** Ответ средств ОС. undefined — отказ, и этот отказ секретом не становится. */
 function exchange(op: "SEAL" | "OPEN", payload: string): string | undefined {
   const current = ensureWorker();
-  Atomics.store(meta, 0, 0);
-  current.postMessage({ op, payload });
-  Atomics.wait(meta, 0, 0, 30_000);
-  if (Atomics.load(meta, 0) !== 1) {
+  Atomics.store(current.meta, 0, 0);
+  current.worker.postMessage({ op, payload });
+  Atomics.wait(current.meta, 0, 0, 30_000);
+  if (active !== current || Atomics.load(current.meta, 0) !== 1) {
     stopWorker();
     throw new Error("Средства ОС не ответили.");
   }
-  const length = Atomics.load(meta, 1);
-  const text = Buffer.from(new Uint8Array(shared, 8, length)).toString("utf8");
+  const length = Atomics.load(current.meta, 1);
+  const text = Buffer.from(new Uint8Array(current.shared, 8, length)).toString("utf8");
   if (text.startsWith("OK ")) {
     return text.slice(3);
   }
@@ -91,9 +95,9 @@ export function isSealedSecret(stored: string): boolean {
 
 /**
  * Сворачивает секрет для записи в хранилище.
- * account — идентификатор ключа: на macOS это учётная запись записи keychain.
+ * На macOS учётная запись keychain новая на каждый секрет: чужой каталог с тем же id ключа её не затирает.
  */
-export function sealSecret(secret: string, account: string): string {
+export function sealSecret(secret: string): string {
   const platform = requirePlatform();
   const secretB64 = Buffer.from(secret, "utf8").toString("base64");
   if (platform === "win32") {
@@ -103,6 +107,7 @@ export function sealSecret(secret: string, account: string): string {
     }
     return DPAPI_PREFIX + blob;
   }
+  const account = randomUUID();
   const accountB64 = Buffer.from(account, "utf8").toString("base64");
   const saved = exchange("SEAL", `${accountB64} ${secretB64}`);
   if (saved === undefined) {

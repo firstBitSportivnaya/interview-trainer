@@ -432,6 +432,33 @@ test("открытый секрет прошлого хранилища свор
   assert.equal(storeHasSecret(directory, secret), false);
 });
 
+test("незавершённая очистка хранилища повторяется при открытии", () => {
+  const directory = tempDirectory();
+  const secret = "sk-test-not-a-live-key-LEFT";
+  start(directory).close();
+
+  const database = new DatabaseSync(join(directory, "store.sqlite"));
+  const insert = database.prepare(
+    "INSERT INTO keys (id, protocol, base_address, model_name, secret) VALUES (?, ?, ?, ?, ?)",
+  );
+  insert.run("key-left", "anthropic", "https://api.anthropic.com", "claude-sonnet", "sealed:dpapi:already-sealed");
+  insert.run("key-gone", "anthropic", "https://api.anthropic.com", "claude-sonnet", secret);
+  database.prepare("DELETE FROM keys WHERE id = ?").run("key-gone");
+  database.prepare("INSERT INTO store_flags (name, value) VALUES ('plaintext-vacuum', 'pending')").run();
+  database.close();
+  assert.equal(storeHasSecret(directory, secret), true);
+
+  const trainer = start(directory);
+  assert.equal(trainer.listKeys()[0]?.secretPreview, "••••");
+  trainer.close();
+  assert.equal(storeHasSecret(directory, secret), false);
+
+  const again = new DatabaseSync(join(directory, "store.sqlite"));
+  const flag = again.prepare("SELECT value FROM store_flags WHERE name = 'plaintext-vacuum'").get();
+  again.close();
+  assert.equal(flag, undefined);
+});
+
 test("текст, зашифрованный другой учётной записью, секретом не становится", async () => {
   const directory = tempDirectory();
   const secret = "sk-test-not-a-live-key-WXYZ";
@@ -541,7 +568,14 @@ test("на macOS секрет читается через keychain той же �
   trainer.close();
 
   assert.equal(storeHasSecret(directory, secret), false);
-  const result = spawnSync("security", ["find-generic-password", "-s", "interview-trainer", "-a", keyId, "-w"], {
+  const database = new DatabaseSync(join(directory, "store.sqlite"));
+  const row = database.prepare("SELECT secret FROM keys WHERE id = ?").get(keyId) as { secret: string };
+  database.close();
+  const prefix = "sealed:keychain:";
+  assert.equal(row.secret.startsWith(prefix), true);
+  const account = row.secret.slice(prefix.length);
+  assert.notEqual(account, keyId);
+  const result = spawnSync("security", ["find-generic-password", "-s", "interview-trainer", "-a", account, "-w"], {
     encoding: "utf8",
   });
   assert.equal(result.status, 0);
