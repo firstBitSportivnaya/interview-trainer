@@ -19,6 +19,7 @@ import {
   type SaveCaseResult,
   type SaveKeyResult,
   type SessionRecord,
+  type SetPortfolioSentResult,
   type SourceFileRecord,
   type SpeechEvent,
   type TranscriptLine,
@@ -59,9 +60,10 @@ type Trainer = {
   openingQuestion(sessionId: string, signal?: AbortSignal): AsyncIterable<SpeechEvent>;
   reply(sessionId: string, line: string, signal?: AbortSignal): AsyncIterable<SpeechEvent>;
   listOpenSessions(): SessionRecord[];
+  setPortfolioSent(caseId: string, sent: boolean): SetPortfolioSentResult;
 };
 
-type CaseAction = "draft" | "approve" | "session" | "file";
+type CaseAction = "draft" | "approve" | "session" | "file" | "portfolio";
 type SessionAction = "opening" | "ask";
 
 const PROTOCOL_LABEL: Record<KeySummary["protocol"], string> = {
@@ -577,6 +579,10 @@ function renderCase(
     `<h1>${escapeHtml(item.customerName)} — ${escapeHtml(item.title)}</h1>
     <p>${escapeHtml(`Голоса заказчика: ${customerVoices(item.characters).join(", ")}`)}</p>
     <p>${escapeHtml(item.portfolioSent ? "Отметка «портфолио уже отправлено» стоит." : "Отметка «портфолио уже отправлено» снята.")}</p>
+    <form method="post" action="${escapeHtml(casePath(item.id, "/portfolio"))}">
+      <button type="submit" name="sent" value="1">Поставить отметку «портфолио уже отправлено»</button>
+      <button type="submit" name="sent" value="0">Снять отметку «портфолио уже отправлено»</button>
+    </form>
     ${notice(error)}
     ${renderSourceFiles(trainer, item, fileError)}
     ${approvedBlock(trainer, item, sessionError)}
@@ -706,13 +712,20 @@ function allowsFormPost(origin: string | string[] | undefined, port: number): bo
 }
 
 function caseTarget(pathname: string): { id: string; action?: CaseAction } | undefined {
-  const match = pathname.match(/^\/cases\/([^/]+)(?:\/(draft|approve|session|file))?$/);
+  const match = pathname.match(/^\/cases\/([^/]+)(?:\/(draft|approve|session|file|portfolio))?$/);
   const id = match?.[1];
   if (!id) {
     return undefined;
   }
   const action = match?.[2];
-  if (action !== undefined && action !== "draft" && action !== "approve" && action !== "session" && action !== "file") {
+  if (
+    action !== undefined &&
+    action !== "draft" &&
+    action !== "approve" &&
+    action !== "session" &&
+    action !== "file" &&
+    action !== "portfolio"
+  ) {
     return undefined;
   }
   return { id: decodeURIComponent(id), action };
@@ -948,6 +961,20 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
       extractedText: fields.get("extractedText") ?? "",
     });
     redirect(response, saved.ok ? casePath(item.id) : `${casePath(item.id)}?fileError=${saved.reason}`);
+    return;
+  }
+
+  if (target?.action === "portfolio") {
+    const item = trainer.readCase(target.id);
+    if (!item) {
+      refuse(request, response, 404);
+      return;
+    }
+    const sent = fields.get("sent");
+    if (sent === "1" || sent === "0") {
+      trainer.setPortfolioSent(item.id, sent === "1");
+    }
+    redirect(response, casePath(item.id));
     return;
   }
 

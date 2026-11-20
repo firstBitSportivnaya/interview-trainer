@@ -324,7 +324,7 @@ test("второй запрос первого вопроса ждёт, пока
   );
 });
 
-test("сторона внутренней команды остаётся прежним вызовом модели", async () => {
+test("персонаж внутренней команды читает служебный слой и пишет стенограмму", async () => {
   const calls: ModelCall[] = [];
   const trainer = start({
     async *complete(call) {
@@ -335,7 +335,13 @@ test("сторона внутренней команды остаётся пре
         secret: call.secret,
         messages: call.messages.map((message) => ({ role: message.role, text: message.text })),
       });
-      yield call.messages[0]?.text ?? "";
+      const text = call.messages[0]?.text ?? "";
+      const task = text.split("\n\n").at(-1) ?? "";
+      if (task.startsWith("Задай один вопрос")) {
+        yield "Как в роли «аналитик» устроена приёмка?";
+        return;
+      }
+      yield text.includes("Маржа подрядчика 12%.") ? "Маржа подрядчика 12%." : "В материале проекта этого нет.";
     },
   });
   const prepared = prepare(trainer);
@@ -350,11 +356,21 @@ test("сторона внутренней команды остаётся пре
   });
   assert.ok(openedSession.ok);
 
-  assert.deepEqual(await take(trainer.reply(openedSession.session.id, "Где расчёт?")), [
-    { kind: "speech", text: "Где расчёт?" },
+  assert.deepEqual(await take(trainer.reply(openedSession.session.id, "Какая маржа?")), [
+    { kind: "speech", text: "Маржа подрядчика 12%." },
   ]);
-  assert.deepEqual(calls[0]?.messages, [{ role: "user", text: "Где расчёт?" }]);
-  assert.deepEqual(trainer.readTranscript(openedSession.session.id), []);
-  assert.deepEqual(await take(trainer.openingQuestion(openedSession.session.id)), []);
-  assert.equal(calls.length, 1);
+  const replyCall = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(replyCall.includes("Маржа подрядчика 12%."), true);
+  assert.equal(replyCall.includes("Спросить про сроки."), false);
+  assert.equal(replyCall === "Какая маржа?", false);
+  assert.deepEqual(trainer.readTranscript(openedSession.session.id), [
+    { speaker: "исполнитель", kind: "реплика", text: "Какая маржа?" },
+    { speaker: "персонаж", kind: "ответ", text: "Маржа подрядчика 12%." },
+  ]);
+
+  assert.deepEqual(await take(trainer.openingQuestion(openedSession.session.id)), [
+    { kind: "speech", text: "Как в роли «аналитик» устроена приёмка?" },
+  ]);
+  assert.equal(calls[1]?.messages[0]?.text.includes("роли «аналитик»"), true);
+  assert.equal(calls.length, 2);
 });
