@@ -136,6 +136,28 @@ export type SpeechEvent =
   | { kind: "speech"; text: string }
   | { kind: "failure"; reason: "timeout" | "model" | "missing" | "secret"; message: string };
 
+/** Кто говорит в стенограмме. */
+export type TranscriptSpeaker = "персонаж" | "исполнитель";
+
+/** Вопрос персонажа, его ответ или реплика исполнителя. */
+export type TranscriptKind = "вопрос" | "ответ" | "реплика";
+
+/** Строка стенограммы. Она остаётся на сессии. */
+export type TranscriptLine = {
+  speaker: TranscriptSpeaker;
+  kind: TranscriptKind;
+  text: string;
+};
+
+/**
+ * Фраза, которой персонаж заказчика называет факт, которого нет в материале проекта.
+ * Записанная модель и живая получают одну и ту же формулировку.
+ */
+export const ABSENT_FACT = "В материале проекта этого нет.";
+
+/** Один вопрос персонажа. После него персонаж ждёт и сам очередь не продолжает. */
+const OPENING_TASK = "Задай один вопрос исполнителю по материалу проекта и остановись.";
+
 /** Отказ открыть сессию: тройка уже открыта, записи нет или поле не из каталога. */
 export type OpenSessionResult =
   | { ok: true; session: SessionRecord }
@@ -193,7 +215,7 @@ const STORE_FILE = "store.sqlite";
 const SESSION_COLUMNS = "id, case_id, dossier_id, side, character_name, role, executor_id, key_id, status";
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
-const PERFORMER_ROLES = [
+export const PERFORMER_ROLES = [
   "руководитель проекта",
   "аналитик",
   "функциональный архитектор",
@@ -286,6 +308,18 @@ function schemaSql(): string {
       executor_id TEXT NOT NULL,
       note TEXT NOT NULL
     ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS transcript (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id),
+      ordinal INTEGER NOT NULL,
+      speaker TEXT NOT NULL CHECK (speaker IN ('персонаж', 'исполнитель')),
+      kind TEXT NOT NULL CHECK (kind IN ('вопрос', 'ответ', 'реплика')),
+      body TEXT NOT NULL
+    ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS transcript_session
+      ON transcript(session_id, ordinal);
   `;
 }
 
@@ -406,6 +440,42 @@ function dossierDraftPrompt(layers: DossierLayers): string {
     "",
     "Шпаргалка проекта:",
     layers.crib,
+  ].join("\n");
+}
+
+/**
+ * Задание персонажу заказчика.
+ * Факты — только материал проекта. Заметки хода подготовки — линия поведения, не источник фактов.
+ * Служебный слой и шпаргалка в текст не входят: персонаж их не произносит.
+ */
+function customerPrompt(input: {
+  character: string;
+  material: string;
+  notes: readonly string[];
+  history: readonly TranscriptLine[];
+  task: string;
+}): string {
+  const historyText =
+    input.history.length === 0
+      ? "пока пусто"
+      : input.history.map((line) => `${line.speaker}: ${line.text}`).join("\n");
+  return [
+    `Ты — персонаж «${input.character}», сторона «заказчик».`,
+    "Факты бери только из материала проекта.",
+    `Если факта в материале проекта нет, скажи дословно: ${ABSENT_FACT}`,
+    "Шпаргалку не произноси. Служебный слой не читай и не упоминай.",
+    "Линия поведения — не факты. Фактов из неё не произноси.",
+    "",
+    "Линия поведения:",
+    input.notes.length === 0 ? "нет" : input.notes.join("\n"),
+    "",
+    "Материал проекта:",
+    input.material,
+    "",
+    "Стенограмма:",
+    historyText,
+    "",
+    input.task,
   ].join("\n");
 }
 
@@ -795,7 +865,145 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     return { key: { ...stored, secret } };
   }
 
+  function loadDossier(dossierId: string): DossierRecord | undefined {
+    const row = database
+      .prepare("SELECT id, case_id, material, service_layer, crib FROM dossiers WHERE id = ?")
+      .get(dossierId) as Row | undefined;
+    return row ? readDossierRecord(row) : undefined;
+  }
+
+  function isTranscriptSpeaker(value: string): value is TranscriptSpeaker {
+    return value === "персонаж" || value === "исполнитель";
+  }
+
+  function isTranscriptKind(value: string): value is TranscriptKind {
+    return value === "вопрос" || value === "ответ" || value === "реплика";
+  }
+
+  function readTranscriptRows(sessionId: string): TranscriptLine[] {
+    const rows = database
+      .prepare("SELECT speaker, kind, body FROM transcript WHERE session_id = ? ORDER BY ordinal")
+      .all(sessionId) as Row[];
+    return rows.map((row) => {
+      const speaker = textColumn(row, "speaker");
+      const kind = textColumn(row, "kind");
+      if (!isTranscriptSpeaker(speaker) || !isTranscriptKind(kind)) {
+        throw new Error("Запись хранилища повреждена");
+      }
+      return { speaker, kind, text: textColumn(row, "body") };
+    });
+  }
+
+  function hasOpeningQuestion(sessionId: string): boolean {
+    return (
+      database.prepare("SELECT id FROM transcript WHERE session_id = ? AND kind = 'вопрос' LIMIT 1").get(sessionId) !==
+      undefined
+    );
+  }
+
+  function appendTranscript(sessionId: string, speaker: TranscriptSpeaker, kind: TranscriptKind, text: string): void {
+    const row = database
+      .prepare("SELECT COALESCE(MAX(ordinal), 0) AS ordinal FROM transcript WHERE session_id = ?")
+      .get(sessionId) as Row;
+    database
+      .prepare("INSERT INTO transcript (id, session_id, ordinal, speaker, kind, body) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(randomUUID(), sessionId, integerColumn(row, "ordinal") + 1, speaker, kind, text);
+  }
+
+  /**
+   * Зовёт модель ключом сессии и отдаёт речь кусками.
+   * spoken собирает куски. failed — вызов оборвался, и целая реплика не сложилась.
+   * signal обрывает вызов, когда читатель закрыл поток.
+   */
+  async function* streamKey(
+    session: SessionRecord,
+    messages: { role: "user"; text: string }[],
+    spoken: { text: string; failed: boolean },
+    signal?: AbortSignal,
+  ): AsyncIterable<SpeechEvent> {
+    const loaded = loadKey(session.keyId);
+    if (!loaded) {
+      spoken.failed = true;
+      yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
+      return;
+    }
+    if (!("key" in loaded)) {
+      spoken.failed = true;
+      yield { kind: "failure", reason: "secret", message: FAILURE_MESSAGE.secret };
+      return;
+    }
+    const key = loaded.key;
+    const controller = new AbortController();
+    const onAbort = (): void => {
+      controller.abort();
+    };
+    if (signal?.aborted) {
+      controller.abort();
+    } else {
+      signal?.addEventListener("abort", onAbort, { once: true });
+    }
+    try {
+      if (signal?.aborted) {
+        spoken.failed = true;
+        return;
+      }
+      for await (const text of model.complete(
+        {
+          protocol: key.protocol,
+          baseAddress: key.baseAddress,
+          modelName: key.modelName,
+          secret: key.secret,
+          messages,
+        },
+        controller.signal,
+      )) {
+        if (signal?.aborted) {
+          spoken.failed = true;
+          return;
+        }
+        if (text) {
+          spoken.text += text;
+          yield { kind: "speech", text };
+        }
+      }
+      if (signal?.aborted) {
+        spoken.failed = true;
+      }
+    } catch (error) {
+      spoken.failed = true;
+      if (signal?.aborted) {
+        return;
+      }
+      const reason = error instanceof ModelFailure ? error.reason : "model";
+      yield { kind: "failure", reason, message: FAILURE_MESSAGE[reason] };
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+      controller.abort();
+    }
+  }
+
+  /** Задание персонажу заказчика: материал проекта и линия поведения, без служебного слоя. */
+  function customerTask(session: SessionRecord, task: string): { ok: true; text: string } | { ok: false } {
+    const dossier = loadDossier(session.dossierId);
+    if (!dossier) {
+      return { ok: false };
+    }
+    const notes = readPreparationRecord(session.caseId, session.role, session.executorId)?.notes ?? [];
+    return {
+      ok: true,
+      text: customerPrompt({
+        character: session.character,
+        material: dossier.material,
+        notes,
+        history: readTranscriptRows(session.id),
+        task,
+      }),
+    };
+  }
+
   let closed = false;
+  /** Сессии, у которых первый вопрос уже пошёл к модели и ещё не записан. */
+  const openingReservations = new Set<string>();
 
   return {
     /** Закрывает файл хранилища. Повторный вызов ничего не делает. */
@@ -1118,44 +1326,78 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       return loadSession(sessionId);
     },
 
+    /** Возвращает стенограмму сессии. Нет сессии — записи нет. */
+    readTranscript(sessionId: string): TranscriptLine[] | undefined {
+      if (!loadSession(sessionId)) {
+        return undefined;
+      }
+      return readTranscriptRows(sessionId);
+    },
+
     /**
-     * Зовёт модель ключом, которым открыта сессия.
-     * Речь приходит кусками. Ошибка модели в речь не подмешивается.
+     * Персонаж заказчика задаёт один вопрос по материалу проекта и делает паузу.
+     * Повторный вызов модель не зовёт: очередь сама не продолжается.
+     * Сторону внутренней команды этот вызов не меняет.
+     * signal обрывает генерацию, когда страница закрыла поток.
      */
-    async *reply(sessionId: string, line: string): AsyncIterable<SpeechEvent> {
+    async *openingQuestion(sessionId: string, signal?: AbortSignal): AsyncIterable<SpeechEvent> {
       const session = loadSession(sessionId);
-      const loaded = session ? loadKey(session.keyId) : undefined;
-      if (!session || !loaded) {
+      if (!session) {
         yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
         return;
       }
-      if (!("key" in loaded)) {
-        yield { kind: "failure", reason: "secret", message: FAILURE_MESSAGE.secret };
+      if (session.side !== "заказчик" || hasOpeningQuestion(session.id) || openingReservations.has(session.id)) {
         return;
       }
-      const key = loaded.key;
-
-      const controller = new AbortController();
+      openingReservations.add(session.id);
       try {
-        for await (const text of model.complete(
-          {
-            protocol: key.protocol,
-            baseAddress: key.baseAddress,
-            modelName: key.modelName,
-            secret: key.secret,
-            messages: [{ role: "user", text: line }],
-          },
-          controller.signal,
-        )) {
-          if (text) {
-            yield { kind: "speech", text };
-          }
+        const task = customerTask(session, OPENING_TASK);
+        if (!task.ok) {
+          yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
+          return;
         }
-      } catch (error) {
-        const reason = error instanceof ModelFailure ? error.reason : "model";
-        yield { kind: "failure", reason, message: FAILURE_MESSAGE[reason] };
+        const spoken = { text: "", failed: false };
+        yield* streamKey(session, [{ role: "user", text: task.text }], spoken, signal);
+        if (!spoken.failed && spoken.text && !signal?.aborted) {
+          appendTranscript(session.id, "персонаж", "вопрос", spoken.text);
+        }
       } finally {
-        controller.abort();
+        openingReservations.delete(session.id);
+      }
+    },
+
+    /**
+     * Зовёт модель ключом, которым открыта сессия.
+     * У заказчика ответ берётся из материала проекта и пишется в стенограмму.
+     * Исполнитель может спросить, не дожидаясь вопроса персонажа.
+     * Внутренняя команда получает прежний вызов: одна реплика, без стенограммы.
+     * Речь приходит кусками. Ошибка модели в речь не подмешивается.
+     * signal обрывает генерацию, когда страница закрыла поток.
+     */
+    async *reply(sessionId: string, line: string, signal?: AbortSignal): AsyncIterable<SpeechEvent> {
+      const session = loadSession(sessionId);
+      if (!session) {
+        yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
+        return;
+      }
+      if (session.side !== "заказчик") {
+        yield* streamKey(session, [{ role: "user", text: line }], { text: "", failed: false }, signal);
+        return;
+      }
+      const text = line.trim();
+      if (!text) {
+        return;
+      }
+      const task = customerTask(session, text);
+      if (!task.ok) {
+        yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
+        return;
+      }
+      appendTranscript(session.id, "исполнитель", "реплика", text);
+      const spoken = { text: "", failed: false };
+      yield* streamKey(session, [{ role: "user", text: task.text }], spoken, signal);
+      if (spoken.text && !signal?.aborted) {
+        appendTranscript(session.id, "персонаж", "ответ", spoken.text);
       }
     },
 

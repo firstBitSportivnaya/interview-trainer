@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import {
   customerVoices,
   DRAFT_LIMIT,
+  PERFORMER_ROLES,
   type ApproveDossierResult,
   type CaseRecord,
   type CustomerRecord,
@@ -11,9 +12,13 @@ import {
   type DraftDossierResult,
   type KeyDraft,
   type KeySummary,
+  type OpenSessionResult,
   type OwnerProfile,
   type SaveCaseResult,
   type SaveKeyResult,
+  type SessionRecord,
+  type SpeechEvent,
+  type TranscriptLine,
 } from "./trainer.ts";
 
 /** Ядро, которым веб пользуется тем же путём, что и проверка. */
@@ -30,9 +35,24 @@ type Trainer = {
   draftDossier(draft: { caseId: string; keyId: string } & DossierLayers): Promise<DraftDossierResult>;
   approveDossier(draft: { caseId: string } & DossierLayers): ApproveDossierResult;
   readApprovedDossier(caseId: string): DossierRecord | undefined;
+  openSession(draft: {
+    caseId: string;
+    dossierId: string;
+    side: string;
+    character: string;
+    role: string;
+    executorId: string;
+    keyId: string;
+  }): OpenSessionResult;
+  readSession(sessionId: string): SessionRecord | undefined;
+  readTranscript(sessionId: string): TranscriptLine[] | undefined;
+  openingQuestion(sessionId: string, signal?: AbortSignal): AsyncIterable<SpeechEvent>;
+  reply(sessionId: string, line: string, signal?: AbortSignal): AsyncIterable<SpeechEvent>;
+  listOpenSessions(): SessionRecord[];
 };
 
-type CaseAction = "draft" | "approve";
+type CaseAction = "draft" | "approve" | "session";
+type SessionAction = "opening" | "ask";
 
 const PROTOCOL_LABEL: Record<KeySummary["protocol"], string> = {
   anthropic: "Anthropic",
@@ -47,6 +67,15 @@ const KEY_ERROR: Record<Exclude<SaveKeyResult, { ok: true }>["reason"], string> 
 const CASE_ERROR: Record<Exclude<SaveCaseResult, { ok: true }>["reason"], string> = {
   incomplete: "Укажите заказчика и название проекта.",
   missing: "Заказчик не найден.",
+};
+
+const SESSION_ERROR: Record<Exclude<OpenSessionResult, { ok: true }>["reason"] | "character", string> = {
+  incomplete: "Заполните проект, сторону, персонажа, роль исполнителя и ключ.",
+  missing: "Проект, досье или ключ не найдены.",
+  role: "Выберите роль исполнителя.",
+  side: "Сессия этой страницы открывается на стороне заказчика.",
+  open: "Сессия этой тройки уже открыта.",
+  character: "Выберите персонажа заказчика.",
 };
 
 const DRAFT_ERROR: Record<Exclude<DraftDossierResult, { ok: true }>["reason"], string> = {
@@ -88,9 +117,10 @@ function page(title: string, body: string): string {
     .error { color: #9f1239; }
     nav a { margin-right: 1rem; }
     li { margin: 0.4rem 0; }
-    pre { white-space: pre-wrap; font: inherit; }
+    pre, #live { white-space: pre-wrap; font: inherit; }
     code { letter-spacing: 0.04em; }
     section { margin: 1.5rem 0; }
+    ol { padding-left: 1.2rem; }
   </style>
 </head>
 <body>
@@ -254,23 +284,217 @@ function layerAreas(layers: DossierLayers): string {
     </label>`;
 }
 
-function approvedBlock(dossier: DossierRecord | undefined): string {
+function approvedBlock(trainer: Trainer, item: CaseRecord, sessionError?: string): string {
+  const dossier = trainer.readApprovedDossier(item.id);
   if (!dossier) {
     return "<p>Утверждённого досье ещё нет. Сессия не открывается.</p>";
   }
+  const keys = trainer.listKeys();
+  const voices = customerVoices(item.characters);
+  const openSessions = trainer.listOpenSessions().filter((session) => session.caseId === item.id);
+  const links =
+    openSessions.length === 0
+      ? ""
+      : `<ul>${openSessions
+          .map(
+            (session) =>
+              `<li><a href="/sessions/${encodeURIComponent(session.id)}">Стенограмма: ${escapeHtml(session.character)}, ${escapeHtml(session.role)}</a></li>`,
+          )
+          .join("")}</ul>`;
+  const form =
+    keys.length === 0
+      ? "<p>Сначала сохраните ключ.</p>"
+      : `<form method="post" action="${escapeHtml(casePath(item.id, "/session"))}">
+          <label>Сторона
+            <select name="side" required>
+              <option value="заказчик">заказчик</option>
+            </select>
+          </label>
+          <label>Персонаж
+            <select name="character" required>
+              ${voices.map((voice) => `<option value="${escapeHtml(voice)}">${escapeHtml(voice)}</option>`).join("")}
+            </select>
+          </label>
+          <label>Роль исполнителя
+            <select name="role" required>
+              ${PERFORMER_ROLES.map((role) => `<option value="${escapeHtml(role)}">${escapeHtml(role)}</option>`).join("")}
+            </select>
+          </label>
+          <label>Ключ
+            <select name="keyId" required>
+              ${keys
+                .map(
+                  (key) =>
+                    `<option value="${escapeHtml(key.id)}">${escapeHtml(PROTOCOL_LABEL[key.protocol])} — ${escapeHtml(key.modelName)}</option>`,
+                )
+                .join("")}
+            </select>
+          </label>
+          <button type="submit">Открыть сессию</button>
+        </form>`;
   return `<section>
     <h2>Утверждённое досье</h2>
-    <p>Сессия ещё не открывается. В диалог позже попадёт только этот текст.</p>
     <h3>Материал проекта</h3>
     <pre>${escapeHtml(dossier.material)}</pre>
     <h3>Служебный слой</h3>
     <pre>${escapeHtml(dossier.serviceLayer)}</pre>
     <h3>Шпаргалка проекта</h3>
     <pre>${escapeHtml(dossier.crib)}</pre>
+    <h2>Сессия</h2>
+    <p>Сессия читает это досье. Персонаж заказчика отвечает по материалу проекта.</p>
+    ${notice(sessionError)}
+    ${form}
+    ${links}
   </section>`;
 }
 
-function renderCase(trainer: Trainer, item: CaseRecord, error?: string, paste?: DossierLayers & { keyId: string }): string {
+function transcriptList(lines: TranscriptLine[]): string {
+  if (lines.length === 0) {
+    return `<p id="empty-transcript">Стенограмма пока пуста.</p>`;
+  }
+  return `<ol id="transcript">${lines
+    .map((line) => {
+      const who = line.speaker === "персонаж" ? "Персонаж" : "Исполнитель";
+      return `<li><span>${who}</span> ${escapeHtml(line.text)}</li>`;
+    })
+    .join("")}</ol>`;
+}
+
+/** Поток первого вопроса и вопрос исполнителя. Текст реплики в скрипт не подставляется. */
+function sessionScript(sessionId: string, needsOpening: boolean): string {
+  return `<script>
+    const openingBox = document.getElementById("opening");
+    const live = document.getElementById("live");
+    const form = document.getElementById("ask");
+    const field = form.querySelector("textarea");
+    const openingUrl = ${JSON.stringify(`/sessions/${encodeURIComponent(sessionId)}/opening`)};
+    let asking = false;
+    function remember(who, text) {
+      if (!text) return;
+      const empty = document.getElementById("empty-transcript");
+      if (empty) empty.remove();
+      let list = document.getElementById("transcript");
+      if (!list) {
+        list = document.createElement("ol");
+        list.id = "transcript";
+        openingBox.before(list);
+      }
+      const item = document.createElement("li");
+      const name = document.createElement("span");
+      name.textContent = who;
+      item.append(name, document.createTextNode(" " + text));
+      list.append(item);
+    }
+    function consume(buffer, onEvent) {
+      const parts = buffer.split("\\n\\n");
+      const rest = parts.pop() ?? "";
+      for (const part of parts) {
+        if (!part.trim()) continue;
+        let name = "message";
+        const data = [];
+        for (const line of part.split("\\n")) {
+          if (line.startsWith("event:")) name = line.slice(6).trim();
+          else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+        }
+        onEvent(name, data.join("\\n"));
+      }
+      return rest;
+    }
+    ${
+      needsOpening
+        ? `const source = new EventSource(openingUrl);
+    let openingFailed = false;
+    source.onmessage = (event) => openingBox.append(document.createTextNode(event.data));
+    source.addEventListener("failure", (event) => {
+      openingFailed = true;
+      source.close();
+      openingBox.textContent = event.data;
+    });
+    source.addEventListener("done", () => {
+      source.close();
+      if (openingFailed) return;
+      const spoken = openingBox.textContent;
+      openingBox.textContent = "";
+      remember("Персонаж", spoken);
+    });`
+        : ""
+    }
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (asking) return;
+      asking = true;
+      const question = field.value;
+      const body = new URLSearchParams(new FormData(form));
+      fetch(form.action, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", accept: "text/event-stream" },
+        body,
+      }).then(async (response) => {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let pending = "";
+        let failed = false;
+        while (true) {
+          const step = await reader.read();
+          if (step.done) break;
+          pending += decoder.decode(step.value, { stream: true });
+          pending = consume(pending, (name, data) => {
+            if (name === "failure") {
+              failed = true;
+              live.textContent = data;
+            } else if (name === "message") live.append(document.createTextNode(data));
+          });
+        }
+        if (!failed) {
+          remember("Исполнитель", question);
+          const answer = live.textContent;
+          live.textContent = "";
+          remember("Персонаж", answer);
+          field.value = "";
+        }
+        asking = false;
+      }).catch(() => {
+        asking = false;
+      });
+    });
+  </script>`;
+}
+
+function renderSession(trainer: Trainer, session: SessionRecord, error?: string): string {
+  const item = trainer.readCase(session.caseId);
+  const lines = trainer.readTranscript(session.id) ?? [];
+  const key = trainer.listKeys().find((itemKey) => itemKey.id === session.keyId);
+  const keyLabel = key ? `${PROTOCOL_LABEL[key.protocol]} — ${key.modelName}` : "ключ сессии не найден";
+  const needsOpening = session.side === "заказчик" && !lines.some((line) => line.kind === "вопрос");
+  const title = item ? `${item.customerName} — ${item.title}` : "Сессия";
+  return page(
+    title,
+    `<h1>${escapeHtml(title)}</h1>
+    <p>${escapeHtml(`Сторона: ${session.side}. Персонаж: ${session.character}. Роль исполнителя: ${session.role}.`)}</p>
+    <p>${escapeHtml(`Сессия помнит ключ: ${keyLabel}`)}</p>
+    ${notice(error)}
+    <h2>Стенограмма</h2>
+    ${transcriptList(lines)}
+    <div id="opening"></div>
+    <div id="live"></div>
+    <form id="ask" method="post" action="/sessions/${encodeURIComponent(session.id)}/ask">
+      <label>Вопрос
+        <textarea name="line" required></textarea>
+      </label>
+      <button type="submit">Спросить</button>
+    </form>
+    ${item ? `<p><a href="${escapeHtml(casePath(item.id))}">К проекту</a></p>` : ""}
+    ${sessionScript(session.id, needsOpening)}`,
+  );
+}
+
+function renderCase(
+  trainer: Trainer,
+  item: CaseRecord,
+  error?: string,
+  paste?: DossierLayers & { keyId: string },
+  sessionError?: string,
+): string {
   const keys = trainer.listKeys();
   const draftForm =
     keys.length === 0
@@ -296,7 +520,7 @@ function renderCase(trainer: Trainer, item: CaseRecord, error?: string, paste?: 
     <p>${escapeHtml(`Голоса заказчика: ${customerVoices(item.characters).join(", ")}`)}</p>
     <p>${escapeHtml(item.portfolioSent ? "Отметка «портфолио уже отправлено» стоит." : "Отметка «портфолио уже отправлено» снята.")}</p>
     ${notice(error)}
-    ${approvedBlock(trainer.readApprovedDossier(item.id))}
+    ${approvedBlock(trainer, item, sessionError)}
     <section>
       <h2>Черновик</h2>
       <p>Вставьте тексты слоёв и выберите ключ. Черновик сессия не читает.</p>
@@ -357,6 +581,20 @@ function knownCaseError(reason: string | null): string | undefined {
   return undefined;
 }
 
+function knownSessionError(reason: string | null): string | undefined {
+  if (
+    reason === "incomplete" ||
+    reason === "missing" ||
+    reason === "role" ||
+    reason === "side" ||
+    reason === "open" ||
+    reason === "character"
+  ) {
+    return SESSION_ERROR[reason];
+  }
+  return undefined;
+}
+
 function knownDraftError(reason: string | null): string | undefined {
   if (
     reason === "incomplete" ||
@@ -402,16 +640,92 @@ function allowsFormPost(origin: string | string[] | undefined, port: number): bo
 }
 
 function caseTarget(pathname: string): { id: string; action?: CaseAction } | undefined {
-  const match = pathname.match(/^\/cases\/([^/]+)(?:\/(draft|approve))?$/);
+  const match = pathname.match(/^\/cases\/([^/]+)(?:\/(draft|approve|session))?$/);
   const id = match?.[1];
   if (!id) {
     return undefined;
   }
   const action = match?.[2];
-  if (action !== undefined && action !== "draft" && action !== "approve") {
+  if (action !== undefined && action !== "draft" && action !== "approve" && action !== "session") {
     return undefined;
   }
   return { id: decodeURIComponent(id), action };
+}
+
+function sessionTarget(pathname: string): { id: string; action?: SessionAction } | undefined {
+  const match = pathname.match(/^\/sessions\/([^/]+)(?:\/(opening|ask))?$/);
+  const id = match?.[1];
+  if (!id) {
+    return undefined;
+  }
+  const action = match?.[2];
+  if (action !== undefined && action !== "opening" && action !== "ask") {
+    return undefined;
+  }
+  return { id: decodeURIComponent(id), action };
+}
+
+function wantsStream(accept: string | string[] | undefined): boolean {
+  const value = Array.isArray(accept) ? accept.join(",") : (accept ?? "");
+  return value.includes("text/event-stream");
+}
+
+/** Пишет речь кусками. Отказ модели остаётся отдельным событием, не репликой. */
+async function writeSpeech(
+  response: ServerResponse,
+  events: AsyncIterable<SpeechEvent>,
+  signal: AbortSignal,
+): Promise<void> {
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache",
+  });
+  const iterator = events[Symbol.asyncIterator]();
+  try {
+    while (!signal.aborted && !response.destroyed) {
+      const step = await iterator.next();
+      if (step.done || signal.aborted || response.destroyed) {
+        break;
+      }
+      const event = step.value;
+      const payload =
+        event.kind === "speech"
+          ? `${event.text.split("\n").map((line) => `data: ${line}`).join("\n")}\n\n`
+          : `event: failure\ndata: ${event.message.replaceAll("\n", " ")}\n\n`;
+      response.write(payload);
+    }
+    if (!signal.aborted && !response.writableEnded && !response.destroyed) {
+      response.write("event: done\ndata: pause\n\n");
+      response.end();
+    }
+  } finally {
+    await iterator.return?.();
+  }
+}
+
+/**
+ * Отдаёт поток речи и обрывает модель, когда клиент закрыл соединение.
+ * Обычное завершение соединение закрывает само и модель повторно не обрывает.
+ */
+async function speak(
+  request: IncomingMessage,
+  response: ServerResponse,
+  eventsFor: (signal: AbortSignal) => AsyncIterable<SpeechEvent>,
+): Promise<void> {
+  const controller = new AbortController();
+  const stop = (): void => {
+    if (!response.writableEnded) {
+      controller.abort();
+    }
+  };
+  request.on("aborted", stop);
+  response.on("close", stop);
+  try {
+    await writeSpeech(response, eventsFor(controller.signal), controller.signal);
+  } finally {
+    request.off("aborted", stop);
+    response.off("close", stop);
+  }
 }
 
 function refuse(request: IncomingMessage, response: ServerResponse, status: number): void {
@@ -431,6 +745,7 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
 
   const url = new URL(request.url ?? "/", "http://127.0.0.1");
   const target = caseTarget(url.pathname);
+  const session = sessionTarget(url.pathname);
 
   if (request.method === "GET" && url.pathname === "/") {
     sendHtml(response, renderKeys(trainer.listKeys(), knownKeyError(url.searchParams.get("error"))));
@@ -448,7 +763,46 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
       refuse(request, response, 404);
       return;
     }
-    sendHtml(response, renderCase(trainer, item, knownDraftError(url.searchParams.get("error"))));
+    sendHtml(
+      response,
+      renderCase(
+        trainer,
+        item,
+        knownDraftError(url.searchParams.get("error")),
+        undefined,
+        knownSessionError(url.searchParams.get("sessionError")),
+      ),
+    );
+    return;
+  }
+
+  if (request.method === "GET" && session?.action === "opening") {
+    const open = trainer.readSession(session.id);
+    if (!open) {
+      refuse(request, response, 404);
+      return;
+    }
+    await speak(request, response, (signal) => trainer.openingQuestion(open.id, signal));
+    return;
+  }
+
+  if (request.method === "GET" && session && session.action === undefined) {
+    const open = trainer.readSession(session.id);
+    if (!open) {
+      refuse(request, response, 404);
+      return;
+    }
+    const failure = url.searchParams.get("error");
+    const message =
+      failure === "timeout" || failure === "model" || failure === "missing" || failure === "secret"
+        ? {
+            timeout: "Модель не ответила вовремя.",
+            model: "Модель вернула ошибку.",
+            missing: "Сессия не найдена.",
+            secret: "Секрет ключа не читается.",
+          }[failure]
+        : undefined;
+    sendHtml(response, renderSession(trainer, open, message));
     return;
   }
 
@@ -545,13 +899,68 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
     return;
   }
 
+  if (target?.action === "session") {
+    const item = trainer.readCase(target.id);
+    const dossier = item ? trainer.readApprovedDossier(item.id) : undefined;
+    if (!item || !dossier) {
+      refuse(request, response, 404);
+      return;
+    }
+    const character = (fields.get("character") ?? "").trim();
+    if (!customerVoices(item.characters).includes(character)) {
+      redirect(response, `${casePath(item.id)}?sessionError=character`);
+      return;
+    }
+    if ((fields.get("side") ?? "").trim() !== "заказчик") {
+      redirect(response, `${casePath(item.id)}?sessionError=side`);
+      return;
+    }
+    const opened = trainer.openSession({
+      caseId: item.id,
+      dossierId: dossier.id,
+      side: "заказчик",
+      character,
+      role: fields.get("role") ?? "",
+      executorId: "владелец",
+      keyId: fields.get("keyId") ?? "",
+    });
+    redirect(response, opened.ok ? `/sessions/${encodeURIComponent(opened.session.id)}` : `${casePath(item.id)}?sessionError=${opened.reason}`);
+    return;
+  }
+
+  if (session?.action === "ask") {
+    const open = trainer.readSession(session.id);
+    if (!open) {
+      refuse(request, response, 404);
+      return;
+    }
+    const line = fields.get("line") ?? "";
+    if (wantsStream(request.headers.accept)) {
+      await speak(request, response, (signal) => trainer.reply(open.id, line, signal));
+      return;
+    }
+    let failureReason: "timeout" | "model" | "missing" | "secret" | undefined;
+    for await (const event of trainer.reply(open.id, line)) {
+      if (event.kind === "failure") {
+        failureReason = event.reason;
+      }
+    }
+    redirect(
+      response,
+      failureReason
+        ? `/sessions/${encodeURIComponent(open.id)}?error=${failureReason}`
+        : `/sessions/${encodeURIComponent(open.id)}`,
+    );
+    return;
+  }
+
   refuse(request, response, 404);
 }
 
 /**
  * Веб-адаптер ядра.
  * Слушает только 127.0.0.1 и не проверяет пароль: дверь — учётная запись машины.
- * Сессию не открывает: после правки показывает утверждённое досье.
+ * Открывает сессию стороны заказчика и отдаёт речь модели потоком.
  */
 export function startWeb(trainer: Trainer, port = 0): Promise<Server> {
   const server = createServer((request, response) => {
