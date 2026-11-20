@@ -284,7 +284,7 @@ test("чужой Host не открывает страницу и не сохр�
   }
 });
 
-test("веб заводит заказчика, дело и утверждённое досье тем же ядром", async () => {
+test("веб заводит заказчика, проект и утверждённое досье тем же ядром", async () => {
   const directory = tempDirectory();
   const trainer = openTrainer(directory, {
     async *complete() {
@@ -335,7 +335,7 @@ test("веб заводит заказчика, дело и утверждённ
     const foreign = await fetch(`${base}/customers`, {
       method: "POST",
       headers: { ...headers, origin: "https://evil.example" },
-      body: new URLSearchParams({ customerName: "Чужой", title: "Чужое дело" }),
+      body: new URLSearchParams({ customerName: "Чужой", title: "Чужой проект" }),
     });
     assert.equal(foreign.status, 403);
 
@@ -509,7 +509,7 @@ test("веб открывает сессию заказчика, и стеног
         yield "принимаете паллеты?";
         return;
       }
-      const marker = "Материал дела:\n";
+      const marker = "Материал проекта:\n";
       const start = text.indexOf(marker);
       const end = text.indexOf("\n\nСтенограмма:");
       const material = start < 0 || end < 0 ? "" : text.slice(start + marker.length, end);
@@ -637,6 +637,97 @@ test("веб открывает сессию заказчика, и стеног
     assert.equal(absentPage.includes(ABSENT_FACT), true);
     assert.equal(absentPage.includes("12%"), false);
     assert.equal(trainer.readSession(open.id)?.keyId, keyId);
+  } finally {
+    await close(server);
+  }
+});
+
+test("закрытие потока первого вопроса останавливает модель", async () => {
+  let signal: AbortSignal | undefined;
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, {
+    async *complete(_call, incoming) {
+      signal = incoming;
+      yield "Как ";
+      await new Promise<void>((resolve) => {
+        if (incoming.aborted) {
+          resolve();
+          return;
+        }
+        incoming.addEventListener("abort", () => resolve(), { once: true });
+      });
+    },
+  });
+  opened.push(trainer);
+  assert.deepEqual(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-WXYZ",
+    }),
+    { ok: true },
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+  assert.ok(saved.ok);
+  const approved = trainer.approveDossier({
+    caseId: saved.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: "Маржа подрядчика 12%.",
+    crib: "Спросить про сроки.",
+  });
+  assert.ok(approved.ok);
+  const openedSession = trainer.openSession({
+    caseId: saved.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.ok(openedSession.ok);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    await new Promise<void>((resolve, reject) => {
+      const req = httpRequest(
+        {
+          hostname: "127.0.0.1",
+          port: address.port,
+          path: `/sessions/${openedSession.session.id}/opening`,
+          method: "GET",
+        },
+        (res) => {
+          res.on("data", () => req.destroy());
+          res.on("error", () => resolve());
+          res.on("close", () => resolve());
+        },
+      );
+      req.on("error", () => resolve());
+      req.end();
+    });
+    const stopped = await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(signal?.aborted === true), 1000);
+      const mark = (): void => {
+        if (signal?.aborted) {
+          clearTimeout(timer);
+          resolve(true);
+        }
+      };
+      if (signal) {
+        signal.addEventListener("abort", mark, { once: true });
+      }
+      mark();
+    });
+    assert.equal(stopped, true);
+    assert.equal(
+      trainer.readTranscript(openedSession.session.id)?.some((line) => line.kind === "вопрос"),
+      false,
+    );
   } finally {
     await close(server);
   }

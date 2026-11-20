@@ -46,8 +46,8 @@ type Trainer = {
   }): OpenSessionResult;
   readSession(sessionId: string): SessionRecord | undefined;
   readTranscript(sessionId: string): TranscriptLine[] | undefined;
-  openingQuestion(sessionId: string): AsyncIterable<SpeechEvent>;
-  reply(sessionId: string, line: string): AsyncIterable<SpeechEvent>;
+  openingQuestion(sessionId: string, signal?: AbortSignal): AsyncIterable<SpeechEvent>;
+  reply(sessionId: string, line: string, signal?: AbortSignal): AsyncIterable<SpeechEvent>;
   listOpenSessions(): SessionRecord[];
 };
 
@@ -65,13 +65,13 @@ const KEY_ERROR: Record<Exclude<SaveKeyResult, { ok: true }>["reason"], string> 
 };
 
 const CASE_ERROR: Record<Exclude<SaveCaseResult, { ok: true }>["reason"], string> = {
-  incomplete: "Укажите заказчика и название дела.",
+  incomplete: "Укажите заказчика и название проекта.",
   missing: "Заказчик не найден.",
 };
 
 const SESSION_ERROR: Record<Exclude<OpenSessionResult, { ok: true }>["reason"] | "character", string> = {
-  incomplete: "Заполните дело, сторону, персонажа, роль исполнителя и ключ.",
-  missing: "Дело, досье или ключ не найдены.",
+  incomplete: "Заполните проект, сторону, персонажа, роль исполнителя и ключ.",
+  missing: "Проект, досье или ключ не найдены.",
   role: "Выберите роль исполнителя.",
   side: "Сессия этой страницы открывается на стороне заказчика.",
   open: "Сессия этой тройки уже открыта.",
@@ -80,7 +80,7 @@ const SESSION_ERROR: Record<Exclude<OpenSessionResult, { ok: true }>["reason"] |
 
 const DRAFT_ERROR: Record<Exclude<DraftDossierResult, { ok: true }>["reason"], string> = {
   incomplete: "Вставьте текст хотя бы одного слоя и выберите ключ.",
-  missing: "Дело или ключ не найдены.",
+  missing: "Проект или ключ не найдены.",
   timeout: "Модель не ответила вовремя.",
   model: "Модель не собрала черновик.",
   secret: "Секрет ключа не читается.",
@@ -124,7 +124,7 @@ function page(title: string, body: string): string {
   </style>
 </head>
 <body>
-  <nav><a href="/">Ключи</a><a href="/cases">Дела</a></nav>
+  <nav><a href="/">Ключи</a><a href="/cases">Проекты</a></nav>
   ${body}
 </body>
 </html>`;
@@ -194,7 +194,7 @@ function renderKeys(keys: KeySummary[], error?: string): string {
 function renderProfile(profile: OwnerProfile): string {
   return `<section>
     <h2>Профиль</h2>
-    <p>Резюме, портфолио и кейсы одни на владельца и общие для всех дел.</p>
+    <p>Резюме, портфолио и кейсы одни на владельца и общие для всех проектов.</p>
     <form method="post" action="/profile">
       <label>Резюме
         <textarea name="resume">${escapeHtml(profile.resume)}</textarea>
@@ -215,7 +215,7 @@ function renderCases(trainer: Trainer, error?: string): string {
   const cases = trainer.listCases();
   const items =
     cases.length === 0
-      ? "<p>Дел пока нет.</p>"
+      ? "<p>Проектов пока нет.</p>"
       : `<ul>${cases
           .map(
             (item) =>
@@ -233,19 +233,19 @@ function renderCases(trainer: Trainer, error?: string): string {
                 .join("")}
             </select>
           </label>
-          <label>Название дела
+          <label>Название проекта
             <input name="title" required>
           </label>
           <label>Персонажи заказчика, по одному в строке
             <textarea name="characters"></textarea>
           </label>
-          <button type="submit">Добавить дело</button>
+          <button type="submit">Добавить проект</button>
         </form>`;
 
   return page(
-    "Дела",
-    `<h1>Дела</h1>
-    <p>Заказчик и первое дело заводятся вместе. Следующее дело остаётся у того же заказчика.</p>
+    "Проекты",
+    `<h1>Проекты</h1>
+    <p>Заказчик и первый проект заводятся вместе. Следующий проект остаётся у того же заказчика.</p>
     ${notice(error)}
     ${renderProfile(trainer.readProfile())}
     <section>
@@ -254,32 +254,32 @@ function renderCases(trainer: Trainer, error?: string): string {
         <label>Заказчик
           <input name="customerName" required>
         </label>
-        <label>Название первого дела
+        <label>Название первого проекта
           <input name="title" required>
         </label>
         <label>Персонажи заказчика, по одному в строке
           <textarea name="characters"></textarea>
         </label>
-        <button type="submit">Завести заказчика и дело</button>
+        <button type="submit">Завести заказчика и проект</button>
       </form>
     </section>
     <section>
-      <h2>Ещё одно дело</h2>
+      <h2>Ещё один проект</h2>
       ${addCase}
     </section>
-    <h2>Все дела</h2>
+    <h2>Все проекты</h2>
     ${items}`,
   );
 }
 
 function layerAreas(layers: DossierLayers): string {
-  return `<label>Материал дела
+  return `<label>Материал проекта
       <textarea name="material">${escapeHtml(layers.material)}</textarea>
     </label>
     <label>Служебный слой
       <textarea name="serviceLayer">${escapeHtml(layers.serviceLayer)}</textarea>
     </label>
-    <label>Шпаргалка дела
+    <label>Шпаргалка проекта
       <textarea name="crib">${escapeHtml(layers.crib)}</textarea>
     </label>`;
 }
@@ -334,14 +334,14 @@ function approvedBlock(trainer: Trainer, item: CaseRecord, sessionError?: string
         </form>`;
   return `<section>
     <h2>Утверждённое досье</h2>
-    <h3>Материал дела</h3>
+    <h3>Материал проекта</h3>
     <pre>${escapeHtml(dossier.material)}</pre>
     <h3>Служебный слой</h3>
     <pre>${escapeHtml(dossier.serviceLayer)}</pre>
-    <h3>Шпаргалка дела</h3>
+    <h3>Шпаргалка проекта</h3>
     <pre>${escapeHtml(dossier.crib)}</pre>
     <h2>Сессия</h2>
-    <p>Сессия читает это досье. Персонаж заказчика отвечает по материалу дела.</p>
+    <p>Сессия читает это досье. Персонаж заказчика отвечает по материалу проекта.</p>
     ${notice(sessionError)}
     ${form}
     ${links}
@@ -350,9 +350,9 @@ function approvedBlock(trainer: Trainer, item: CaseRecord, sessionError?: string
 
 function transcriptList(lines: TranscriptLine[]): string {
   if (lines.length === 0) {
-    return "<p>Стенограмма пока пуста.</p>";
+    return `<p id="empty-transcript">Стенограмма пока пуста.</p>`;
   }
-  return `<ol>${lines
+  return `<ol id="transcript">${lines
     .map((line) => {
       const who = line.speaker === "персонаж" ? "Персонаж" : "Исполнитель";
       return `<li><span>${who}</span> ${escapeHtml(line.text)}</li>`;
@@ -363,11 +363,27 @@ function transcriptList(lines: TranscriptLine[]): string {
 /** Поток первого вопроса и вопрос исполнителя. Текст реплики в скрипт не подставляется. */
 function sessionScript(sessionId: string, needsOpening: boolean): string {
   return `<script>
+    const openingBox = document.getElementById("opening");
     const live = document.getElementById("live");
     const form = document.getElementById("ask");
+    const field = form.querySelector("textarea");
     const openingUrl = ${JSON.stringify(`/sessions/${encodeURIComponent(sessionId)}/opening`)};
-    function append(text) {
-      live.append(document.createTextNode(text));
+    let asking = false;
+    function remember(who, text) {
+      if (!text) return;
+      const empty = document.getElementById("empty-transcript");
+      if (empty) empty.remove();
+      let list = document.getElementById("transcript");
+      if (!list) {
+        list = document.createElement("ol");
+        list.id = "transcript";
+        openingBox.before(list);
+      }
+      const item = document.createElement("li");
+      const name = document.createElement("span");
+      name.textContent = who;
+      item.append(name, document.createTextNode(" " + text));
+      list.append(item);
     }
     function consume(buffer, onEvent) {
       const parts = buffer.split("\\n\\n");
@@ -387,19 +403,27 @@ function sessionScript(sessionId: string, needsOpening: boolean): string {
     ${
       needsOpening
         ? `const source = new EventSource(openingUrl);
-    source.onmessage = (event) => append(event.data);
+    let openingFailed = false;
+    source.onmessage = (event) => openingBox.append(document.createTextNode(event.data));
     source.addEventListener("failure", (event) => {
+      openingFailed = true;
       source.close();
-      live.textContent = event.data;
+      openingBox.textContent = event.data;
     });
     source.addEventListener("done", () => {
       source.close();
-      if (live.textContent) location.reload();
+      if (openingFailed) return;
+      const spoken = openingBox.textContent;
+      openingBox.textContent = "";
+      remember("Персонаж", spoken);
     });`
         : ""
     }
     form.addEventListener("submit", (event) => {
       event.preventDefault();
+      if (asking) return;
+      asking = true;
+      const question = field.value;
       const body = new URLSearchParams(new FormData(form));
       fetch(form.action, {
         method: "POST",
@@ -418,10 +442,19 @@ function sessionScript(sessionId: string, needsOpening: boolean): string {
             if (name === "failure") {
               failed = true;
               live.textContent = data;
-            } else if (name === "message") append(data);
+            } else if (name === "message") live.append(document.createTextNode(data));
           });
         }
-        if (!failed) location.reload();
+        if (!failed) {
+          remember("Исполнитель", question);
+          const answer = live.textContent;
+          live.textContent = "";
+          remember("Персонаж", answer);
+          field.value = "";
+        }
+        asking = false;
+      }).catch(() => {
+        asking = false;
       });
     });
   </script>`;
@@ -442,6 +475,7 @@ function renderSession(trainer: Trainer, session: SessionRecord, error?: string)
     ${notice(error)}
     <h2>Стенограмма</h2>
     ${transcriptList(lines)}
+    <div id="opening"></div>
     <div id="live"></div>
     <form id="ask" method="post" action="/sessions/${encodeURIComponent(session.id)}/ask">
       <label>Вопрос
@@ -449,7 +483,7 @@ function renderSession(trainer: Trainer, session: SessionRecord, error?: string)
       </label>
       <button type="submit">Спросить</button>
     </form>
-    ${item ? `<p><a href="${escapeHtml(casePath(item.id))}">К делу</a></p>` : ""}
+    ${item ? `<p><a href="${escapeHtml(casePath(item.id))}">К проекту</a></p>` : ""}
     ${sessionScript(session.id, needsOpening)}`,
   );
 }
@@ -637,20 +671,61 @@ function wantsStream(accept: string | string[] | undefined): boolean {
 }
 
 /** Пишет речь кусками. Отказ модели остаётся отдельным событием, не репликой. */
-async function writeSpeech(response: ServerResponse, events: AsyncIterable<SpeechEvent>): Promise<void> {
+async function writeSpeech(
+  response: ServerResponse,
+  events: AsyncIterable<SpeechEvent>,
+  signal: AbortSignal,
+): Promise<void> {
   response.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache",
   });
-  for await (const event of events) {
-    if (event.kind === "speech") {
-      response.write(`${event.text.split("\n").map((line) => `data: ${line}`).join("\n")}\n\n`);
-    } else {
-      response.write(`event: failure\ndata: ${event.message.replaceAll("\n", " ")}\n\n`);
+  const iterator = events[Symbol.asyncIterator]();
+  try {
+    while (!signal.aborted && !response.destroyed) {
+      const step = await iterator.next();
+      if (step.done || signal.aborted || response.destroyed) {
+        break;
+      }
+      const event = step.value;
+      const payload =
+        event.kind === "speech"
+          ? `${event.text.split("\n").map((line) => `data: ${line}`).join("\n")}\n\n`
+          : `event: failure\ndata: ${event.message.replaceAll("\n", " ")}\n\n`;
+      response.write(payload);
     }
+    if (!signal.aborted && !response.writableEnded && !response.destroyed) {
+      response.write("event: done\ndata: pause\n\n");
+      response.end();
+    }
+  } finally {
+    await iterator.return?.();
   }
-  response.write("event: done\ndata: pause\n\n");
-  response.end();
+}
+
+/**
+ * Отдаёт поток речи и обрывает модель, когда клиент закрыл соединение.
+ * Обычное завершение соединение закрывает само и модель повторно не обрывает.
+ */
+async function speak(
+  request: IncomingMessage,
+  response: ServerResponse,
+  eventsFor: (signal: AbortSignal) => AsyncIterable<SpeechEvent>,
+): Promise<void> {
+  const controller = new AbortController();
+  const stop = (): void => {
+    if (!response.writableEnded) {
+      controller.abort();
+    }
+  };
+  request.on("aborted", stop);
+  response.on("close", stop);
+  try {
+    await writeSpeech(response, eventsFor(controller.signal), controller.signal);
+  } finally {
+    request.off("aborted", stop);
+    response.off("close", stop);
+  }
 }
 
 function refuse(request: IncomingMessage, response: ServerResponse, status: number): void {
@@ -659,7 +734,7 @@ function refuse(request: IncomingMessage, response: ServerResponse, status: numb
   response.end();
 }
 
-/** Отвечает на ключи, дела и утверждение досье. Чужой Host и чужой Origin запись не открывают. */
+/** Отвечает на ключи, проекты и утверждение досье. Чужой Host и чужой Origin запись не открывают. */
 async function handle(server: Server, trainer: Trainer, request: IncomingMessage, response: ServerResponse): Promise<void> {
   const address = server.address();
   const listenPort = address && typeof address === "object" ? address.port : undefined;
@@ -707,7 +782,7 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
       refuse(request, response, 404);
       return;
     }
-    await writeSpeech(response, trainer.openingQuestion(open.id));
+    await speak(request, response, (signal) => trainer.openingQuestion(open.id, signal));
     return;
   }
 
@@ -861,7 +936,7 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
     }
     const line = fields.get("line") ?? "";
     if (wantsStream(request.headers.accept)) {
-      await writeSpeech(response, trainer.reply(open.id, line));
+      await speak(request, response, (signal) => trainer.reply(open.id, line, signal));
       return;
     }
     let failureReason: "timeout" | "model" | "missing" | "secret" | undefined;

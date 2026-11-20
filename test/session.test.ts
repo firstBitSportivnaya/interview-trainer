@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
-import { type ModelCall, type ModelPort } from "../src/model.ts";
+import { type ModelCall, ModelFailure, type ModelPort } from "../src/model.ts";
 import { ABSENT_FACT, openTrainer, type SpeechEvent } from "../src/trainer.ts";
 
 const directories: string[] = [];
@@ -31,7 +31,7 @@ async function take(events: AsyncIterable<SpeechEvent>): Promise<SpeechEvent[]> 
 }
 
 function materialOf(text: string): string {
-  const marker = "Материал дела:\n";
+  const marker = "Материал проекта:\n";
   const start = text.indexOf(marker);
   const end = text.indexOf("\n\nСтенограмма:");
   if (start < 0 || end < 0) {
@@ -104,7 +104,7 @@ function prepare(trainer: ReturnType<typeof openTrainer>) {
   return { keyId, caseId: savedCase.caseRecord.id, dossierId: approved.dossier.id };
 }
 
-test("сессия заказчика открывается делом, персонажем, ролью и ключом", () => {
+test("сессия заказчика открывается проектом, персонажем, ролью и ключом", () => {
   const trainer = start();
   const prepared = prepare(trainer);
   const openedSession = trainer.openSession({
@@ -241,6 +241,87 @@ test("ответ берётся из материала, а факта вне м
     true,
   );
   assert.equal(restarted.readSession(openedSession.session.id)?.keyId, prepared.keyId);
+});
+
+test("оборванный первый вопрос не закрывает паузу", async () => {
+  let calls = 0;
+  const trainer = start({
+    async *complete() {
+      calls += 1;
+      if (calls === 1) {
+        yield "Как ";
+        throw new ModelFailure("timeout");
+      }
+      yield "Как принимаете паллеты?";
+    },
+  });
+  const prepared = prepare(trainer);
+  const openedSession = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: prepared.dossierId,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  assert.ok(openedSession.ok);
+
+  assert.deepEqual(await take(trainer.openingQuestion(openedSession.session.id)), [
+    { kind: "speech", text: "Как " },
+    { kind: "failure", reason: "timeout", message: "Модель не ответила вовремя." },
+  ]);
+  assert.equal(
+    trainer.readTranscript(openedSession.session.id)?.some((line) => line.kind === "вопрос"),
+    false,
+  );
+
+  assert.deepEqual(await take(trainer.openingQuestion(openedSession.session.id)), [
+    { kind: "speech", text: "Как принимаете паллеты?" },
+  ]);
+  assert.equal(calls, 2);
+  assert.deepEqual(trainer.readTranscript(openedSession.session.id), [
+    { speaker: "персонаж", kind: "вопрос", text: "Как принимаете паллеты?" },
+  ]);
+});
+
+test("второй запрос первого вопроса ждёт, пока первый не закончится", async () => {
+  let calls = 0;
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const trainer = start({
+    async *complete() {
+      calls += 1;
+      await gate;
+      yield "Как принимаете паллеты?";
+    },
+  });
+  const prepared = prepare(trainer);
+  const openedSession = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: prepared.dossierId,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  assert.ok(openedSession.ok);
+
+  const first = trainer.openingQuestion(openedSession.session.id)[Symbol.asyncIterator]();
+  const started = first.next();
+  const second = trainer.openingQuestion(openedSession.session.id)[Symbol.asyncIterator]();
+  assert.equal((await second.next()).done, true);
+  assert.equal(calls, 1);
+  release();
+  assert.deepEqual((await started).value, { kind: "speech", text: "Как принимаете паллеты?" });
+  assert.equal((await first.next()).done, true);
+  assert.equal(
+    trainer.readTranscript(openedSession.session.id)?.filter((line) => line.kind === "вопрос").length,
+    1,
+  );
 });
 
 test("сторона внутренней команды остаётся прежним вызовом модели", async () => {

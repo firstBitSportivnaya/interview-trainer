@@ -42,7 +42,7 @@ export type PerformerRole =
 /** Сторона, напротив которой сидит исполнитель. */
 export type Side = "заказчик" | "внутренняя команда";
 
-/** Дело заказчика, которое можно прочитать после перезапуска. */
+/** Проект заказчика, который можно прочитать после перезапуска. */
 export type CaseRecord = {
   id: string;
   customerId: string;
@@ -50,17 +50,17 @@ export type CaseRecord = {
   title: string;
   /** Персонажи заказчика. Пустой список не хранит голос «заказчик»: его добавляет customerVoices. */
   characters: string[];
-  /** Отметка «портфолио уже отправлено». У нового дела снята. */
+  /** Отметка «портфолио уже отправлено». У нового проекта снята. */
   portfolioSent: boolean;
 };
 
-/** Заказчик. Второе дело ссылается на ту же запись и не заводит вторую компанию. */
+/** Заказчик. Второй проект ссылается на ту же запись и не заводит вторую компанию. */
 export type CustomerRecord = {
   id: string;
   name: string;
 };
 
-/** Отказ завести дело: нет имени заказчика или названия, либо заказчик для второго дела не найден. */
+/** Отказ завести проект: нет имени заказчика или названия, либо заказчик для второго проекта не найден. */
 export type SaveCaseResult =
   | { ok: true; caseRecord: CaseRecord }
   | { ok: false; reason: "incomplete" | "missing" };
@@ -87,19 +87,19 @@ export type DraftDossierResult =
   | { ok: true; draft: DossierLayers }
   | { ok: false; reason: "incomplete" | "missing" | "timeout" | "model" | "secret" };
 
-/** Утверждённое досье дела. Сессия хранит его идентификатор. */
+/** Утверждённое досье проекта. Сессия хранит его идентификатор. */
 export type DossierRecord = {
   id: string;
   caseId: string;
-  /** Материал дела. */
+  /** Материал проекта. */
   material: string;
   /** Служебный слой. */
   serviceLayer: string;
-  /** Шпаргалка дела. */
+  /** Шпаргалка проекта. */
   crib: string;
 };
 
-/** Отказ утвердить досье: дела нет. */
+/** Отказ утвердить досье: проекта нет. */
 export type ApproveDossierResult =
   | { ok: true; dossier: DossierRecord }
   | { ok: false; reason: "missing" };
@@ -150,20 +150,20 @@ export type TranscriptLine = {
 };
 
 /**
- * Фраза, которой персонаж заказчика называет факт, которого нет в материале дела.
+ * Фраза, которой персонаж заказчика называет факт, которого нет в материале проекта.
  * Записанная модель и живая получают одну и ту же формулировку.
  */
-export const ABSENT_FACT = "В материале дела этого нет.";
+export const ABSENT_FACT = "В материале проекта этого нет.";
 
 /** Один вопрос персонажа. После него персонаж ждёт и сам очередь не продолжает. */
-const OPENING_TASK = "Задай один вопрос исполнителю по материалу дела и остановись.";
+const OPENING_TASK = "Задай один вопрос исполнителю по материалу проекта и остановись.";
 
 /** Отказ открыть сессию: тройка уже открыта, записи нет или поле не из каталога. */
 export type OpenSessionResult =
   | { ok: true; session: SessionRecord }
   | { ok: false; reason: "open" | "missing" | "role" | "side" | "incomplete" };
 
-/** Ход подготовки одной тройки «дело + роль исполнителя + исполнитель». */
+/** Ход подготовки одной тройки «проект + роль исполнителя + исполнитель». */
 export type PreparationRecord = {
   caseId: string;
   role: PerformerRole;
@@ -179,7 +179,7 @@ export type PreparationDraft = {
   note: string;
 };
 
-/** Отказ дописать ход: дела нет, роль чужая или заметка пустая. */
+/** Отказ дописать ход: проекта нет, роль чужая или заметка пустая. */
 export type WritePreparationResult =
   | { ok: true; preparation: PreparationRecord }
   | { ok: false; reason: "missing" | "role" | "incomplete" };
@@ -409,14 +409,14 @@ function namedCharacters(names: readonly string[] | undefined): string[] {
 }
 
 /**
- * Голоса заказчика на деле.
+ * Голоса заказчика на проекте.
  * Пустой список даёт один голос «заказчик», не записывая его в персонажи.
  */
 export function customerVoices(characters: readonly string[]): string[] {
   return characters.length === 0 ? ["заказчик"] : [...characters];
 }
 
-/** Прежнее хранилище без отметки портфолио получает колонку. Уже записанное дело остаётся без отметки. */
+/** Прежнее хранилище без отметки портфолио получает колонку. Уже записанный проект остаётся без отметки. */
 function ensureCaseShape(database: DatabaseSync): void {
   const rows = database.prepare("PRAGMA table_info(cases)").all() as Row[];
   const names = new Set(rows.map((row) => textColumn(row, "name")));
@@ -432,20 +432,20 @@ function dossierDraftPrompt(layers: DossierLayers): string {
     "Не переноси текст между слоями. Не добавляй фактов, которых нет во вставленном тексте.",
     "Верни только JSON-объект с полями material, serviceLayer и crib. Значения — строки.",
     "",
-    "Материал дела:",
+    "Материал проекта:",
     layers.material,
     "",
     "Служебный слой:",
     layers.serviceLayer,
     "",
-    "Шпаргалка дела:",
+    "Шпаргалка проекта:",
     layers.crib,
   ].join("\n");
 }
 
 /**
  * Задание персонажу заказчика.
- * Факты — только материал дела. Заметки хода подготовки — линия поведения, не источник фактов.
+ * Факты — только материал проекта. Заметки хода подготовки — линия поведения, не источник фактов.
  * Служебный слой и шпаргалка в текст не входят: персонаж их не произносит.
  */
 function customerPrompt(input: {
@@ -461,15 +461,15 @@ function customerPrompt(input: {
       : input.history.map((line) => `${line.speaker}: ${line.text}`).join("\n");
   return [
     `Ты — персонаж «${input.character}», сторона «заказчик».`,
-    "Факты бери только из материала дела.",
-    `Если факта в материале дела нет, скажи дословно: ${ABSENT_FACT}`,
+    "Факты бери только из материала проекта.",
+    `Если факта в материале проекта нет, скажи дословно: ${ABSENT_FACT}`,
     "Шпаргалку не произноси. Служебный слой не читай и не упоминай.",
     "Линия поведения — не факты. Фактов из неё не произноси.",
     "",
     "Линия поведения:",
     input.notes.length === 0 ? "нет" : input.notes.join("\n"),
     "",
-    "Материал дела:",
+    "Материал проекта:",
     input.material,
     "",
     "Стенограмма:",
@@ -759,10 +759,10 @@ function readSessionRecord(row: Row): SessionRecord {
 
 /**
  * Ядро одного владельца.
- * Каталог — хранилище на этой машине: заказчики, дела, профиль, досье, сессии, ход подготовки и ключи.
+ * Каталог — хранилище на этой машине: заказчики, проекты, профиль, досье, сессии, ход подготовки и ключи.
  * Список ключей секрет целиком не отдаёт. Секрет в хранилище свёрнут средствами ОС.
  * Одна открытая сессия на тройку
- * «дело + роль исполнителя + исполнитель» держится уникальным индексом.
+ * «проект + роль исполнителя + исполнитель» держится уникальным индексом.
  * Прежний процесс, который пишет keys.json, нужно остановить до этого запуска.
  * Модель приходит портом: проверка подставляет записанную, запуск — живую.
  */
@@ -912,25 +912,41 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
 
   /**
    * Зовёт модель ключом сессии и отдаёт речь кусками.
-   * spoken собирает куски, чтобы стенограмма хранила целую реплику.
+   * spoken собирает куски. failed — вызов оборвался, и целая реплика не сложилась.
+   * signal обрывает вызов, когда читатель закрыл поток.
    */
   async function* streamKey(
     session: SessionRecord,
     messages: { role: "user"; text: string }[],
-    spoken: { text: string },
+    spoken: { text: string; failed: boolean },
+    signal?: AbortSignal,
   ): AsyncIterable<SpeechEvent> {
     const loaded = loadKey(session.keyId);
     if (!loaded) {
+      spoken.failed = true;
       yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
       return;
     }
     if (!("key" in loaded)) {
+      spoken.failed = true;
       yield { kind: "failure", reason: "secret", message: FAILURE_MESSAGE.secret };
       return;
     }
     const key = loaded.key;
     const controller = new AbortController();
+    const onAbort = (): void => {
+      controller.abort();
+    };
+    if (signal?.aborted) {
+      controller.abort();
+    } else {
+      signal?.addEventListener("abort", onAbort, { once: true });
+    }
     try {
+      if (signal?.aborted) {
+        spoken.failed = true;
+        return;
+      }
       for await (const text of model.complete(
         {
           protocol: key.protocol,
@@ -941,20 +957,32 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
         },
         controller.signal,
       )) {
+        if (signal?.aborted) {
+          spoken.failed = true;
+          return;
+        }
         if (text) {
           spoken.text += text;
           yield { kind: "speech", text };
         }
       }
+      if (signal?.aborted) {
+        spoken.failed = true;
+      }
     } catch (error) {
+      spoken.failed = true;
+      if (signal?.aborted) {
+        return;
+      }
       const reason = error instanceof ModelFailure ? error.reason : "model";
       yield { kind: "failure", reason, message: FAILURE_MESSAGE[reason] };
     } finally {
+      signal?.removeEventListener("abort", onAbort);
       controller.abort();
     }
   }
 
-  /** Задание персонажу заказчика: материал дела и линия поведения, без служебного слоя. */
+  /** Задание персонажу заказчика: материал проекта и линия поведения, без служебного слоя. */
   function customerTask(session: SessionRecord, task: string): { ok: true; text: string } | { ok: false } {
     const dossier = loadDossier(session.dossierId);
     if (!dossier) {
@@ -974,6 +1002,8 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
   }
 
   let closed = false;
+  /** Сессии, у которых первый вопрос уже пошёл к модели и ещё не записан. */
+  const openingReservations = new Set<string>();
 
   return {
     /** Закрывает файл хранилища. Повторный вызов ничего не делает. */
@@ -1027,8 +1057,8 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     },
 
     /**
-     * Одним действием заводит заказчика и первое дело.
-     * Пустое имя или название дело не создают. Пустой список персонажей остаётся пустым.
+     * Одним действием заводит заказчика и первый проект.
+     * Пустое имя или название не создают проект. Пустой список персонажей остаётся пустым.
      */
     saveCase(draft: { customerName: string; title: string; characters?: readonly string[] }): SaveCaseResult {
       const customerName = draft.customerName.trim();
@@ -1053,8 +1083,8 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     },
 
     /**
-     * Добавляет ещё одно дело уже существующему заказчику.
-     * Новую компанию не создаёт. Неизвестный заказчик дело не создаёт.
+     * Добавляет ещё один проект уже существующему заказчику.
+     * Новую компанию не создаёт. Неизвестный заказчик проект не создаёт.
      */
     addCase(draft: { customerId: string; title: string; characters?: readonly string[] }): SaveCaseResult {
       const customerId = draft.customerId.trim();
@@ -1088,13 +1118,13 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       return rows.map((row) => ({ id: textColumn(row, "id"), name: textColumn(row, "name") }));
     },
 
-    /** Возвращает дела в порядке появления. */
+    /** Возвращает проекты в порядке появления. */
     listCases(): CaseRecord[] {
       const rows = database.prepare(`${caseQuery} ORDER BY cases.rowid`).all() as Row[];
       return rows.map((row) => loadCase(row));
     },
 
-    /** Возвращает дело. Нет идентификатора — дела нет. */
+    /** Возвращает проект. Нет идентификатора — проекта нет. */
     readCase(caseId: string): CaseRecord | undefined {
       const row = database.prepare(`${caseQuery} WHERE cases.id = ?`).get(caseId) as Row | undefined;
       return row ? loadCase(row) : undefined;
@@ -1213,7 +1243,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     },
 
     /**
-     * Возвращает последнее утверждённое досье дела.
+     * Возвращает последнее утверждённое досье проекта.
      * Черновик сюда не входит. Пока владелец не утвердил правку, досье нет.
      */
     readApprovedDossier(caseId: string): DossierRecord | undefined {
@@ -1305,46 +1335,53 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     },
 
     /**
-     * Персонаж заказчика задаёт один вопрос по материалу дела и делает паузу.
+     * Персонаж заказчика задаёт один вопрос по материалу проекта и делает паузу.
      * Повторный вызов модель не зовёт: очередь сама не продолжается.
      * Сторону внутренней команды этот вызов не меняет.
+     * signal обрывает генерацию, когда страница закрыла поток.
      */
-    async *openingQuestion(sessionId: string): AsyncIterable<SpeechEvent> {
+    async *openingQuestion(sessionId: string, signal?: AbortSignal): AsyncIterable<SpeechEvent> {
       const session = loadSession(sessionId);
       if (!session) {
         yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
         return;
       }
-      if (session.side !== "заказчик" || hasOpeningQuestion(session.id)) {
+      if (session.side !== "заказчик" || hasOpeningQuestion(session.id) || openingReservations.has(session.id)) {
         return;
       }
-      const task = customerTask(session, OPENING_TASK);
-      if (!task.ok) {
-        yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
-        return;
-      }
-      const spoken = { text: "" };
-      yield* streamKey(session, [{ role: "user", text: task.text }], spoken);
-      if (spoken.text) {
-        appendTranscript(session.id, "персонаж", "вопрос", spoken.text);
+      openingReservations.add(session.id);
+      try {
+        const task = customerTask(session, OPENING_TASK);
+        if (!task.ok) {
+          yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
+          return;
+        }
+        const spoken = { text: "", failed: false };
+        yield* streamKey(session, [{ role: "user", text: task.text }], spoken, signal);
+        if (!spoken.failed && spoken.text && !signal?.aborted) {
+          appendTranscript(session.id, "персонаж", "вопрос", spoken.text);
+        }
+      } finally {
+        openingReservations.delete(session.id);
       }
     },
 
     /**
      * Зовёт модель ключом, которым открыта сессия.
-     * У заказчика ответ берётся из материала дела и пишется в стенограмму.
+     * У заказчика ответ берётся из материала проекта и пишется в стенограмму.
      * Исполнитель может спросить, не дожидаясь вопроса персонажа.
      * Внутренняя команда получает прежний вызов: одна реплика, без стенограммы.
      * Речь приходит кусками. Ошибка модели в речь не подмешивается.
+     * signal обрывает генерацию, когда страница закрыла поток.
      */
-    async *reply(sessionId: string, line: string): AsyncIterable<SpeechEvent> {
+    async *reply(sessionId: string, line: string, signal?: AbortSignal): AsyncIterable<SpeechEvent> {
       const session = loadSession(sessionId);
       if (!session) {
         yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
         return;
       }
       if (session.side !== "заказчик") {
-        yield* streamKey(session, [{ role: "user", text: line }], { text: "" });
+        yield* streamKey(session, [{ role: "user", text: line }], { text: "", failed: false }, signal);
         return;
       }
       const text = line.trim();
@@ -1357,9 +1394,9 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
         return;
       }
       appendTranscript(session.id, "исполнитель", "реплика", text);
-      const spoken = { text: "" };
-      yield* streamKey(session, [{ role: "user", text: task.text }], spoken);
-      if (spoken.text) {
+      const spoken = { text: "", failed: false };
+      yield* streamKey(session, [{ role: "user", text: task.text }], spoken, signal);
+      if (spoken.text && !signal?.aborted) {
         appendTranscript(session.id, "персонаж", "ответ", spoken.text);
       }
     },
