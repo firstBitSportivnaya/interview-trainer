@@ -17,10 +17,10 @@ export type KeyDraft = {
   secret: string;
 };
 
-/** Отказ сохранить ключ: не хватает поля или протокол не из двух допустимых. */
+/** Отказ сохранить ключ: не хватает поля, протокол не из двух допустимых или ключ записывает не владелец. */
 export type SaveKeyResult =
   | { ok: true }
-  | { ok: false; reason: "incomplete" | "protocol" };
+  | { ok: false; reason: "incomplete" | "protocol" | "forbidden" };
 
 /** Ключ, который можно показать. Хвост секрета виден, только если секрет длиннее четырёх знаков. */
 export type KeySummary = {
@@ -60,10 +60,10 @@ export type CustomerRecord = {
   name: string;
 };
 
-/** Отказ завести проект: нет имени заказчика или названия, либо заказчик для второго проекта не найден. */
+/** Отказ завести проект: нет имени заказчика или названия, заказчик для второго проекта не найден, либо проект создаёт не владелец. */
 export type SaveCaseResult =
   | { ok: true; caseRecord: CaseRecord }
-  | { ok: false; reason: "incomplete" | "missing" };
+  | { ok: false; reason: "incomplete" | "missing" | "forbidden" };
 
 /** Отказ поставить отметку «портфолио уже отправлено»: проекта нет. */
 export type SetPortfolioSentResult =
@@ -105,10 +105,10 @@ export type SourceFileRecord = {
   extractedText: string;
 };
 
-/** Отказ записать файл: слоя нет в каталоге, поля пустые или проекта нет. */
+/** Отказ записать файл: слоя нет в каталоге, поля пустые, проекта нет или слой называет не владелец. */
 export type AddSourceFileResult =
   | { ok: true; file: SourceFileRecord }
-  | { ok: false; reason: "layer" | "incomplete" | "missing" };
+  | { ok: false; reason: "layer" | "incomplete" | "missing" | "forbidden" };
 
 /** Отказ собрать черновик. Текст модели в отказ не входит. */
 export type DraftDossierResult =
@@ -127,10 +127,10 @@ export type DossierRecord = {
   crib: string;
 };
 
-/** Отказ утвердить досье: проекта нет. */
+/** Отказ утвердить досье: проекта нет или досье утверждает не владелец. */
 export type ApproveDossierResult =
   | { ok: true; dossier: DossierRecord }
-  | { ok: false; reason: "missing" };
+  | { ok: false; reason: "missing" | "forbidden" };
 
 /** Сессия. Законченная хранит разбор отдельно от стенограммы. */
 export type SessionStatus = "open" | "finished";
@@ -157,6 +157,12 @@ export type ReviewRecord = {
 export type FinishSessionResult =
   | { ok: true; session: SessionRecord; review: ReviewRecord }
   | { ok: false; reason: "missing" | "finished" | "timeout" | "model" | "secret" };
+
+/**
+ * Исполнитель первой версии.
+ * Сессию по любому своему проекту он открывает без отдельной строки назначения.
+ */
+export const OWNER_EXECUTOR_ID = "владелец";
 
 /**
  * Поля открытия сессии.
@@ -210,10 +216,20 @@ const FORK_RULE = "Если в материале проекта названы 
 /** При стоящей отметке персонаж спрашивает про опыт и не цитирует профиль. */
 const PROFILE_RULE = "Спроси про опыт. Формулировку профиля не произноси и не подсказывай.";
 
-/** Отказ открыть сессию: тройка уже открыта, записи нет или поле не из каталога. */
+/** Отказ открыть сессию: тройка уже открыта, записи нет, поле не из каталога или назначения на проект нет. */
 export type OpenSessionResult =
   | { ok: true; session: SessionRecord }
-  | { ok: false; reason: "open" | "missing" | "role" | "side" | "incomplete" };
+  | { ok: false; reason: "open" | "missing" | "role" | "side" | "incomplete" | "assignment" };
+
+/** Отказ назначить исполнителя: поля пустые, проекта нет или назначает не владелец. */
+export type AssignExecutorResult =
+  | { ok: true }
+  | { ok: false; reason: "incomplete" | "missing" | "forbidden" };
+
+/** Отказ отозвать назначение: поля пустые, строки нет или отзывает не владелец. */
+export type RevokeAssignmentResult =
+  | { ok: true }
+  | { ok: false; reason: "incomplete" | "missing" | "forbidden" };
 
 /** Ход подготовки одной тройки «проект + роль исполнителя + исполнитель». */
 export type PreparationRecord = {
@@ -378,6 +394,12 @@ function schemaSql(): string {
       secret TEXT NOT NULL
     ) STRICT;
 
+    CREATE TABLE IF NOT EXISTS assignments (
+      executor_id TEXT NOT NULL,
+      case_id TEXT NOT NULL REFERENCES cases(id),
+      PRIMARY KEY (executor_id, case_id)
+    ) STRICT;
+
     CREATE TABLE IF NOT EXISTS store_flags (
       name TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -461,6 +483,11 @@ function isSide(value: string): value is Side {
 
 function isDossierLayer(value: string): value is DossierLayerName {
   return (DOSSIER_LAYER_NAMES as readonly string[]).includes(value);
+}
+
+/** Чужой исполнитель. Пустое поле — не владелец. Поле не передали — действует владелец первой версии. */
+function foreignExecutor(executorId: string | undefined): boolean {
+  return executorId !== undefined && executorId.trim() !== OWNER_EXECUTOR_ID;
 }
 
 function secretPreview(secret: string): string {
@@ -1317,6 +1344,14 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     return database.prepare("SELECT id FROM cases WHERE id = ?").get(caseId) !== undefined;
   }
 
+  function assignmentExists(executorId: string, caseId: string): boolean {
+    return (
+      database
+        .prepare("SELECT executor_id FROM assignments WHERE executor_id = ? AND case_id = ?")
+        .get(executorId, caseId) !== undefined
+    );
+  }
+
   const caseQuery = `
     SELECT cases.id, cases.customer_id, customers.name AS customer_name, cases.title, cases.portfolio_sent
     FROM cases
@@ -1752,8 +1787,11 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       database.close();
     },
 
-    /** Дописывает ключ отдельно от уже сохранённых. Пустое поле или чужой протокол ключ не создают. */
-    saveKey(draft: KeyDraft): SaveKeyResult {
+    /** Дописывает ключ отдельно от уже сохранённых. Пустое поле или чужой протокол ключ не создают. Чужой исполнитель ключ не записывает. */
+    saveKey(draft: KeyDraft & { executorId?: string }): SaveKeyResult {
+      if (foreignExecutor(draft.executorId)) {
+        return { ok: false, reason: "forbidden" };
+      }
       const protocol = draft.protocol.trim();
       const baseAddress = draft.baseAddress.trim();
       const modelName = draft.modelName.trim();
@@ -1797,7 +1835,15 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
      * Одним действием заводит заказчика и первый проект.
      * Пустое имя или название не создают проект. Пустой список персонажей остаётся пустым.
      */
-    saveCase(draft: { customerName: string; title: string; characters?: readonly string[] }): SaveCaseResult {
+    saveCase(draft: {
+      customerName: string;
+      title: string;
+      characters?: readonly string[];
+      executorId?: string;
+    }): SaveCaseResult {
+      if (foreignExecutor(draft.executorId)) {
+        return { ok: false, reason: "forbidden" };
+      }
       const customerName = draft.customerName.trim();
       const title = draft.title.trim();
       if (!customerName || !title) {
@@ -1823,7 +1869,15 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
      * Добавляет ещё один проект уже существующему заказчику.
      * Новую компанию не создаёт. Неизвестный заказчик проект не создаёт.
      */
-    addCase(draft: { customerId: string; title: string; characters?: readonly string[] }): SaveCaseResult {
+    addCase(draft: {
+      customerId: string;
+      title: string;
+      characters?: readonly string[];
+      executorId?: string;
+    }): SaveCaseResult {
+      if (foreignExecutor(draft.executorId)) {
+        return { ok: false, reason: "forbidden" };
+      }
       const customerId = draft.customerId.trim();
       const title = draft.title.trim();
       if (!customerId || !title) {
@@ -1909,7 +1963,11 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       name: string;
       layer: string;
       extractedText: string;
+      executorId?: string;
     }): AddSourceFileResult {
+      if (foreignExecutor(draft.executorId)) {
+        return { ok: false, reason: "forbidden" };
+      }
       const layer = draft.layer.trim();
       if (!isDossierLayer(layer)) {
         return { ok: false, reason: "layer" };
@@ -2007,7 +2065,16 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     },
 
     /** Утверждает досье новой записью. В запись входит текст после правки, не черновик модели. Открытая сессия держит то досье, с которым её открыли. */
-    approveDossier(draft: { caseId: string; material: string; serviceLayer: string; crib: string }): ApproveDossierResult {
+    approveDossier(draft: {
+      caseId: string;
+      material: string;
+      serviceLayer: string;
+      crib: string;
+      executorId?: string;
+    }): ApproveDossierResult {
+      if (foreignExecutor(draft.executorId)) {
+        return { ok: false, reason: "forbidden" };
+      }
       if (!caseExists(draft.caseId)) {
         return { ok: false, reason: "missing" };
       }
@@ -2047,8 +2114,61 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     },
 
     /**
+     * Назначает исполнителя на проект.
+     * Владельцу строка не нужна: он открывает любой свой проект. Повтор той же пары вторую строку не создаёт.
+     * Назначает владелец. Открытую сессию это не закрывает и не перенацеливает.
+     */
+    assignExecutor(draft: { executorId: string; caseId: string; actorId?: string }): AssignExecutorResult {
+      const actorId = (draft.actorId ?? OWNER_EXECUTOR_ID).trim();
+      if (actorId !== OWNER_EXECUTOR_ID) {
+        return { ok: false, reason: "forbidden" };
+      }
+      const executorId = draft.executorId.trim();
+      const caseId = draft.caseId.trim();
+      if (!executorId || !caseId) {
+        return { ok: false, reason: "incomplete" };
+      }
+      if (!caseExists(caseId)) {
+        return { ok: false, reason: "missing" };
+      }
+      if (executorId === OWNER_EXECUTOR_ID) {
+        return { ok: true };
+      }
+      database
+        .prepare("INSERT OR IGNORE INTO assignments (executor_id, case_id) VALUES (?, ?)")
+        .run(executorId, caseId);
+      return { ok: true };
+    },
+
+    /**
+     * Отзывает назначение.
+     * Уже открытая сессия остаётся на досье и текстах файлов, с которыми её открыли.
+     * Следующее открытие этой пары не проходит. Отзывает владелец.
+     */
+    revokeAssignment(draft: { executorId: string; caseId: string; actorId?: string }): RevokeAssignmentResult {
+      const actorId = (draft.actorId ?? OWNER_EXECUTOR_ID).trim();
+      if (actorId !== OWNER_EXECUTOR_ID) {
+        return { ok: false, reason: "forbidden" };
+      }
+      const executorId = draft.executorId.trim();
+      const caseId = draft.caseId.trim();
+      if (!executorId || !caseId) {
+        return { ok: false, reason: "incomplete" };
+      }
+      const existing = database
+        .prepare("SELECT executor_id FROM assignments WHERE executor_id = ? AND case_id = ?")
+        .get(executorId, caseId);
+      if (!existing) {
+        return { ok: false, reason: "missing" };
+      }
+      database.prepare("DELETE FROM assignments WHERE executor_id = ? AND case_id = ?").run(executorId, caseId);
+      return { ok: true };
+    },
+
+    /**
      * Открывает сессию.
      * Вторая открытая сессия той же тройки не создаётся: это держит уникальный индекс.
+     * Кроме владельца, сессия открывается только по назначенному проекту.
      */
     openSession(draft: SessionDraft): OpenSessionResult {
       const caseId = draft.caseId.trim();
@@ -2072,6 +2192,9 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       const key = database.prepare("SELECT id FROM keys WHERE id = ?").get(keyId);
       if (!caseExists(caseId) || !dossier || textColumn(dossier, "case_id") !== caseId || !key) {
         return { ok: false, reason: "missing" };
+      }
+      if (executorId !== OWNER_EXECUTOR_ID && !assignmentExists(executorId, caseId)) {
+        return { ok: false, reason: "assignment" };
       }
 
       const session: SessionRecord = {
