@@ -132,7 +132,10 @@ export type ApproveDossierResult =
   | { ok: true; dossier: DossierRecord }
   | { ok: false; reason: "missing" };
 
-/** Открытая сессия. */
+/** Сессия. Законченная хранит разбор отдельно от стенограммы. */
+export type SessionStatus = "open" | "finished";
+
+/** Сессия, открытая или уже законченная. */
 export type SessionRecord = {
   id: string;
   caseId: string;
@@ -142,8 +145,18 @@ export type SessionRecord = {
   role: PerformerRole;
   executorId: string;
   keyId: string;
-  status: "open";
+  status: SessionStatus;
 };
+
+/** Текст разбора. Числовой оценки в нём нет. */
+export type ReviewRecord = {
+  text: string;
+};
+
+/** Отказ закончить сессию: её нет, она уже закончена или ключ не ответил. */
+export type FinishSessionResult =
+  | { ok: true; session: SessionRecord; review: ReviewRecord }
+  | { ok: false; reason: "missing" | "finished" | "timeout" | "model" | "secret" };
 
 /**
  * Поля открытия сессии.
@@ -344,12 +357,24 @@ function schemaSql(): string {
       role TEXT NOT NULL CHECK (role IN (${roles})),
       executor_id TEXT NOT NULL,
       key_id TEXT NOT NULL REFERENCES keys(id),
-      status TEXT NOT NULL CHECK (status = 'open')
+      status TEXT NOT NULL CHECK (status IN ('open', 'finished')),
+      review TEXT
     ) STRICT;
 
     CREATE UNIQUE INDEX IF NOT EXISTS sessions_one_open
       ON sessions(case_id, role, executor_id)
       WHERE status = 'open';
+
+    CREATE TABLE IF NOT EXISTS session_files (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id),
+      name TEXT NOT NULL,
+      layer TEXT NOT NULL CHECK (layer IN ('material', 'serviceLayer', 'crib')),
+      extracted_text TEXT NOT NULL
+    ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS session_files_session
+      ON session_files(session_id);
 
     CREATE TABLE IF NOT EXISTS preparation_notes (
       id TEXT PRIMARY KEY,
@@ -480,6 +505,54 @@ function ensureCaseShape(database: DatabaseSync): void {
 }
 
 /**
+ * Прежняя таблица сессий знает только открытую.
+ * Перенос добавляет законченную и текст разбора. Строки сессий остаются.
+ */
+function ensureSessionShape(database: DatabaseSync): void {
+  const row = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sessions'").get() as
+    | Row
+    | undefined;
+  if (!row) {
+    return;
+  }
+  const sql = textColumn(row, "sql");
+  if (sql.includes("'finished'")) {
+    return;
+  }
+  database.exec("PRAGMA foreign_keys = OFF");
+  try {
+    inTransaction(database, () => {
+      database.exec(`
+        CREATE TABLE sessions_next (
+          id TEXT PRIMARY KEY,
+          case_id TEXT NOT NULL REFERENCES cases(id),
+          dossier_id TEXT NOT NULL REFERENCES dossiers(id),
+          side TEXT NOT NULL CHECK (side IN (${sqlTextList(SIDES)})),
+          character_name TEXT NOT NULL,
+          role TEXT NOT NULL CHECK (role IN (${sqlTextList(PERFORMER_ROLES)})),
+          executor_id TEXT NOT NULL,
+          key_id TEXT NOT NULL REFERENCES keys(id),
+          status TEXT NOT NULL CHECK (status IN ('open', 'finished')),
+          review TEXT
+        ) STRICT;
+        INSERT INTO sessions_next (
+          id, case_id, dossier_id, side, character_name, role, executor_id, key_id, status, review
+        )
+        SELECT id, case_id, dossier_id, side, character_name, role, executor_id, key_id, status, NULL
+        FROM sessions;
+        DROP TABLE sessions;
+        ALTER TABLE sessions_next RENAME TO sessions;
+        CREATE UNIQUE INDEX sessions_one_open
+          ON sessions(case_id, role, executor_id)
+          WHERE status = 'open';
+      `);
+    });
+  } finally {
+    database.exec("PRAGMA foreign_keys = ON");
+  }
+}
+
+/**
  * Кладёт извлечённый текст в слой, который назвал владелец.
  * Пустой список файлов оставляет вставленный текст как есть.
  */
@@ -606,6 +679,64 @@ function internalPrompt(input: {
     historyText(input.history),
     "",
     input.task,
+  ].join("\n");
+}
+
+/** Текст файлов, с которыми открыта сессия. Пустой снимок так и называется. */
+function fileLayerLabel(layer: DossierLayerName): string {
+  if (layer === "material") {
+    return "материал проекта";
+  }
+  if (layer === "serviceLayer") {
+    return "служебный слой";
+  }
+  return "шпаргалка проекта";
+}
+
+function heldFileText(files: readonly { name: string; layer: DossierLayerName; text: string }[]): string {
+  if (files.length === 0) {
+    return "нет";
+  }
+  return files
+    .map((file) => `${fileLayerLabel(file.layer)}, ${file.name}:\n${file.text}`)
+    .join("\n\n");
+}
+
+/**
+ * Задание на разбор.
+ * Досье и тексты файлов — те, с которыми открыта сессия. Ход подготовки сюда не входит.
+ * Числовой оценки разбор не ставит.
+ */
+function reviewPrompt(input: {
+  material: string;
+  serviceLayer: string;
+  crib: string;
+  files: readonly { name: string; layer: DossierLayerName; text: string }[];
+  history: readonly TranscriptLine[];
+}): string {
+  return [
+    "Разбери законченную сессию.",
+    "Числовой оценки не ставь.",
+    "Отметь, где прозвучал служебный слой.",
+    "Отметь, где речь разошлась с досье.",
+    "Отметь, где речь разошлась с текстом файла проекта.",
+    "Назови вопросы шпаргалки проекта, которые не прозвучали.",
+    "",
+    "Досье, с которым открыта сессия:",
+    "Материал проекта:",
+    input.material,
+    "",
+    "Служебный слой:",
+    input.serviceLayer,
+    "",
+    "Шпаргалка проекта:",
+    input.crib,
+    "",
+    "Тексты файлов, с которыми открыта сессия:",
+    heldFileText(input.files),
+    "",
+    "Стенограмма:",
+    historyText(input.history),
   ].join("\n");
 }
 
@@ -881,11 +1012,15 @@ function readSourceFileRecord(row: Row): SourceFileRecord {
   };
 }
 
+function isSessionStatus(value: string): value is SessionStatus {
+  return value === "open" || value === "finished";
+}
+
 function readSessionRecord(row: Row): SessionRecord {
   const role = textColumn(row, "role");
   const side = textColumn(row, "side");
   const status = textColumn(row, "status");
-  if (!isPerformerRole(role) || !isSide(side) || status !== "open") {
+  if (!isPerformerRole(role) || !isSide(side) || !isSessionStatus(status)) {
     throw new Error("Запись хранилища повреждена");
   }
   return {
@@ -922,6 +1057,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     database.exec("PRAGMA busy_timeout = 5000");
     database.exec(schemaSql());
     ensureCaseShape(database);
+    ensureSessionShape(database);
     migrateLegacyKeys(database, directory);
     if (hasPlaintextSecret(database) || vacuumPending(database)) {
       setVacuumPending(database, true);
@@ -1017,6 +1153,44 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       )
       .all(caseId) as Row[];
     return rows.map((row) => readSourceFileRecord(row));
+  }
+
+  /** Снимок текстов файлов на момент открытия. Поздний файл сюда не входит. */
+  function rememberSessionFiles(sessionId: string, caseId: string): void {
+    const insert = database.prepare(
+      "INSERT INTO session_files (id, session_id, name, layer, extracted_text) VALUES (?, ?, ?, ?, ?)",
+    );
+    for (const file of loadSourceFiles(caseId)) {
+      insert.run(randomUUID(), sessionId, file.name, file.layer, file.extractedText);
+    }
+  }
+
+  function loadHeldFiles(sessionId: string): { name: string; layer: DossierLayerName; text: string }[] {
+    const rows = database
+      .prepare(
+        `SELECT name, layer, extracted_text
+         FROM session_files WHERE session_id = ? ORDER BY rowid`,
+      )
+      .all(sessionId) as Row[];
+    return rows.map((row) => {
+      const layer = textColumn(row, "layer");
+      if (!isDossierLayer(layer)) {
+        throw new Error("Запись хранилища повреждена");
+      }
+      return { name: textColumn(row, "name"), layer, text: textColumn(row, "extracted_text") };
+    });
+  }
+
+  function readReviewRow(sessionId: string): ReviewRecord | undefined {
+    const row = database.prepare("SELECT status, review FROM sessions WHERE id = ?").get(sessionId) as Row | undefined;
+    if (!row || textColumn(row, "status") !== "finished") {
+      return undefined;
+    }
+    const text = row.review;
+    if (typeof text !== "string" || text.trim() === "") {
+      return undefined;
+    }
+    return { text };
   }
 
   function loadDossier(dossierId: string): DossierRecord | undefined {
@@ -1203,6 +1377,8 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
   let closed = false;
   /** Сессии, у которых первый вопрос уже пошёл к модели и ещё не записан. */
   const openingReservations = new Set<string>();
+  /** Сессии, у которых разбор уже пошёл к модели и ещё не записан. */
+  const finishing = new Set<string>();
 
   return {
     /** Закрывает файл хранилища. Повторный вызов ничего не делает. */
@@ -1548,22 +1724,25 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
         status: "open",
       };
       try {
-        database
-          .prepare(
-            `INSERT INTO sessions (
-               id, case_id, dossier_id, side, character_name, role, executor_id, key_id, status
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')`,
-          )
-          .run(
-            session.id,
-            session.caseId,
-            session.dossierId,
-            session.side,
-            session.character,
-            session.role,
-            session.executorId,
-            session.keyId,
-          );
+        inTransaction(database, () => {
+          database
+            .prepare(
+              `INSERT INTO sessions (
+                 id, case_id, dossier_id, side, character_name, role, executor_id, key_id, status
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')`,
+            )
+            .run(
+              session.id,
+              session.caseId,
+              session.dossierId,
+              session.side,
+              session.character,
+              session.role,
+              session.executorId,
+              session.keyId,
+            );
+          rememberSessionFiles(session.id, caseId);
+        });
       } catch (error) {
         if (isUniqueConstraint(error)) {
           return { ok: false, reason: "open" };
@@ -1586,6 +1765,76 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       return readTranscriptRows(sessionId);
     },
 
+    /** Возвращает разбор законченной сессии. Открытая сессия и чужой идентификатор разбора не имеют. */
+    readReview(sessionId: string): ReviewRecord | undefined {
+      return readReviewRow(sessionId);
+    },
+
+    /**
+     * Заканчивает сессию и пишет разбор ключом, которым она открыта.
+     * Сбой и пустой ответ сессию не заканчивают. Ход подготовки не меняется.
+     */
+    async finishSession(sessionId: string): Promise<FinishSessionResult> {
+      const session = loadSession(sessionId);
+      if (!session) {
+        return { ok: false, reason: "missing" };
+      }
+      if (session.status !== "open" || finishing.has(session.id)) {
+        return { ok: false, reason: "finished" };
+      }
+      const dossier = loadDossier(session.dossierId);
+      if (!dossier) {
+        return { ok: false, reason: "missing" };
+      }
+      finishing.add(session.id);
+      try {
+        const spoken = { text: "", failed: false };
+        let failure: "timeout" | "model" | "missing" | "secret" | undefined;
+        for await (const event of streamKey(
+          session,
+          [
+            {
+              role: "user",
+              text: reviewPrompt({
+                material: dossier.material,
+                serviceLayer: dossier.serviceLayer,
+                crib: dossier.crib,
+                files: loadHeldFiles(session.id),
+                history: readTranscriptRows(session.id),
+              }),
+            },
+          ],
+          spoken,
+        )) {
+          if (event.kind === "failure") {
+            failure = event.reason;
+          }
+        }
+        if (failure) {
+          return { ok: false, reason: failure };
+        }
+        const text = spoken.text.trim();
+        if (spoken.failed || !text) {
+          return { ok: false, reason: "model" };
+        }
+        const current = loadSession(session.id);
+        if (!current || current.status !== "open") {
+          return { ok: false, reason: "finished" };
+        }
+        database
+          .prepare("UPDATE sessions SET status = 'finished', review = ? WHERE id = ? AND status = 'open'")
+          .run(text, session.id);
+        const saved = loadSession(session.id);
+        const review = readReviewRow(session.id);
+        if (!saved || saved.status !== "finished" || !review) {
+          return { ok: false, reason: "model" };
+        }
+        return { ok: true, session: saved, review };
+      } finally {
+        finishing.delete(session.id);
+      }
+    },
+
     /**
      * Персонаж задаёт один вопрос по роли исполнителя и делает паузу.
      * Повторный вызов модель не зовёт: очередь сама не продолжается.
@@ -1595,6 +1844,9 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       const session = loadSession(sessionId);
       if (!session) {
         yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
+        return;
+      }
+      if (session.status !== "open") {
         return;
       }
       if (hasOpeningQuestion(session.id) || openingReservations.has(session.id)) {
@@ -1630,6 +1882,9 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
         yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
         return;
       }
+      if (session.status !== "open") {
+        return;
+      }
       const text = line.trim();
       if (!text) {
         return;
@@ -1654,6 +1909,12 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
           `SELECT ${SESSION_COLUMNS} FROM sessions WHERE status = 'open' ORDER BY rowid`,
         )
         .all() as Row[];
+      return rows.map((row) => readSessionRecord(row));
+    },
+
+    /** Возвращает сессии в порядке открытия, включая законченные. */
+    listSessions(): SessionRecord[] {
+      const rows = database.prepare(`SELECT ${SESSION_COLUMNS} FROM sessions ORDER BY rowid`).all() as Row[];
       return rows.map((row) => readSessionRecord(row));
     },
 

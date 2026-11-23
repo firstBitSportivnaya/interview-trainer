@@ -14,8 +14,10 @@ import {
   type DraftDossierResult,
   type KeyDraft,
   type KeySummary,
+  type FinishSessionResult,
   type OpenSessionResult,
   type OwnerProfile,
+  type ReviewRecord,
   type SaveCaseResult,
   type SaveKeyResult,
   type SessionRecord,
@@ -57,6 +59,9 @@ type Trainer = {
   }): OpenSessionResult;
   readSession(sessionId: string): SessionRecord | undefined;
   readTranscript(sessionId: string): TranscriptLine[] | undefined;
+  readReview(sessionId: string): ReviewRecord | undefined;
+  finishSession(sessionId: string): Promise<FinishSessionResult>;
+  listSessions(): SessionRecord[];
   openingQuestion(sessionId: string, signal?: AbortSignal): AsyncIterable<SpeechEvent>;
   reply(sessionId: string, line: string, signal?: AbortSignal): AsyncIterable<SpeechEvent>;
   listOpenSessions(): SessionRecord[];
@@ -64,7 +69,7 @@ type Trainer = {
 };
 
 type CaseAction = "draft" | "approve" | "session" | "file" | "portfolio";
-type SessionAction = "opening" | "ask";
+type SessionAction = "opening" | "ask" | "finish";
 
 const PROTOCOL_LABEL: Record<KeySummary["protocol"], string> = {
   anthropic: "Anthropic",
@@ -315,15 +320,15 @@ function approvedBlock(trainer: Trainer, item: CaseRecord, sessionError?: string
   }
   const keys = trainer.listKeys();
   const voices = customerVoices(item.characters);
-  const openSessions = trainer.listOpenSessions().filter((session) => session.caseId === item.id);
+  const sessions = trainer.listSessions().filter((session) => session.caseId === item.id);
   const links =
-    openSessions.length === 0
+    sessions.length === 0
       ? ""
-      : `<ul>${openSessions
-          .map(
-            (session) =>
-              `<li><a href="/sessions/${encodeURIComponent(session.id)}">Стенограмма: ${escapeHtml(session.character)}, ${escapeHtml(session.role)}</a></li>`,
-          )
+      : `<ul>${sessions
+          .map((session) => {
+            const label = session.status === "finished" ? "Разбор" : "Стенограмма";
+            return `<li><a href="/sessions/${encodeURIComponent(session.id)}">${label}: ${escapeHtml(session.character)}, ${escapeHtml(session.role)}</a></li>`;
+          })
           .join("")}</ul>`;
   const form =
     keys.length === 0
@@ -487,10 +492,29 @@ function sessionScript(sessionId: string, needsOpening: boolean): string {
 function renderSession(trainer: Trainer, session: SessionRecord, error?: string): string {
   const item = trainer.readCase(session.caseId);
   const lines = trainer.readTranscript(session.id) ?? [];
+  const review = trainer.readReview(session.id);
   const key = trainer.listKeys().find((itemKey) => itemKey.id === session.keyId);
   const keyLabel = key ? `${PROTOCOL_LABEL[key.protocol]} — ${key.modelName}` : "ключ сессии не найден";
-  const needsOpening = session.side === "заказчик" && !lines.some((line) => line.kind === "вопрос");
+  const open = session.status === "open";
+  const needsOpening = open && session.side === "заказчик" && !lines.some((line) => line.kind === "вопрос");
   const title = item ? `${item.customerName} — ${item.title}` : "Сессия";
+  const talk = open
+    ? `<div id="opening"></div>
+    <div id="live"></div>
+    <form id="ask" method="post" action="/sessions/${encodeURIComponent(session.id)}/ask">
+      <label>Вопрос
+        <textarea name="line" required></textarea>
+      </label>
+      <button type="submit">Спросить</button>
+    </form>
+    <form method="post" action="/sessions/${encodeURIComponent(session.id)}/finish">
+      <button type="submit">Закончить сессию</button>
+    </form>`
+    : "";
+  const reviewText = review
+    ? `<h2>Разбор</h2>
+    <pre id="review">${escapeHtml(review.text)}</pre>`
+    : "";
   return page(
     title,
     `<h1>${escapeHtml(title)}</h1>
@@ -499,16 +523,10 @@ function renderSession(trainer: Trainer, session: SessionRecord, error?: string)
     ${notice(error)}
     <h2>Стенограмма</h2>
     ${transcriptList(lines)}
-    <div id="opening"></div>
-    <div id="live"></div>
-    <form id="ask" method="post" action="/sessions/${encodeURIComponent(session.id)}/ask">
-      <label>Вопрос
-        <textarea name="line" required></textarea>
-      </label>
-      <button type="submit">Спросить</button>
-    </form>
+    ${talk}
+    ${reviewText}
     ${item ? `<p><a href="${escapeHtml(casePath(item.id))}">К проекту</a></p>` : ""}
-    ${sessionScript(session.id, needsOpening)}`,
+    ${open ? sessionScript(session.id, needsOpening) : ""}`,
   );
 }
 
@@ -732,13 +750,13 @@ function caseTarget(pathname: string): { id: string; action?: CaseAction } | und
 }
 
 function sessionTarget(pathname: string): { id: string; action?: SessionAction } | undefined {
-  const match = pathname.match(/^\/sessions\/([^/]+)(?:\/(opening|ask))?$/);
+  const match = pathname.match(/^\/sessions\/([^/]+)(?:\/(opening|ask|finish))?$/);
   const id = match?.[1];
   if (!id) {
     return undefined;
   }
   const action = match?.[2];
-  if (action !== undefined && action !== "opening" && action !== "ask") {
+  if (action !== undefined && action !== "opening" && action !== "ask" && action !== "finish") {
     return undefined;
   }
   return { id: decodeURIComponent(id), action };
@@ -1035,6 +1053,22 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
       keyId: fields.get("keyId") ?? "",
     });
     redirect(response, opened.ok ? `/sessions/${encodeURIComponent(opened.session.id)}` : `${casePath(item.id)}?sessionError=${opened.reason}`);
+    return;
+  }
+
+  if (session?.action === "finish") {
+    const current = trainer.readSession(session.id);
+    if (!current) {
+      refuse(request, response, 404);
+      return;
+    }
+    const finished = await trainer.finishSession(current.id);
+    redirect(
+      response,
+      finished.ok || finished.reason === "finished"
+        ? `/sessions/${encodeURIComponent(current.id)}`
+        : `/sessions/${encodeURIComponent(current.id)}?error=${finished.reason}`,
+    );
     return;
   }
 
