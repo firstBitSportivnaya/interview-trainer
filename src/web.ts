@@ -14,9 +14,12 @@ import {
   type DraftDossierResult,
   type KeyDraft,
   type KeySummary,
+  type AcceptProposalResult,
+  type DismissPreparationResult,
   type FinishSessionResult,
   type OpenSessionResult,
   type OwnerProfile,
+  type PreparationEntry,
   type ReviewRecord,
   type SaveCaseResult,
   type SaveKeyResult,
@@ -66,9 +69,13 @@ type Trainer = {
   reply(sessionId: string, line: string, signal?: AbortSignal): AsyncIterable<SpeechEvent>;
   listOpenSessions(): SessionRecord[];
   setPortfolioSent(caseId: string, sent: boolean): SetPortfolioSentResult;
+  readPreparationEntries(caseId: string, role: string, executorId: string): PreparationEntry[];
+  readPreparationEntry(entryId: string): PreparationEntry | undefined;
+  dismissPreparation(entryId: string): DismissPreparationResult;
+  acceptProposal(entryId: string): AcceptProposalResult;
 };
 
-type CaseAction = "draft" | "approve" | "session" | "file" | "portfolio";
+type CaseAction = "draft" | "approve" | "session" | "file" | "portfolio" | "preparation";
 type SessionAction = "opening" | "ask" | "finish";
 
 const PROTOCOL_LABEL: Record<KeySummary["protocol"], string> = {
@@ -377,6 +384,48 @@ function approvedBlock(trainer: Trainer, item: CaseRecord, sessionError?: string
   </section>`;
 }
 
+const ENTRY_LABEL: Record<PreparationEntry["kind"], string> = {
+  gap: "Пробел",
+  watch: "Сигнал следить",
+  divergence: "Расхождение",
+  line: "Линия",
+  proposal: "Правка",
+};
+
+/** Ход владельца по ролям. Снять можно сигнал и расхождение. Правку можно принять. */
+function preparationBlock(trainer: Trainer, item: CaseRecord): string {
+  const rows: string[] = [];
+  for (const role of PERFORMER_ROLES) {
+    const entries = trainer
+      .readPreparationEntries(item.id, role, "владелец")
+      .filter((entry) => entry.status === "open");
+    for (const entry of entries) {
+      const label = entry.layer === "serviceLayer" ? "Правка служебного слоя" : ENTRY_LABEL[entry.kind];
+      const action =
+        entry.kind === "watch" || entry.kind === "divergence"
+          ? `<form method="post" action="${escapeHtml(casePath(item.id, "/preparation"))}">
+              <input type="hidden" name="entryId" value="${escapeHtml(entry.id)}">
+              <button type="submit" name="act" value="dismiss">Снять</button>
+            </form>`
+          : entry.kind === "proposal"
+            ? `<form method="post" action="${escapeHtml(casePath(item.id, "/preparation"))}">
+              <input type="hidden" name="entryId" value="${escapeHtml(entry.id)}">
+              <button type="submit" name="act" value="accept">Принять правку</button>
+            </form>`
+            : "";
+      rows.push(
+        `<li><span>${escapeHtml(role)}</span> <span>${escapeHtml(label)}</span> <span>${escapeHtml(entry.text)}</span> ${action}</li>`,
+      );
+    }
+  }
+  const list = rows.length === 0 ? "<p>Ход подготовки пока пуст.</p>" : `<ul id="preparation">${rows.join("")}</ul>`;
+  return `<section>
+    <h2>Ход подготовки</h2>
+    <p>Сигнал следить и расхождение снимает владелец. Пробел закрывает поздний разбор. Правка входит в досье после приёмки.</p>
+    ${list}
+  </section>`;
+}
+
 function transcriptList(lines: TranscriptLine[]): string {
   if (lines.length === 0) {
     return `<p id="empty-transcript">Стенограмма пока пуста.</p>`;
@@ -603,6 +652,7 @@ function renderCase(
     </form>
     ${notice(error)}
     ${renderSourceFiles(trainer, item, fileError)}
+    ${preparationBlock(trainer, item)}
     ${approvedBlock(trainer, item, sessionError)}
     <section>
       <h2>Черновик</h2>
@@ -730,7 +780,7 @@ function allowsFormPost(origin: string | string[] | undefined, port: number): bo
 }
 
 function caseTarget(pathname: string): { id: string; action?: CaseAction } | undefined {
-  const match = pathname.match(/^\/cases\/([^/]+)(?:\/(draft|approve|session|file|portfolio))?$/);
+  const match = pathname.match(/^\/cases\/([^/]+)(?:\/(draft|approve|session|file|portfolio|preparation))?$/);
   const id = match?.[1];
   if (!id) {
     return undefined;
@@ -742,7 +792,8 @@ function caseTarget(pathname: string): { id: string; action?: CaseAction } | und
     action !== "approve" &&
     action !== "session" &&
     action !== "file" &&
-    action !== "portfolio"
+    action !== "portfolio" &&
+    action !== "preparation"
   ) {
     return undefined;
   }
@@ -991,6 +1042,26 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
     const sent = fields.get("sent");
     if (sent === "1" || sent === "0") {
       trainer.setPortfolioSent(item.id, sent === "1");
+    }
+    redirect(response, casePath(item.id));
+    return;
+  }
+
+  if (target?.action === "preparation") {
+    const item = trainer.readCase(target.id);
+    if (!item) {
+      refuse(request, response, 404);
+      return;
+    }
+    const entry = trainer.readPreparationEntry((fields.get("entryId") ?? "").trim());
+    const act = fields.get("act");
+    if (entry && entry.caseId === item.id && entry.executorId === "владелец") {
+      if (act === "dismiss") {
+        trainer.dismissPreparation(entry.id);
+      }
+      if (act === "accept") {
+        trainer.acceptProposal(entry.id);
+      }
     }
     redirect(response, casePath(item.id));
     return;

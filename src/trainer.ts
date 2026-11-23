@@ -236,6 +236,41 @@ export type WritePreparationResult =
   | { ok: true; preparation: PreparationRecord }
   | { ok: false; reason: "missing" | "role" | "incomplete" };
 
+/** Вид записи хода. Пробел закрывает поздний разбор. Сигнал и расхождение снимает владелец. */
+export type PreparationKind = "gap" | "watch" | "divergence" | "line" | "proposal";
+
+/** Одна запись хода тройки. Правка хранит слой, который она предлагает заменить дополнением. */
+export type PreparationEntry = {
+  id: string;
+  caseId: string;
+  role: PerformerRole;
+  executorId: string;
+  kind: PreparationKind;
+  text: string;
+  layer?: "material" | "serviceLayer";
+  status: "open" | "closed" | "accepted";
+};
+
+/** Отказ снять сигнал или расхождение: записи нет либо это не сигнал и не расхождение. */
+export type DismissPreparationResult =
+  | { ok: true; entry: PreparationEntry }
+  | { ok: false; reason: "missing" | "kind" };
+
+/** Отказ принять правку: записи нет, это не правка или досье проекта нет. */
+export type AcceptProposalResult =
+  | { ok: true; dossier: DossierRecord; entry: PreparationEntry }
+  | { ok: false; reason: "missing" | "kind" };
+
+/** Факты разбора, из которых дописывается ход. Числовой оценки среди них нет. */
+type ReviewFacts = {
+  gaps: string[];
+  covered: string[];
+  watch: string[];
+  divergence: string[];
+  line: string;
+  proposals: { layer: "material" | "serviceLayer"; text: string }[];
+};
+
 type StoredKey = {
   id: string;
   protocol: Protocol;
@@ -383,6 +418,20 @@ function schemaSql(): string {
       executor_id TEXT NOT NULL,
       note TEXT NOT NULL
     ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS preparation_entries (
+      id TEXT PRIMARY KEY,
+      case_id TEXT NOT NULL REFERENCES cases(id),
+      role TEXT NOT NULL CHECK (role IN (${roles})),
+      executor_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('gap', 'watch', 'divergence', 'line', 'proposal')),
+      body TEXT NOT NULL,
+      layer TEXT CHECK (layer IS NULL OR layer IN ('material', 'serviceLayer')),
+      status TEXT NOT NULL CHECK (status IN ('open', 'closed', 'accepted'))
+    ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS preparation_entries_triple
+      ON preparation_entries(case_id, role, executor_id);
 
     CREATE TABLE IF NOT EXISTS transcript (
       id TEXT PRIMARY KEY,
@@ -704,7 +753,8 @@ function heldFileText(files: readonly { name: string; layer: DossierLayerName; t
 
 /**
  * Задание на разбор.
- * Досье и тексты файлов — те, с которыми открыта сессия. Ход подготовки сюда не входит.
+ * Досье и тексты файлов — те, с которыми открыта сессия.
+ * Из хода сюда входят только открытые пробелы и их идентификаторы.
  * Числовой оценки разбор не ставит.
  */
 function reviewPrompt(input: {
@@ -713,7 +763,9 @@ function reviewPrompt(input: {
   crib: string;
   files: readonly { name: string; layer: DossierLayerName; text: string }[];
   history: readonly TranscriptLine[];
+  gaps: readonly { id: string; text: string }[];
 }): string {
+  const openGaps = input.gaps.length === 0 ? "нет" : input.gaps.map((gap) => `${gap.id}: ${gap.text}`).join("\n");
   return [
     "Разбери законченную сессию.",
     "Числовой оценки не ставь.",
@@ -721,6 +773,14 @@ function reviewPrompt(input: {
     "Отметь, где речь разошлась с досье.",
     "Отметь, где речь разошлась с текстом файла проекта.",
     "Назови вопросы шпаргалки проекта, которые не прозвучали.",
+    "В конце, с новой строки, напиши маркер ХОД и следом один JSON-объект.",
+    "Поля JSON: gaps, watch, divergence — массивы строк; covered — массив идентификаторов открытых пробелов; line — строка линии поведения без текста служебного слоя; proposals — массив объектов с полями layer и text.",
+    "layer в proposals — только material или serviceLayer. text — дополнение этого слоя, не замена всего досье.",
+    "В covered ставь идентификатор пробела, который в этой сессии прозвучал. Своя формулировка пробел не закрывает. Сигнал следить и расхождение сами не снимаются.",
+    "Числовой оценки нет и в JSON.",
+    "",
+    "Открытые пробелы:",
+    openGaps,
     "",
     "Досье, с которым открыта сессия:",
     "Материал проекта:",
@@ -738,6 +798,188 @@ function reviewPrompt(input: {
     "Стенограмма:",
     historyText(input.history),
   ].join("\n");
+}
+
+/** Берёт непустые строки. Чужой элемент делает весь список негодным. */
+function stringList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const items: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") {
+      return undefined;
+    }
+    const text = item.trim();
+    if (text) {
+      items.push(text);
+    }
+  }
+  return items;
+}
+
+/** Берёт предложения правки. Чужой слой или не объект список негодным делают. */
+function proposalList(value: unknown): ReviewFacts["proposals"] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const items: ReviewFacts["proposals"] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return undefined;
+    }
+    const record = item as Record<string, unknown>;
+    const text = typeof record.text === "string" ? record.text.trim() : "";
+    if (record.layer !== "material" && record.layer !== "serviceLayer") {
+      return undefined;
+    }
+    if (text) {
+      items.push({ layer: record.layer, text });
+    }
+  }
+  return items;
+}
+
+/** Читает JSON после маркера. Обрывок и чужие поля фактами разбора не становятся. */
+function parseFactsJson(raw: string): ReviewFacts | undefined {
+  const source = raw.replace(/^```(?:json)?\s*/, "").replace(/```$/, "").trim();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return undefined;
+  }
+  const record = parsed as Record<string, unknown>;
+  const gaps = stringList(record.gaps);
+  const covered = stringList(record.covered);
+  const watch = stringList(record.watch);
+  const divergence = stringList(record.divergence);
+  const proposals = proposalList(record.proposals);
+  if (!gaps || !covered || !watch || !divergence || !proposals || typeof record.line !== "string") {
+    return undefined;
+  }
+  return {
+    gaps,
+    covered,
+    watch,
+    divergence,
+    line: record.line.trim(),
+    proposals,
+  };
+}
+
+/**
+ * Отделяет текст разбора от блока хода.
+ * Нет маркера или JSON не читается — остаётся весь ответ, ход из него не пишется.
+ */
+function splitReview(text: string): { prose: string; facts?: ReviewFacts } {
+  const marker = "\nХОД\n";
+  const at = text.lastIndexOf(marker);
+  if (at < 0) {
+    return { prose: text.trim() };
+  }
+  const facts = parseFactsJson(text.slice(at + marker.length));
+  if (!facts) {
+    return { prose: text.trim() };
+  }
+  return { prose: text.slice(0, at).trim(), facts };
+}
+
+/** Режет текст на предложения. Короткий обрывок из линии не вырезается. */
+function servicePieces(text: string): string[] {
+  return text
+    .split(/\n+|(?<=[.!?])\s+/)
+    .map((part) => part.trim())
+    .filter((part) => part.length >= 8);
+}
+
+/**
+ * Тексты, которых не должно быть в линии заказчика.
+ * Статус записи не открывает служебный текст: снятый сигнал и принятая правка остаются скрытыми.
+ */
+function hiddenServiceTexts(serviceLayer: string, entries: readonly PreparationEntry[]): string[] {
+  const hidden = new Set<string>();
+  const add = (value: string): void => {
+    const text = value.trim();
+    if (text) {
+      hidden.add(text);
+    }
+    for (const piece of servicePieces(value)) {
+      hidden.add(piece);
+    }
+  };
+  add(serviceLayer);
+  for (const entry of entries) {
+    if (entry.kind === "watch" || (entry.kind === "proposal" && entry.layer === "serviceLayer")) {
+      add(entry.text);
+    }
+  }
+  return [...hidden].sort((left, right) => right.length - left.length);
+}
+
+/** Вырезает служебные тексты. Обычная линия поведения остаётся. */
+function withoutServiceText(text: string, secrets: readonly string[]): string {
+  let next = text;
+  for (const secret of secrets) {
+    next = next.split(secret).join("");
+  }
+  return next.trim();
+}
+
+/** Убирает из линии текст служебного слоя и служебные записи любого статуса. */
+function behaviorLine(notes: readonly string[], entries: readonly PreparationEntry[], serviceLayer: string): string {
+  const secrets = hiddenServiceTexts(serviceLayer, entries);
+  const parts: string[] = [];
+  for (const note of notes) {
+    const text = withoutServiceText(note, secrets);
+    if (text) {
+      parts.push(text);
+    }
+  }
+  for (const entry of entries) {
+    if (entry.status !== "open" || entry.kind !== "line") {
+      continue;
+    }
+    const text = withoutServiceText(entry.text, secrets);
+    if (text) {
+      parts.push(text);
+    }
+  }
+  return parts.join("\n");
+}
+
+/** Полная запись хода для внутренней команды. Закрытое и принятое в неё не входит. */
+function preparationLog(notes: readonly string[], entries: readonly PreparationEntry[]): string {
+  const parts = [...notes];
+  for (const entry of entries) {
+    if (entry.status !== "open") {
+      continue;
+    }
+    if (entry.kind === "gap") {
+      parts.push(`Пробел: ${entry.text}`);
+    } else if (entry.kind === "watch") {
+      parts.push(`Сигнал следить: ${entry.text}`);
+    } else if (entry.kind === "divergence") {
+      parts.push(`Расхождение: ${entry.text}`);
+    } else if (entry.kind === "line") {
+      parts.push(`Линия: ${entry.text}`);
+    } else if (entry.layer === "serviceLayer") {
+      parts.push(`Правка служебного слоя: ${entry.text}`);
+    } else {
+      parts.push(`Правка материала проекта: ${entry.text}`);
+    }
+  }
+  return parts.join("\n");
+}
+
+/** Дописывает принятый текст к слою. Пустой слой становится этим текстом. */
+function appendLayer(current: string, addition: string): string {
+  const base = current.trim();
+  const next = addition.trim();
+  return base ? `${base}\n\n${next}` : next;
 }
 
 /** Читает три слоя из ответа модели. Чужой текст черновиком не становится. */
@@ -1332,9 +1574,126 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     };
   }
 
+  function optionalText(row: Row, column: string): string | undefined {
+    const value = row[column];
+    if (value === null) {
+      return undefined;
+    }
+    if (typeof value !== "string") {
+      throw new Error("Запись хранилища повреждена");
+    }
+    return value;
+  }
+
+  function isPreparationKind(value: string): value is PreparationKind {
+    return value === "gap" || value === "watch" || value === "divergence" || value === "line" || value === "proposal";
+  }
+
+  function readPreparationEntry(row: Row): PreparationEntry {
+    const kind = textColumn(row, "kind");
+    const status = textColumn(row, "status");
+    const role = textColumn(row, "role");
+    const layer = optionalText(row, "layer");
+    if (
+      !isPreparationKind(kind) ||
+      (status !== "open" && status !== "closed" && status !== "accepted") ||
+      !isPerformerRole(role) ||
+      (layer !== undefined && layer !== "material" && layer !== "serviceLayer")
+    ) {
+      throw new Error("Запись хранилища повреждена");
+    }
+    return {
+      id: textColumn(row, "id"),
+      caseId: textColumn(row, "case_id"),
+      role,
+      executorId: textColumn(row, "executor_id"),
+      kind,
+      text: textColumn(row, "body"),
+      ...(layer ? { layer } : {}),
+      status,
+    };
+  }
+
+  function loadPreparationEntries(caseId: string, role: PerformerRole, executorId: string): PreparationEntry[] {
+    const rows = database
+      .prepare(
+        `SELECT id, case_id, role, executor_id, kind, body, layer, status
+         FROM preparation_entries
+         WHERE case_id = ? AND role = ? AND executor_id = ?
+         ORDER BY rowid`,
+      )
+      .all(caseId, role, executorId) as Row[];
+    return rows.map((row) => readPreparationEntry(row));
+  }
+
+  function loadPreparationEntry(entryId: string): PreparationEntry | undefined {
+    const row = database
+      .prepare(
+        `SELECT id, case_id, role, executor_id, kind, body, layer, status
+         FROM preparation_entries WHERE id = ?`,
+      )
+      .get(entryId) as Row | undefined;
+    return row ? readPreparationEntry(row) : undefined;
+  }
+
+  /** Дописывает ход тройки из фактов разбора. Пробел закрывается по идентификатору. Сигнал и расхождение нет. */
+  function applyReviewFacts(session: SessionRecord, facts: ReviewFacts): void {
+    const coveredBodies = new Set<string>();
+    const findGap = database.prepare(
+      `SELECT body FROM preparation_entries
+       WHERE id = ? AND case_id = ? AND role = ? AND executor_id = ? AND kind = 'gap' AND status = 'open'`,
+    );
+    const closeGap = database.prepare(
+      `UPDATE preparation_entries SET status = 'closed'
+       WHERE id = ? AND case_id = ? AND role = ? AND executor_id = ? AND kind = 'gap' AND status = 'open'`,
+    );
+    for (const id of facts.covered) {
+      const row = findGap.get(id, session.caseId, session.role, session.executorId) as Row | undefined;
+      if (!row) {
+        continue;
+      }
+      coveredBodies.add(textColumn(row, "body"));
+      closeGap.run(id, session.caseId, session.role, session.executorId);
+    }
+    const insert = database.prepare(
+      `INSERT INTO preparation_entries (
+         id, case_id, role, executor_id, kind, body, layer, status
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open')`,
+    );
+    const sameOpen = database.prepare(
+      `SELECT id FROM preparation_entries
+       WHERE case_id = ? AND role = ? AND executor_id = ? AND kind = ? AND status = 'open' AND body = ?
+         AND ((? IS NULL AND layer IS NULL) OR layer = ?)`,
+    );
+    const add = (kind: PreparationKind, body: string, layer: "material" | "serviceLayer" | null): void => {
+      if (kind === "gap" && coveredBodies.has(body)) {
+        return;
+      }
+      if (kind !== "line" && sameOpen.get(session.caseId, session.role, session.executorId, kind, body, layer, layer)) {
+        return;
+      }
+      insert.run(randomUUID(), session.caseId, session.role, session.executorId, kind, body, layer);
+    };
+    for (const gap of facts.gaps) {
+      add("gap", gap, null);
+    }
+    for (const item of facts.watch) {
+      add("watch", item, null);
+    }
+    for (const item of facts.divergence) {
+      add("divergence", item, null);
+    }
+    if (facts.line) {
+      add("line", facts.line, null);
+    }
+    for (const proposal of facts.proposals) {
+      add("proposal", proposal.text, proposal.layer);
+    }
+  }
+
   /**
    * Задание персонажу открытой сессии.
-   * Заказчик не получает служебный слой. Внутренняя команда получает его.
+   * Заказчик получает линию без текста служебного слоя. Внутренняя команда читает ход целиком.
    * Профиль заказчика входит только при стоящей отметке.
    */
   function characterTask(session: SessionRecord, task: string): { ok: true; text: string } | { ok: false } {
@@ -1344,8 +1703,10 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       return { ok: false };
     }
     const notes = readPreparationRecord(session.caseId, session.role, session.executorId)?.notes ?? [];
+    const entries = loadPreparationEntries(session.caseId, session.role, session.executorId);
     const history = readTranscriptRows(session.id);
     if (session.side === "внутренняя команда") {
+      const log = preparationLog(notes, entries);
       return {
         ok: true,
         text: internalPrompt({
@@ -1353,20 +1714,21 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
           role: session.role,
           material: dossier.material,
           serviceLayer: dossier.serviceLayer,
-          notes,
+          notes: log ? [log] : [],
           history,
           task,
         }),
       };
     }
     const caseRecord = loadCase(caseRow);
+    const behavior = behaviorLine(notes, entries, dossier.serviceLayer);
     return {
       ok: true,
       text: customerPrompt({
         character: session.character,
         role: session.role,
         material: dossier.material,
-        notes,
+        notes: behavior ? [behavior] : [],
         history,
         profile: caseRecord.portfolioSent ? loadProfile() : undefined,
         task,
@@ -1772,7 +2134,8 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
 
     /**
      * Заканчивает сессию и пишет разбор ключом, которым она открыта.
-     * Сбой и пустой ответ сессию не заканчивают. Ход подготовки не меняется.
+     * Сбой и пустой ответ сессию не заканчивают и ход подготовки не меняют.
+     * Блок ХОД дописывает ход этой тройки. Текст разбора — до маркера.
      */
     async finishSession(sessionId: string): Promise<FinishSessionResult> {
       const session = loadSession(sessionId);
@@ -1801,6 +2164,9 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
                 crib: dossier.crib,
                 files: loadHeldFiles(session.id),
                 history: readTranscriptRows(session.id),
+                gaps: loadPreparationEntries(session.caseId, session.role, session.executorId)
+                  .filter((entry) => entry.kind === "gap" && entry.status === "open")
+                  .map((entry) => ({ id: entry.id, text: entry.text })),
               }),
             },
           ],
@@ -1817,13 +2183,33 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
         if (spoken.failed || !text) {
           return { ok: false, reason: "model" };
         }
+        const split = splitReview(text);
+        if (!split.prose) {
+          return { ok: false, reason: "model" };
+        }
         const current = loadSession(session.id);
         if (!current || current.status !== "open") {
           return { ok: false, reason: "finished" };
         }
-        database
-          .prepare("UPDATE sessions SET status = 'finished', review = ? WHERE id = ? AND status = 'open'")
-          .run(text, session.id);
+        try {
+          inTransaction(database, () => {
+            const stillOpen = loadSession(session.id);
+            if (!stillOpen || stillOpen.status !== "open") {
+              throw new Error("Сессия уже закончена");
+            }
+            database
+              .prepare("UPDATE sessions SET status = 'finished', review = ? WHERE id = ? AND status = 'open'")
+              .run(split.prose, session.id);
+            if (split.facts) {
+              applyReviewFacts(stillOpen, split.facts);
+            }
+          });
+        } catch (error) {
+          if (error instanceof Error && error.message === "Сессия уже закончена") {
+            return { ok: false, reason: "finished" };
+          }
+          throw error;
+        }
         const saved = loadSession(session.id);
         const review = readReviewRow(session.id);
         if (!saved || saved.status !== "finished" || !review) {
@@ -1916,6 +2302,82 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     listSessions(): SessionRecord[] {
       const rows = database.prepare(`SELECT ${SESSION_COLUMNS} FROM sessions ORDER BY rowid`).all() as Row[];
       return rows.map((row) => readSessionRecord(row));
+    },
+
+    /** Возвращает записи хода тройки, включая закрытые. Чужая роль — пустой список. */
+    readPreparationEntries(caseId: string, role: string, executorId: string): PreparationEntry[] {
+      if (!isPerformerRole(role)) {
+        return [];
+      }
+      return loadPreparationEntries(caseId, role, executorId);
+    },
+
+    /** Возвращает одну запись хода. Нет идентификатора — записи нет. */
+    readPreparationEntry(entryId: string): PreparationEntry | undefined {
+      return loadPreparationEntry(entryId.trim());
+    },
+
+    /**
+     * Снимает сигнал следить или расхождение.
+     * Пробел и правка этим действием не закрываются: пробел закрывает поздний разбор, правку принимают отдельно.
+     */
+    dismissPreparation(entryId: string): DismissPreparationResult {
+      const entry = loadPreparationEntry(entryId.trim());
+      if (!entry) {
+        return { ok: false, reason: "missing" };
+      }
+      if ((entry.kind !== "watch" && entry.kind !== "divergence") || entry.status !== "open") {
+        return { ok: false, reason: "kind" };
+      }
+      database.prepare("UPDATE preparation_entries SET status = 'closed' WHERE id = ? AND status = 'open'").run(entry.id);
+      const saved = loadPreparationEntry(entry.id);
+      if (!saved) {
+        return { ok: false, reason: "missing" };
+      }
+      return { ok: true, entry: saved };
+    },
+
+    /**
+     * Принимает правку в новое досье.
+     * Текст слоя дополняется, веса модели не меняются. Уже открытая сессия держит прежнее досье.
+     */
+    acceptProposal(entryId: string): AcceptProposalResult {
+      const entry = loadPreparationEntry(entryId.trim());
+      if (!entry) {
+        return { ok: false, reason: "missing" };
+      }
+      if (entry.kind !== "proposal" || entry.status !== "open" || (entry.layer !== "material" && entry.layer !== "serviceLayer")) {
+        return { ok: false, reason: "kind" };
+      }
+      const current = database
+        .prepare(
+          `SELECT id, case_id, material, service_layer, crib
+           FROM dossiers WHERE case_id = ? ORDER BY rowid DESC LIMIT 1`,
+        )
+        .get(entry.caseId) as Row | undefined;
+      if (!current) {
+        return { ok: false, reason: "missing" };
+      }
+      const dossier = readDossierRecord(current);
+      const layer = entry.layer;
+      const next: DossierRecord = {
+        id: randomUUID(),
+        caseId: dossier.caseId,
+        material: layer === "material" ? appendLayer(dossier.material, entry.text) : dossier.material,
+        serviceLayer: layer === "serviceLayer" ? appendLayer(dossier.serviceLayer, entry.text) : dossier.serviceLayer,
+        crib: dossier.crib,
+      };
+      inTransaction(database, () => {
+        database
+          .prepare("INSERT INTO dossiers (id, case_id, material, service_layer, crib) VALUES (?, ?, ?, ?, ?)")
+          .run(next.id, next.caseId, next.material, next.serviceLayer, next.crib);
+        database.prepare("UPDATE preparation_entries SET status = 'accepted' WHERE id = ? AND status = 'open'").run(entry.id);
+      });
+      const saved = loadPreparationEntry(entry.id);
+      if (!saved || saved.status !== "accepted") {
+        return { ok: false, reason: "kind" };
+      }
+      return { ok: true, dossier: next, entry: saved };
     },
 
     /** Дописывает заметку в ход подготовки тройки. Пустая заметка ход не меняет. */
