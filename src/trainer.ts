@@ -202,6 +202,17 @@ export type TranscriptLine = {
  */
 export const ABSENT_FACT = "В материале проекта этого нет.";
 
+/**
+ * Порт эмбеддингов хода.
+ * Проверка подставляет записанный порт и живую модель не вызывает.
+ * passage — текст фрагмента файла, query — текст хода.
+ */
+export type EmbeddingRole = "passage" | "query";
+
+export type EmbeddingPort = {
+  embed(text: string, role: EmbeddingRole): Promise<readonly number[]>;
+};
+
 /** Один вопрос персонажа. После него персонаж ждёт и сам очередь не продолжает. */
 function openingTask(role: string, askExperience: boolean): string {
   if (askExperience) {
@@ -309,6 +320,15 @@ const FAILURE_MESSAGE = {
  * Форма утверждения кодирует один знак девятью байтами, поэтому предел короче тела запроса.
  */
 export const DRAFT_LIMIT = 64 * 1024;
+
+/** Сколько близких фрагментов попадает в один ход. Файл целиком сюда не входит. */
+const FRAGMENT_LIMIT = 4;
+
+/** Длиннее этого абзац режется, чтобы файл целиком не попал в ход. */
+const FRAGMENT_CHARS = 400;
+
+/** Фрагмент уточняет вопрос. Фактом досье он не становится. */
+const FRAGMENT_RULE = "Фрагмент уточняет вопрос и не произносится как факт.";
 
 const PLAINTEXT_VACUUM = "plaintext-vacuum";
 const LEGACY_KEYS = "keys.json";
@@ -432,6 +452,17 @@ function schemaSql(): string {
 
     CREATE INDEX IF NOT EXISTS session_files_session
       ON session_files(session_id);
+
+    CREATE TABLE IF NOT EXISTS session_fragments (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id),
+      layer TEXT NOT NULL CHECK (layer IN ('material', 'serviceLayer')),
+      body TEXT NOT NULL,
+      vector TEXT NOT NULL
+    ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS session_fragments_session
+      ON session_fragments(session_id);
 
     CREATE TABLE IF NOT EXISTS preparation_notes (
       id TEXT PRIMARY KEY,
@@ -701,10 +732,120 @@ function historyText(history: readonly TranscriptLine[]): string {
   return history.map((line) => `${line.speaker}: ${line.text}`).join("\n");
 }
 
+/** Пустая строка делит текст файла. Абзац длиннее предела режется по предложениям, чтобы файл целиком не вошёл в ход. */
+function splitFragments(text: string): string[] {
+  const fragments: string[] = [];
+  for (const paragraph of text.split(/\n\s*\n/)) {
+    const trimmed = paragraph.trim();
+    if (!trimmed) {
+      continue;
+    }
+    fragments.push(...packFragment(trimmed));
+  }
+  return fragments;
+}
+
+function packFragment(paragraph: string): string[] {
+  if (paragraph.length <= FRAGMENT_CHARS) {
+    return [paragraph];
+  }
+  const sentences = paragraph
+    .split(/(?<=[.!?])\s+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 0);
+  const packed: string[] = [];
+  let current = "";
+  const pushCurrent = (): void => {
+    if (!current) {
+      return;
+    }
+    packed.push(current);
+    current = "";
+  };
+  for (const sentence of sentences) {
+    if (sentence.length > FRAGMENT_CHARS) {
+      pushCurrent();
+      for (let start = 0; start < sentence.length; start += FRAGMENT_CHARS) {
+        const slice = sentence.slice(start, start + FRAGMENT_CHARS).trim();
+        if (slice) {
+          packed.push(slice);
+        }
+      }
+      continue;
+    }
+    const next = current ? `${current} ${sentence}` : sentence;
+    if (next.length > FRAGMENT_CHARS) {
+      pushCurrent();
+      current = sentence;
+    } else {
+      current = next;
+    }
+  }
+  pushCurrent();
+  return packed;
+}
+
+function usableVector(value: readonly unknown[]): value is readonly number[] {
+  return value.length > 0 && value.every((item) => typeof item === "number" && Number.isFinite(item));
+}
+
+/** Близость двух векторов. Чужая длина, ноль и нечисло в сравнение не входят. */
+function cosine(left: readonly number[], right: readonly number[]): number {
+  if (left.length === 0 || left.length !== right.length) {
+    return 0;
+  }
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    const a = left[index] ?? 0;
+    const b = right[index] ?? 0;
+    if (!Number.isFinite(a) || !Number.isFinite(b)) {
+      return 0;
+    }
+    dot += a * b;
+    leftNorm += a * a;
+    rightNorm += b * b;
+  }
+  if (leftNorm === 0 || rightNorm === 0) {
+    return 0;
+  }
+  return dot / Math.sqrt(leftNorm * rightNorm);
+}
+
+/** Заказчик читает материал проекта. Внутренняя команда — материал проекта и служебный слой. */
+function layerOpenToSide(side: Side, layer: DossierLayerName): boolean {
+  if (layer === "material") {
+    return true;
+  }
+  return side === "внутренняя команда" && layer === "serviceLayer";
+}
+
+function fragmentLines(fragments: readonly string[]): string[] {
+  if (fragments.length === 0) {
+    return [];
+  }
+  return [FRAGMENT_RULE, "", "Фрагмент:", fragments.join("\n\n"), ""];
+}
+
+function readStoredVector(raw: string): number[] | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(value) || !usableVector(value)) {
+    return undefined;
+  }
+  return [...value];
+}
+
 /**
  * Задание персонажу заказчика.
  * Факты — только материал проекта. Заметки хода подготовки — линия поведения, не источник фактов.
  * Служебный слой и шпаргалка проекта в текст не входят.
+ * Фрагмент файла уточняет вопрос и не произносится как факт.
  * Профиль входит только при стоящей отметке и не произносится.
  */
 function customerPrompt(input: {
@@ -713,6 +854,7 @@ function customerPrompt(input: {
   material: string;
   notes: readonly string[];
   history: readonly TranscriptLine[];
+  fragments: readonly string[];
   profile?: OwnerProfile;
   task: string;
 }): string {
@@ -744,7 +886,8 @@ function customerPrompt(input: {
       "",
     );
   }
-  lines.push("Материал проекта:", input.material, "", "Стенограмма:", historyText(input.history), "", input.task);
+  lines.push("Материал проекта:", input.material, "", "Стенограмма:", historyText(input.history), "");
+  lines.push(...fragmentLines(input.fragments), input.task);
   return lines.join("\n");
 }
 
@@ -759,6 +902,7 @@ function internalPrompt(input: {
   serviceLayer: string;
   notes: readonly string[];
   history: readonly TranscriptLine[];
+  fragments: readonly string[];
   task: string;
 }): string {
   return [
@@ -781,6 +925,7 @@ function internalPrompt(input: {
     "Стенограмма:",
     historyText(input.history),
     "",
+    ...fragmentLines(input.fragments),
     input.task,
   ].join("\n");
 }
@@ -1340,8 +1485,9 @@ function readSessionRecord(row: Row): SessionRecord {
  * «проект + роль исполнителя + исполнитель» держится уникальным индексом.
  * Прежний процесс, который пишет keys.json, нужно остановить до этого запуска.
  * Модель приходит портом: проверка подставляет записанную, запуск — живую.
+ * Эмбеддинги приходят отдельным портом. Без него ход фрагмент не ищет.
  */
-export function openTrainer(directory: string, model: ModelPort = liveModel()) {
+export function openTrainer(directory: string, model: ModelPort = liveModel(), embeddings?: EmbeddingPort) {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   chmodSync(directory, 0o700);
 
@@ -1755,11 +1901,119 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
   }
 
   /**
+   * Считает векторы текстов, с которыми открыта сессия, вне транзакции.
+   * Шпаргалка проекта в индекс не входит. Повторный ход тот же набор не пересчитывает.
+   */
+  async function buildFragmentIndex(sessionId: string): Promise<void> {
+    if (!embeddings) {
+      return;
+    }
+    const ready = database.prepare("SELECT id FROM session_fragments WHERE session_id = ? LIMIT 1").get(sessionId);
+    if (ready) {
+      return;
+    }
+    const pieces: { layer: "material" | "serviceLayer"; body: string }[] = [];
+    for (const file of loadHeldFiles(sessionId)) {
+      if (file.layer !== "material" && file.layer !== "serviceLayer") {
+        continue;
+      }
+      for (const body of splitFragments(file.text)) {
+        pieces.push({ layer: file.layer, body });
+      }
+    }
+    const rows: { layer: "material" | "serviceLayer"; body: string; vector: readonly number[] }[] = [];
+    for (const piece of pieces) {
+      const vector = await embeddings.embed(piece.body, "passage");
+      if (!usableVector(vector)) {
+        continue;
+      }
+      rows.push({ layer: piece.layer, body: piece.body, vector });
+    }
+    if (rows.length === 0) {
+      return;
+    }
+    inTransaction(database, () => {
+      const again = database.prepare("SELECT id FROM session_fragments WHERE session_id = ? LIMIT 1").get(sessionId);
+      if (again) {
+        return;
+      }
+      const insert = database.prepare(
+        "INSERT INTO session_fragments (id, session_id, layer, body, vector) VALUES (?, ?, ?, ?, ?)",
+      );
+      for (const row of rows) {
+        insert.run(randomUUID(), sessionId, row.layer, row.body, JSON.stringify(row.vector));
+      }
+    });
+  }
+
+  const fragmentBuilds = new Map<string, Promise<void>>();
+
+  async function ensureFragmentIndex(sessionId: string): Promise<void> {
+    if (!embeddings) {
+      return;
+    }
+    const pending = fragmentBuilds.get(sessionId);
+    if (pending) {
+      await pending;
+      return;
+    }
+    const run = buildFragmentIndex(sessionId);
+    fragmentBuilds.set(sessionId, run);
+    try {
+      await run;
+    } finally {
+      fragmentBuilds.delete(sessionId);
+    }
+  }
+
+  function loadFragmentRows(sessionId: string): { layer: DossierLayerName; body: string; vector: number[] }[] {
+    const rows = database
+      .prepare("SELECT layer, body, vector FROM session_fragments WHERE session_id = ? ORDER BY rowid")
+      .all(sessionId) as Row[];
+    const fragments: { layer: DossierLayerName; body: string; vector: number[] }[] = [];
+    for (const row of rows) {
+      const layer = textColumn(row, "layer");
+      const vector = readStoredVector(textColumn(row, "vector"));
+      if ((layer !== "material" && layer !== "serviceLayer") || !vector) {
+        continue;
+      }
+      fragments.push({ layer, body: textColumn(row, "body"), vector });
+    }
+    return fragments;
+  }
+
+  /**
+   * Близкие фрагменты снимка сессии.
+   * Запрос — текст этого хода. Чужой проект в снимок не входит. Закрытый стороне слой из выдачи выпадает.
+   */
+  async function fragmentsForTurn(session: SessionRecord, task: string): Promise<string[]> {
+    if (!embeddings) {
+      return [];
+    }
+    await ensureFragmentIndex(session.id);
+    const query = await embeddings.embed(task, "query");
+    if (!usableVector(query)) {
+      return [];
+    }
+    return loadFragmentRows(session.id)
+      .map((fragment, index) => ({ fragment, index, score: cosine(query, fragment.vector) }))
+      .filter((item) => item.score > 0 && layerOpenToSide(session.side, item.fragment.layer))
+      .sort((left, right) => right.score - left.score || left.index - right.index)
+      .slice(0, FRAGMENT_LIMIT)
+      .map((item) => item.fragment.body);
+  }
+
+  /**
    * Задание персонажу открытой сессии.
    * Заказчик получает линию без текста служебного слоя. Внутренняя команда читает ход целиком.
    * Профиль исполнителя этой сессии входит персонажу заказчика только при стоящей отметке.
+   * Фрагмент берётся из текстов, с которыми сессия открыта, и фактом не называется.
    */
-  function characterTask(session: SessionRecord, task: string): { ok: true; text: string } | { ok: false } {
+  function characterTask(
+    session: SessionRecord,
+    task: string,
+    fragments: readonly string[],
+  ): { ok: true; text: string } | { ok: false } {
     const dossier = loadDossier(session.dossierId);
     const caseRow = database.prepare(`${caseQuery} WHERE cases.id = ?`).get(session.caseId) as Row | undefined;
     if (!dossier || !caseRow) {
@@ -1779,6 +2033,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
           serviceLayer: dossier.serviceLayer,
           notes: log ? [log] : [],
           history,
+          fragments,
           task,
         }),
       };
@@ -1793,6 +2048,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
         material: dossier.material,
         notes: behavior ? [behavior] : [],
         history,
+        fragments,
         profile: caseRecord.portfolioSent ? loadProfile(session.executorId) : undefined,
         task,
       }),
@@ -2395,7 +2651,11 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       }
       openingReservations.add(session.id);
       try {
-        const task = characterTask(session, openingTask(session.role, session.side === "заказчик" && portfolioMarked(session.caseId)));
+        const taskText = openingTask(
+          session.role,
+          session.side === "заказчик" && portfolioMarked(session.caseId),
+        );
+        const task = characterTask(session, taskText, await fragmentsForTurn(session, taskText));
         if (!task.ok) {
           yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
           return;
@@ -2430,7 +2690,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       if (!text) {
         return;
       }
-      const task = characterTask(session, text);
+      const task = characterTask(session, text, await fragmentsForTurn(session, text));
       if (!task.ok) {
         yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
         return;
