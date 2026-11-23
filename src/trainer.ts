@@ -71,8 +71,8 @@ export type SetPortfolioSentResult =
   | { ok: false; reason: "missing" };
 
 /**
- * Профиль владельца: резюме, портфолио и кейсы.
- * Один на владельца и общий для всех проектов.
+ * Профиль исполнителя: резюме, портфолио и кейсы.
+ * Общий для всех его проектов. Без идентификатора это профиль владельца.
  */
 export type OwnerProfile = {
   resume: string;
@@ -360,8 +360,8 @@ function schemaSql(): string {
     CREATE INDEX IF NOT EXISTS case_characters_case
       ON case_characters(case_id, position);
 
-    CREATE TABLE IF NOT EXISTS owner_profile (
-      id TEXT PRIMARY KEY CHECK (id = 'owner'),
+    CREATE TABLE IF NOT EXISTS profiles (
+      executor_id TEXT PRIMARY KEY,
       resume TEXT NOT NULL,
       portfolio TEXT NOT NULL,
       cases_text TEXT NOT NULL
@@ -490,6 +490,11 @@ function foreignExecutor(executorId: string | undefined): boolean {
   return executorId !== undefined && executorId.trim() !== OWNER_EXECUTOR_ID;
 }
 
+/** Профиль без идентификатора принадлежит владельцу. Пустое поле тоже. */
+function profileExecutorId(executorId: string | undefined): string {
+  return (executorId ?? OWNER_EXECUTOR_ID).trim() || OWNER_EXECUTOR_ID;
+}
+
 function secretPreview(secret: string): string {
   if (secret.length <= 4) {
     return "••••";
@@ -569,6 +574,28 @@ function namedCharacters(names: readonly string[] | undefined): string[] {
  */
 export function customerVoices(characters: readonly string[]): string[] {
   return characters.length === 0 ? ["заказчик"] : [...characters];
+}
+
+/**
+ * Прежняя единственная строка профиля становится профилем владельца.
+ * Проекты, досье, сессии и ключи этот перенос не трогает.
+ */
+function ensureProfileShape(database: DatabaseSync): void {
+  const row = database
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'owner_profile'")
+    .get();
+  if (!row) {
+    return;
+  }
+  inTransaction(database, () => {
+    database
+      .prepare(
+        `INSERT OR IGNORE INTO profiles (executor_id, resume, portfolio, cases_text)
+         SELECT ?, resume, portfolio, cases_text FROM owner_profile`,
+      )
+      .run(OWNER_EXECUTOR_ID);
+    database.exec("DROP TABLE owner_profile");
+  });
 }
 
 /** Прежнее хранилище без отметки портфолио получает колонку. Уже записанный проект остаётся без отметки. */
@@ -1327,6 +1354,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     database.exec(schemaSql());
     ensureCaseShape(database);
     ensureSessionShape(database);
+    ensureProfileShape(database);
     migrateLegacyKeys(database, directory);
     if (hasPlaintextSecret(database) || vacuumPending(database)) {
       setVacuumPending(database, true);
@@ -1595,10 +1623,10 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     return integerColumn(row, "portfolio_sent") === 1;
   }
 
-  function loadProfile(): OwnerProfile {
+  function loadProfile(executorId: string): OwnerProfile {
     const row = database
-      .prepare("SELECT resume, portfolio, cases_text FROM owner_profile WHERE id = 'owner'")
-      .get() as Row | undefined;
+      .prepare("SELECT resume, portfolio, cases_text FROM profiles WHERE executor_id = ?")
+      .get(executorId) as Row | undefined;
     if (!row) {
       return { resume: "", portfolio: "", cases: "" };
     }
@@ -1729,7 +1757,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
   /**
    * Задание персонажу открытой сессии.
    * Заказчик получает линию без текста служебного слоя. Внутренняя команда читает ход целиком.
-   * Профиль заказчика входит только при стоящей отметке.
+   * Профиль исполнителя этой сессии входит персонажу заказчика только при стоящей отметке.
    */
   function characterTask(session: SessionRecord, task: string): { ok: true; text: string } | { ok: false } {
     const dossier = loadDossier(session.dossierId);
@@ -1765,7 +1793,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
         material: dossier.material,
         notes: behavior ? [behavior] : [],
         history,
-        profile: caseRecord.portfolioSent ? loadProfile() : undefined,
+        profile: caseRecord.portfolioSent ? loadProfile(session.executorId) : undefined,
         task,
       }),
     };
@@ -1936,21 +1964,25 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     },
 
     /**
-     * Записывает профиль владельца.
-     * Повторная запись заменяет ту же строку, вторую не создаёт.
+     * Записывает профиль исполнителя.
+     * Без идентификатора это профиль владельца. Повторная запись заменяет ту же строку.
      */
-    saveProfile(draft: OwnerProfile): void {
+    saveProfile(draft: OwnerProfile & { executorId?: string }): void {
+      const executorId = profileExecutorId(draft.executorId);
       database
         .prepare(
-          `INSERT INTO owner_profile (id, resume, portfolio, cases_text) VALUES ('owner', ?, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET resume = excluded.resume, portfolio = excluded.portfolio, cases_text = excluded.cases_text`,
+          `INSERT INTO profiles (executor_id, resume, portfolio, cases_text) VALUES (?, ?, ?, ?)
+           ON CONFLICT(executor_id) DO UPDATE SET
+             resume = excluded.resume,
+             portfolio = excluded.portfolio,
+             cases_text = excluded.cases_text`,
         )
-        .run(draft.resume.trim(), draft.portfolio.trim(), draft.cases.trim());
+        .run(executorId, draft.resume.trim(), draft.portfolio.trim(), draft.cases.trim());
     },
 
-    /** Возвращает профиль владельца. Пока его не сохраняли, поля пустые. */
-    readProfile(): OwnerProfile {
-      return loadProfile();
+    /** Возвращает профиль исполнителя. Без идентификатора — профиль владельца. Пока его не сохраняли, поля пустые. */
+    readProfile(executorId?: string): OwnerProfile {
+      return loadProfile(profileExecutorId(executorId));
     },
 
     /**
