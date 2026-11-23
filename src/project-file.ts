@@ -1,4 +1,4 @@
-import { inflateRawSync } from "node:zlib";
+import { inflateRawSync, inflateSync } from "node:zlib";
 
 import {
   DOSSIER_LAYER_NAMES,
@@ -162,10 +162,7 @@ function readDocx(files: Map<string, Uint8Array>): ReadProjectFileResult {
 }
 
 function readPptx(files: Map<string, Uint8Array>): ReadProjectFileResult {
-  const slides = [...files.keys()]
-    .map((name) => ({ name, slide: slideNumber(name) }))
-    .filter((item): item is { name: string; slide: number } => item.slide !== undefined)
-    .sort((left, right) => left.slide - right.slide);
+  const slides = slideOrder(files);
   const lines: string[] = [];
   const places: SourcePlace[] = [];
   for (const slide of slides) {
@@ -173,7 +170,7 @@ function readPptx(files: Map<string, Uint8Array>): ReadProjectFileResult {
     if (!xml) {
       continue;
     }
-    const text = xmlTexts(decodeXmlBytes(xml), "t").join("");
+    const text = docxText(decodeXmlBytes(xml));
     if (!text.trim()) {
       continue;
     }
@@ -194,7 +191,9 @@ function readXlsx(files: Map<string, Uint8Array>): ReadProjectFileResult {
     if (!xml) {
       continue;
     }
-    lines.push(...sheetLines(decodeXmlBytes(xml), shared));
+    for (const row of sheetLines(decodeXmlBytes(xml), shared)) {
+      lines.push(row);
+    }
   }
   return readyText(lines.join("\n"));
 }
@@ -220,13 +219,13 @@ function readPdf(bytes: Uint8Array): ReadProjectFileResult {
 
 function decodeText(bytes: Uint8Array): string | undefined {
   if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
-    return decodeUtf8(bytes.subarray(3));
+    return readableText(decodeUtf8(bytes.subarray(3)));
   }
   if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
     if ((bytes.length - 2) % 2 !== 0) {
       return undefined;
     }
-    return Buffer.from(bytes.subarray(2)).toString("utf16le");
+    return readableText(Buffer.from(bytes.subarray(2)).toString("utf16le"));
   }
   if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
     if ((bytes.length - 2) % 2 !== 0) {
@@ -237,17 +236,14 @@ function decodeText(bytes: Uint8Array): string | undefined {
       swapped[index - 2] = bytes[index + 1] ?? 0;
       swapped[index - 1] = bytes[index] ?? 0;
     }
-    return swapped.toString("utf16le");
+    return readableText(swapped.toString("utf16le"));
   }
-  return decodeUtf8(bytes) ?? decodeWindows1251(bytes);
+  return readableText(decodeUtf8(bytes) ?? decodeWindows1251(bytes));
 }
 
-/** Windows-1251, если байты не UTF-8. Управляющие байты — это не текст, фразу из них не собираем. */
-function decodeWindows1251(bytes: Uint8Array): string | undefined {
-  let text = "";
-  try {
-    text = new TextDecoder("windows-1251").decode(bytes);
-  } catch {
+/** Текст без NUL и прочих управляющих байт. Таб, перевод строки и возврат каретки остаются. */
+function readableText(text: string | undefined): string | undefined {
+  if (text === undefined) {
     return undefined;
   }
   for (const char of text) {
@@ -259,6 +255,15 @@ function decodeWindows1251(bytes: Uint8Array): string | undefined {
   return text;
 }
 
+/** Windows-1251, если байты не UTF-8. Проверку управляющих байт делает readableText. */
+function decodeWindows1251(bytes: Uint8Array): string | undefined {
+  try {
+    return new TextDecoder("windows-1251").decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
 function decodeUtf8(bytes: Uint8Array): string | undefined {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -267,13 +272,60 @@ function decodeUtf8(bytes: Uint8Array): string | undefined {
   }
 }
 
+/** Порядок показа. Без списка презентации остаётся номер из имени части. Пустой слайд место занимает. */
+function slideOrder(files: Map<string, Uint8Array>): { name: string; slide: number }[] {
+  const listed = presentationSlides(files);
+  if (listed) {
+    return listed;
+  }
+  return [...files.keys()]
+    .map((name) => ({ name, slide: slideNumber(name) }))
+    .filter((item): item is { name: string; slide: number } => item.slide !== undefined)
+    .sort((left, right) => left.slide - right.slide);
+}
+
+function presentationSlides(files: Map<string, Uint8Array>): { name: string; slide: number }[] | undefined {
+  const presentation = files.get("ppt/presentation.xml");
+  const rels = files.get("ppt/_rels/presentation.xml.rels");
+  if (!presentation || !rels) {
+    return undefined;
+  }
+  const targets = new Map<string, string>();
+  for (const rel of decodeXmlBytes(rels).matchAll(/<Relationship\b([^>]*)\/?>/g)) {
+    const attrs = rel[1] ?? "";
+    const id = /Id="([^"]+)"/.exec(attrs)?.[1];
+    const target = /Target="([^"]+)"/.exec(attrs)?.[1];
+    if (id && target) {
+      targets.set(id, slidePath(target));
+    }
+  }
+  const slides: { name: string; slide: number }[] = [];
+  for (const item of decodeXmlBytes(presentation).matchAll(/<[^>\s]*sldId\b([^>]*)\/?>/g)) {
+    const relId = /r:id="([^"]+)"/.exec(item[1] ?? "")?.[1];
+    const name = relId ? targets.get(relId) : undefined;
+    if (!name || !Number.isSafeInteger(slides.length + 1)) {
+      continue;
+    }
+    slides.push({ name, slide: slides.length + 1 });
+  }
+  return slides.length > 0 ? slides : undefined;
+}
+
+function slidePath(target: string): string {
+  const clean = target.replaceAll("\\", "/").replace(/^\//, "");
+  if (clean.startsWith("ppt/")) {
+    return clean;
+  }
+  return `ppt/${clean.replace(/^\.\//, "")}`;
+}
+
 function slideNumber(name: string): number | undefined {
   const match = /^ppt\/slides\/slide(\d+)\.xml$/.exec(name);
   if (!match) {
     return undefined;
   }
   const number = Number(match[1]);
-  if (!Number.isInteger(number) || number < 1) {
+  if (!Number.isSafeInteger(number) || number < 1) {
     return undefined;
   }
   return number;
@@ -311,13 +363,11 @@ function sharedStrings(bytes: Uint8Array | undefined): string[] {
 
 function sheetLines(xml: string, shared: readonly string[]): string[] {
   const byRow = new Map<number, { column: number; text: string }[]>();
-  for (const cell of xml.matchAll(/<c\b([^>]*)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
-    const attrs = cell[1] ?? "";
-    const inner = cell[2] ?? "";
-    const ref = /r="([A-Z]+)(\d+)"/.exec(attrs);
+  for (const cell of readCells(xml)) {
+    const ref = /r="([A-Z]+)(\d+)"/.exec(cell.attrs);
     const row = ref ? Number(ref[2]) : 0;
     const column = ref ? columnIndex(ref[1] ?? "") : 0;
-    const text = cellText(attrs, inner, shared);
+    const text = cellText(cell.attrs, cell.inner, shared);
     if (!text) {
       continue;
     }
@@ -327,19 +377,63 @@ function sheetLines(xml: string, shared: readonly string[]): string[] {
   }
   return [...byRow.keys()]
     .sort((left, right) => left - right)
-    .map((row) =>
-      (byRow.get(row) ?? [])
-        .sort((left, right) => left.column - right.column)
-        .map((cell) => cell.text)
-        .join("\t"),
-    );
+    .map((row) => {
+      const cells = (byRow.get(row) ?? []).sort((left, right) => left.column - right.column);
+      const width = cells.at(-1)?.column ?? 0;
+      const slots = Array.from({ length: width }, () => "");
+      for (const cell of cells) {
+        if (cell.column >= 1) {
+          slots[cell.column - 1] = cell.text;
+        }
+      }
+      return slots.join("\t");
+    });
+}
+
+/** Самозакрытая ячейка не захватывает следующую. */
+function readCells(xml: string): { attrs: string; inner: string }[] {
+  const cells: { attrs: string; inner: string }[] = [];
+  let index = 0;
+  while (index < xml.length) {
+    const at = xml.indexOf("<c", index);
+    if (at < 0) {
+      break;
+    }
+    const next = xml[at + 2];
+    if (next !== " " && next !== ">" && next !== "/" && next !== "\n" && next !== "\r" && next !== "\t") {
+      index = at + 2;
+      continue;
+    }
+    const close = xml.indexOf(">", at);
+    if (close < 0) {
+      break;
+    }
+    const head = xml.slice(at, close + 1);
+    const selfClosing = /\/\s*>$/.test(head);
+    const attrs = head.slice(2, selfClosing ? head.lastIndexOf("/") : head.length - 1);
+    if (selfClosing) {
+      cells.push({ attrs, inner: "" });
+      index = close + 1;
+      continue;
+    }
+    const end = xml.indexOf("</c>", close);
+    if (end < 0) {
+      break;
+    }
+    cells.push({ attrs, inner: xml.slice(close + 1, end) });
+    index = end + "</c>".length;
+  }
+  return cells;
 }
 
 function cellText(attrs: string, inner: string, shared: readonly string[]): string {
   const kind = /t="([^"]+)"/.exec(attrs)?.[1] ?? "";
   if (kind === "s") {
-    const index = Number(/<v>(\d+)<\/v>/.exec(inner)?.[1] ?? "");
-    return shared[index] ?? "";
+    const matched = /<v>(\d+)<\/v>/.exec(inner);
+    if (!matched) {
+      return "";
+    }
+    return shared[Number(matched[1])] ?? "";
   }
   if (kind === "inlineStr") {
     return xmlTexts(inner, "t").join("");
@@ -369,16 +463,46 @@ function xmlTexts(xml: string, localName: string): string[] {
 }
 
 function decodeXml(value: string): string {
-  return value
-    .replaceAll("&lt;", "<")
-    .replaceAll("&gt;", ">")
-    .replaceAll("&quot;", '"')
-    .replaceAll("&apos;", "'")
-    .replaceAll("&amp;", "&");
+  return value.replace(/&(#x[0-9a-fA-F]+|#\d+|lt|gt|quot|apos|amp);/g, (entity, body: string) => {
+    if (body === "lt") {
+      return "<";
+    }
+    if (body === "gt") {
+      return ">";
+    }
+    if (body === "quot") {
+      return '"';
+    }
+    if (body === "apos") {
+      return "'";
+    }
+    if (body === "amp") {
+      return "&";
+    }
+    const code = body.startsWith("#x") ? Number.parseInt(body.slice(2), 16) : Number.parseInt(body.slice(1), 10);
+    if (!Number.isInteger(code) || code < 0 || code > 0x10ffff) {
+      return entity;
+    }
+    return String.fromCodePoint(code);
+  });
 }
 
 function decodeXmlBytes(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString("utf8");
+}
+
+/** Предел распакованного текста одного файла. Картинки и прочие части не читаются. */
+const TEXT_LIMIT = 8 * 1024 * 1024;
+
+function neededOfficePart(name: string): boolean {
+  return (
+    name === "word/document.xml" ||
+    name === "ppt/presentation.xml" ||
+    name === "ppt/_rels/presentation.xml.rels" ||
+    /^ppt\/slides\/slide\d+\.xml$/.test(name) ||
+    name === "xl/sharedStrings.xml" ||
+    /^xl\/worksheets\/sheet\d+\.xml$/.test(name)
+  );
 }
 
 /** Центральный каталог ZIP. Несжатые и deflate-записи, без ZIP64. */
@@ -401,6 +525,7 @@ function unzip(bytes: Uint8Array): Map<string, Uint8Array> | undefined {
   const count = data.readUInt16LE(eocd + 10);
   let cursor = data.readUInt32LE(eocd + 16);
   const files = new Map<string, Uint8Array>();
+  let total = 0;
   for (let entry = 0; entry < count; entry += 1) {
     if (cursor + 46 > data.length || data.readUInt32LE(cursor) !== 0x02014b50) {
       return undefined;
@@ -426,15 +551,32 @@ function unzip(bytes: Uint8Array): Map<string, Uint8Array> | undefined {
       return undefined;
     }
     const compressed = data.subarray(dataStart, dataStart + compSize);
-    if (method === 0) {
-      files.set(name, compressed);
-    } else if (method === 8) {
-      files.set(name, inflateRawSync(compressed));
-    } else {
+    if (!neededOfficePart(name)) {
+      continue;
+    }
+    const decoded = inflateZip(method, compressed);
+    if (!decoded || total + decoded.length > TEXT_LIMIT) {
       return undefined;
     }
+    total += decoded.length;
+    files.set(name, decoded);
   }
   return files;
+}
+
+function inflateZip(method: number, compressed: Buffer): Uint8Array | undefined {
+  if (method === 0) {
+    return compressed.length <= TEXT_LIMIT ? compressed : undefined;
+  }
+  if (method !== 8) {
+    return undefined;
+  }
+  try {
+    const inflated = inflateRawSync(compressed, { maxOutputLength: TEXT_LIMIT });
+    return inflated.length <= TEXT_LIMIT ? inflated : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function pdfStreams(data: Buffer): Buffer[] {
@@ -450,7 +592,7 @@ function pdfStreams(data: Buffer): Buffer[] {
       from = at + "stream".length;
       continue;
     }
-    const before = latin.slice(Math.max(0, at - 300), at);
+    const dictionary = streamDictionary(latin, at);
     let start = at + "stream".length;
     if (latin[start] === "\r") {
       start += 1;
@@ -458,33 +600,40 @@ function pdfStreams(data: Buffer): Buffer[] {
     if (latin[start] === "\n") {
       start += 1;
     }
-    const end = latin.indexOf("endstream", start);
-    if (end < 0) {
+    const length = /\/Length\s+(\d+)(?!\s+\d+\s+R)/.exec(dictionary)?.[1];
+    const end = length ? start + Number(length) : latin.indexOf("endstream", start);
+    if (end < start || end > data.length) {
       break;
     }
-    let raw = data.subarray(start, end);
-    if (raw[raw.length - 1] === 0x0a) {
-      raw = raw.subarray(0, raw.length - 1);
-    }
-    if (raw[raw.length - 1] === 0x0d) {
-      raw = raw.subarray(0, raw.length - 1);
-    }
-    if (before.includes("/Image")) {
-      from = end + "endstream".length;
+    const raw = data.subarray(start, end);
+    from = (length ? end : end + "endstream".length);
+    if (dictionary.includes("/Subtype") && dictionary.includes("/Image")) {
       continue;
     }
-    if (before.includes("FlateDecode")) {
+    if (dictionary.includes("FlateDecode")) {
       try {
-        streams.push(inflateRawSync(raw));
+        streams.push(inflateSync(raw, { maxOutputLength: TEXT_LIMIT }));
       } catch {
-        streams.push(raw);
+        continue;
       }
     } else {
       streams.push(raw);
     }
-    from = end + "endstream".length;
   }
   return streams;
+}
+
+/** Словарь этого потока, а не предыдущего объекта. */
+function streamDictionary(latin: string, streamAt: number): string {
+  const dictEnd = latin.lastIndexOf(">>", streamAt);
+  if (dictEnd < 0) {
+    return "";
+  }
+  const dictStart = latin.lastIndexOf("<<", dictEnd);
+  if (dictStart < 0) {
+    return "";
+  }
+  return latin.slice(dictStart, dictEnd + 2);
 }
 
 function textFromPdfContent(content: Buffer): string {
@@ -492,6 +641,13 @@ function textFromPdfContent(content: Buffer): string {
   let index = 0;
   while (index < content.length) {
     const byte = content[index];
+    if (byte === 0x25) {
+      index += 1;
+      while (index < content.length && content[index] !== 0x0a && content[index] !== 0x0d) {
+        index += 1;
+      }
+      continue;
+    }
     if (byte === 0x28) {
       const parsed = readPdfLiteral(content, index);
       if (!parsed) {
@@ -580,7 +736,8 @@ function readPdfLiteral(content: Buffer, start: number): { text: string; next: n
     if (byte === 0x29) {
       depth -= 1;
       if (depth === 0) {
-        return { text: decodePdfBytes(Buffer.from(out)), next: index + 1 };
+        const text = decodePdfBytes(Buffer.from(out));
+        return text === undefined ? { text: "", next: index + 1 } : { text, next: index + 1 };
       }
     }
     out.push(byte);
@@ -614,7 +771,8 @@ function readPdfHex(content: Buffer, start: number): { text: string; next: numbe
     }
     return { text: swapped.toString("utf16le"), next: index + 1 };
   }
-  return { text: decodePdfBytes(bytes), next: index + 1 };
+  const text = decodePdfBytes(bytes);
+  return { text: text ?? "", next: index + 1 };
 }
 
 function readPdfArray(content: Buffer, start: number): { text: string; next: number } | undefined {
@@ -667,10 +825,11 @@ function isPdfSpace(byte: number): boolean {
   return byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d || byte === 0x0c || byte === 0x00;
 }
 
-function decodePdfBytes(bytes: Buffer): string {
+/** Байты без кодировки Unicode текстом не становятся: чужой глиф не подменяется. */
+function decodePdfBytes(bytes: Buffer): string | undefined {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
-    return bytes.toString("latin1");
+    return undefined;
   }
 }

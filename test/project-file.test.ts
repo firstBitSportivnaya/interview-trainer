@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { deflateRawSync } from "node:zlib";
+import { deflateRawSync, deflateSync } from "node:zlib";
 
 import { acceptProjectFile, readProjectFile } from "../src/project-file.ts";
 import { openTrainer } from "../src/trainer.ts";
@@ -310,3 +310,136 @@ test("прочитанный файл без названного слоя ни 
     assert.equal(trainer.listSourceFiles(caseId).some((file) => file.layer === layer), false);
   }
 });
+
+test("TXT с управляющим байтом не готов", () => {
+  assert.equal(readProjectFile("nul.txt", Uint8Array.of(0)).ready, false);
+  assert.equal(readProjectFile("nul.txt", Buffer.from("а\0б", "utf8")).ready, false);
+});
+
+test("XLSX не сдвигает значение и не берёт чужую строку", () => {
+  const read = readProjectFile(
+    "вес.xlsx",
+    zip({
+      "xl/sharedStrings.xml": `<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>ЧУЖОЙ</t></si></sst>`,
+      "xl/worksheets/sheet1.xml": `<?xml version="1.0"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+<row r="1"><c r="A1" t="inlineStr"><is><t>Длина</t></is></c><c r="B1" t="inlineStr"><is><t>Вес</t></is></c></row>
+<row r="2"><c r="A2" t="s" s="1"/><c r="B2"><v>840</v></c></row>
+</sheetData></worksheet>`,
+    }),
+  );
+  assert.equal(read.ready, true);
+  if (!read.ready) {
+    return;
+  }
+  assert.equal(read.text.includes("ЧУЖОЙ"), false);
+  assert.equal(read.text.split("\n")[1], "\t840");
+  assert.equal(read.text.includes("Длина"), true);
+  assert.equal(read.text.includes("Вес"), true);
+});
+
+test("DOCX читает числовую ссылку один раз", () => {
+  const read = readProjectFile(
+    "ссылка.docx",
+    zip({
+      "word/document.xml": `<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Приёмка &#x26; паллет</w:t></w:r></w:p></w:body></w:document>`,
+    }),
+  );
+  assert.equal(read.ready, true);
+  if (read.ready) {
+    assert.equal(read.text.includes("Приёмка & паллет"), true);
+    assert.equal(read.text.includes("&#x26;"), false);
+  }
+});
+
+test("PPTX держит абзацы и порядок показа", () => {
+  const paragraphs = readProjectFile(
+    "абзацы.pptx",
+    zip({ "ppt/slides/slide1.xml": slideXml(["Net", "weight"]) }),
+  );
+  assert.equal(paragraphs.ready, true);
+  if (paragraphs.ready) {
+    assert.equal(paragraphs.text, "Net\nweight");
+  }
+
+  const ordered = readProjectFile(
+    "порядок.pptx",
+    zip({
+      "ppt/slides/slide1.xml": slideXml([PHRASE]),
+      "ppt/slides/slide2.xml": slideXml(["Титул"]),
+      "ppt/presentation.xml": `<?xml version="1.0"?>
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId2"/><p:sldId id="257" r:id="rId1"/></p:sldIdLst></p:presentation>`,
+      "ppt/_rels/presentation.xml.rels": `<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Target="slides/slide2.xml"/></Relationships>`,
+    }),
+  );
+  assert.equal(ordered.ready, true);
+  if (!ordered.ready) {
+    return;
+  }
+  assert.equal(ordered.text, `Титул\n${PHRASE}`);
+  assert.deepEqual(ordered.places, [{ slide: 1 }, { slide: 2 }]);
+});
+
+test("PDF не берёт комментарий и сжатый текст, картинка рядом не гасит страницу", () => {
+  const commented = readProjectFile("комментарий.pdf", pdf(`% (Выдуманный абзац) Tj\nBT (${PHRASE}) Tj ET`));
+  assert.equal(commented.ready, true);
+  if (commented.ready) {
+    assert.equal(commented.text.includes(PHRASE), true);
+    assert.equal(commented.text.includes("Выдуманный абзац"), false);
+  }
+
+  const content = Buffer.from(`BT (${PHRASE}) Tj ET`, "utf8");
+  const compressed = deflateSync(content);
+  const inflated = readProjectFile(
+    "сжатый.pdf",
+    Buffer.concat([
+      Buffer.from(`%PDF-1.4\n1 0 obj\n<< /Filter /FlateDecode /Length ${compressed.length} >>\nstream\n`),
+      compressed,
+      Buffer.from("\nendstream\nendobj\n"),
+    ]),
+  );
+  assert.equal(inflated.ready, true);
+  if (inflated.ready) {
+    assert.equal(inflated.text.includes(PHRASE), true);
+  }
+
+  const page = Buffer.from(`BT (${PHRASE}) Tj ET`, "utf8");
+  const besideImage = readProjectFile(
+    "рядом.pdf",
+    Buffer.concat([
+      Buffer.from("%PDF-1.4\n1 0 obj\n<< /Subtype /Image /Length 4 >>\nstream\nXXXX\nendstream\nendobj\n2 0 obj\n"),
+      Buffer.from(`<< /Length ${page.length} >>\nstream\n`),
+      page,
+      Buffer.from("\nendstream\nendobj\n"),
+    ]),
+  );
+  assert.equal(besideImage.ready, true);
+  if (besideImage.ready) {
+    assert.equal(besideImage.text.includes(PHRASE), true);
+  }
+});
+
+test("номер слайда, который не помещается в хранилище, не записывается", () => {
+  const { trainer, caseId } = start();
+  const saved = trainer.addSourceFile({
+    caseId,
+    name: "слайд.pptx",
+    layer: "material",
+    extractedText: PHRASE,
+    places: [{ slide: 9007199254740992 }, { slide: 2 }],
+  });
+  assert.equal(saved.ok, true);
+  if (saved.ok) {
+    assert.deepEqual(saved.file.places, [{ slide: 2 }]);
+  }
+  assert.deepEqual(trainer.listSourceFiles(caseId)[0]?.places, [{ slide: 2 }]);
+});
+
+function slideXml(paragraphs: readonly string[]): string {
+  const body = paragraphs
+    .map((text) => `<a:p><a:r><a:t>${xmlEscape(text)}</a:t></a:r></a:p>`)
+    .join("");
+  return `<?xml version="1.0"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody>${body}</p:txBody></p:sp></p:spTree></p:cSld></p:sld>`;
+}

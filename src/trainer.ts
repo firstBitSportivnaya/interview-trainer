@@ -1358,7 +1358,7 @@ function keptPlaces(places: readonly SourcePlace[] | undefined): SourcePlace[] {
   }
   const kept: SourcePlace[] = [];
   for (const place of places) {
-    if (Number.isInteger(place.slide) && place.slide >= 1) {
+    if (Number.isSafeInteger(place.slide) && place.slide >= 1) {
       kept.push({ slide: place.slide });
     }
   }
@@ -2131,15 +2131,17 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       if (!caseExists(caseId)) {
         return { ok: false, reason: "missing" };
       }
-      const existing = database
+      const file: UnreadFileRecord = { id: randomUUID(), caseId, name };
+      database
+        .prepare("INSERT OR IGNORE INTO unread_files (id, case_id, name) VALUES (?, ?, ?)")
+        .run(file.id, file.caseId, file.name);
+      const stored = database
         .prepare("SELECT id, case_id, name FROM unread_files WHERE case_id = ? AND name = ?")
         .get(caseId, name) as Row | undefined;
-      if (existing) {
-        return { ok: true, file: readUnreadFileRecord(existing) };
+      if (!stored) {
+        return { ok: false, reason: "missing" };
       }
-      const file: UnreadFileRecord = { id: randomUUID(), caseId, name };
-      database.prepare("INSERT INTO unread_files (id, case_id, name) VALUES (?, ?, ?)").run(file.id, file.caseId, file.name);
-      return { ok: true, file };
+      return { ok: true, file: readUnreadFileRecord(stored) };
     },
 
     /** Возвращает непрочитанные файлы проекта. Нет проекта — списка нет. */
