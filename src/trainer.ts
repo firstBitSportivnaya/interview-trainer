@@ -348,6 +348,9 @@ const FRAGMENT_CHARS = 400;
 /** Фрагмент уточняет вопрос. Фактом досье он не становится. */
 const FRAGMENT_RULE = "Фрагмент уточняет вопрос и не произносится как факт.";
 
+/** Досье число не называет, а фрагменты одного слоя называют разные. Ни одно не факт. */
+const DISPUTED_NUMBERS_RULE = "Фрагменты называют разные числа. Ни одно из этих чисел не произноси как факт.";
+
 const PLAINTEXT_VACUUM = "plaintext-vacuum";
 const LEGACY_KEYS = "keys.json";
 /** Снимок keys.json, уже снятый с пути, куда пишет прежний процесс. */
@@ -855,11 +858,182 @@ function layerOpenToSide(side: Side, layer: DossierLayerName): boolean {
   return side === "внутренняя команда" && layer === "serviceLayer";
 }
 
-function fragmentLines(fragments: readonly string[]): string[] {
+/**
+ * Утверждение о предмете: ограничения нет, ограничение есть или названо максимальное число.
+ * Единица хранится как слово. 500 кг и 500 т — разные числа. 1000 кг в 1 т не переводится.
+ */
+type MatterClaim =
+  | { matter: string; kind: "absent" | "present" }
+  | { matter: string; kind: "number"; value: number; unit: string };
+
+function sentences(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])\s+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 0);
+}
+
+/** Падежи слова «вес». «весы», «весь» и «весовой» — другие слова. */
+const WEIGHT_FORMS = new Set(["вес", "веса", "весу", "весом", "весе", "весов"]);
+
+function matterKey(word: string): string {
+  const folded = word.toLocaleLowerCase("ru");
+  if (WEIGHT_FORMS.has(folded)) {
+    return "вес";
+  }
+  return folded;
+}
+
+/** Один предмет: то же слово или две формы «вес». */
+function sameMatter(left: string, right: string): boolean {
+  return matterKey(left) === matterKey(right);
+}
+
+function pushRestrictions(claims: MatterClaim[], folded: string, pattern: RegExp, kind: "absent" | "present"): void {
+  for (const match of folded.matchAll(pattern)) {
+    const matter = match[1];
+    if (matter) {
+      claims.push({ matter, kind });
+    }
+  }
+}
+
+/** Снимает все ограничения предложения и максимальные числа с дробью. Другой спор текст не выдумывает. */
+function claimsIn(text: string): MatterClaim[] {
+  const claims: MatterClaim[] = [];
+  for (const sentence of sentences(text)) {
+    const folded = sentence.toLocaleLowerCase("ru");
+    pushRestrictions(claims, folded, /ограничени[а-яё]*\s+по\s+([а-яё]{3,})\s+нет(?![а-яё])/gu, "absent");
+    pushRestrictions(claims, folded, /нет(?![а-яё])\s+ограничени[а-яё]*\s+по\s+([а-яё]{3,})/gu, "absent");
+    pushRestrictions(claims, folded, /ограничени[а-яё]*\s+по\s+([а-яё]{3,})\s+есть(?![а-яё])/gu, "present");
+    pushRestrictions(claims, folded, /есть(?![а-яё])\s+ограничени[а-яё]*\s+по\s+([а-яё]{3,})/gu, "present");
+    for (const match of folded.matchAll(/максимальн[а-яё]*\s+([а-яё]{3,})\s+(\d+(?:[.,]\d+)?)(?:\s+([а-яё]{1,12}))?/gu)) {
+      const matter = match[1];
+      const raw = match[2];
+      if (!matter || !raw) {
+        continue;
+      }
+      const value = Number(raw.replace(",", "."));
+      if (!Number.isFinite(value)) {
+        continue;
+      }
+      claims.push({ matter, kind: "number", value, unit: match[3] ?? "" });
+    }
+  }
+  return claims;
+}
+
+/** Отрицание спорит с наличием и с числом. Два разных числа спорят между собой. Одинаковые — нет. */
+function claimsConflict(left: MatterClaim, right: MatterClaim): boolean {
+  if (!sameMatter(left.matter, right.matter)) {
+    return false;
+  }
+  if (left.kind === "number" && right.kind === "number") {
+    if (left.value !== right.value) {
+      return true;
+    }
+    return left.unit !== "" && right.unit !== "" && left.unit !== right.unit;
+  }
+  return (left.kind === "absent") !== (right.kind === "absent");
+}
+
+function layerClaims(dossier: DossierRecord, layer: "material" | "serviceLayer"): MatterClaim[] {
+  return claimsIn(layer === "material" ? dossier.material : dossier.serviceLayer);
+}
+
+/** Фрагмент спорит с досье своего слоя и персонажу не отдаётся. */
+function contradictsLayer(body: string, approved: readonly MatterClaim[]): boolean {
+  return claimsIn(body).some((claim) => approved.some((item) => claimsConflict(claim, item)));
+}
+
+type TurnFragments = {
+  bodies: readonly string[];
+  numbersDisputed: boolean;
+};
+
+const EMPTY_TURN_FRAGMENTS: TurnFragments = { bodies: [], numbersDisputed: false };
+
+type OpenFragment = {
+  layer: "material" | "serviceLayer";
+  body: string;
+  index: number;
+};
+
+/** Разные величины или разные названные единицы. Пустая единица с «кг» не спорит. */
+function quantitiesDiffer(left: MatterClaim & { kind: "number" }, right: MatterClaim & { kind: "number" }): boolean {
+  if (left.value !== right.value) {
+    return true;
+  }
+  return left.unit !== "" && right.unit !== "" && left.unit !== right.unit;
+}
+
+/**
+ * Оставляет оба числа, если досье своё число не назвало.
+ * Второе число входит и при нулевой близости, если первое уже в ходе.
+ */
+function keepDisputedNumbers(
+  ranked: readonly OpenFragment[],
+  visible: readonly OpenFragment[],
+  claimsByLayer: { material: readonly MatterClaim[]; serviceLayer: readonly MatterClaim[] },
+): TurnFragments {
+  const selected = ranked.slice(0, FRAGMENT_LIMIT);
+  const chosen = new Set(selected.map((item) => item.index));
+  const extra: OpenFragment[] = [];
+  let numbersDisputed = false;
+  for (const layer of ["material", "serviceLayer"] as const) {
+    const numbered = visible
+      .filter((item) => item.layer === layer)
+      .flatMap((item) =>
+        claimsIn(item.body)
+          .filter((claim): claim is Extract<MatterClaim, { kind: "number" }> => claim.kind === "number")
+          .map((claim) => ({ item, claim })),
+      );
+    const matters: string[] = [];
+    for (const entry of numbered) {
+      if (!matters.some((matter) => sameMatter(matter, entry.claim.matter))) {
+        matters.push(entry.claim.matter);
+      }
+    }
+    for (const matter of matters) {
+      const dossierNamesNumber = claimsByLayer[layer].some(
+        (claim) => claim.kind === "number" && sameMatter(claim.matter, matter),
+      );
+      if (dossierNamesNumber) {
+        continue;
+      }
+      const group = numbered.filter((entry) => sameMatter(entry.claim.matter, matter));
+      const differs = group.some((left, index) =>
+        group.slice(index + 1).some((right) => quantitiesDiffer(left.claim, right.claim)),
+      );
+      if (!differs || !group.some((entry) => chosen.has(entry.item.index))) {
+        continue;
+      }
+      numbersDisputed = true;
+      for (const entry of group) {
+        if (chosen.has(entry.item.index)) {
+          continue;
+        }
+        chosen.add(entry.item.index);
+        extra.push(entry.item);
+      }
+    }
+  }
+  return {
+    bodies: [...selected, ...extra].map((item) => item.body),
+    numbersDisputed,
+  };
+}
+
+function fragmentLines(fragments: readonly string[], numbersDisputed: boolean): string[] {
   if (fragments.length === 0) {
     return [];
   }
-  return [FRAGMENT_RULE, "", "Фрагмент:", fragments.join("\n\n"), ""];
+  const lines = [FRAGMENT_RULE];
+  if (numbersDisputed) {
+    lines.push(DISPUTED_NUMBERS_RULE);
+  }
+  lines.push("", "Фрагмент:", fragments.join("\n\n"), "");
+  return lines;
 }
 
 function readStoredVector(raw: string): number[] | undefined {
@@ -889,6 +1063,7 @@ function customerPrompt(input: {
   notes: readonly string[];
   history: readonly TranscriptLine[];
   fragments: readonly string[];
+  numbersDisputed: boolean;
   profile?: OwnerProfile;
   task: string;
 }): string {
@@ -921,7 +1096,7 @@ function customerPrompt(input: {
     );
   }
   lines.push("Материал проекта:", input.material, "", "Стенограмма:", historyText(input.history), "");
-  lines.push(...fragmentLines(input.fragments), input.task);
+  lines.push(...fragmentLines(input.fragments, input.numbersDisputed), input.task);
   return lines.join("\n");
 }
 
@@ -937,6 +1112,7 @@ function internalPrompt(input: {
   notes: readonly string[];
   history: readonly TranscriptLine[];
   fragments: readonly string[];
+  numbersDisputed: boolean;
   task: string;
 }): string {
   return [
@@ -959,7 +1135,7 @@ function internalPrompt(input: {
     "Стенограмма:",
     historyText(input.history),
     "",
-    ...fragmentLines(input.fragments),
+    ...fragmentLines(input.fragments, input.numbersDisputed),
     input.task,
   ].join("\n");
 }
@@ -2056,22 +2232,43 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
   /**
    * Близкие фрагменты снимка сессии.
    * Запрос — текст этого хода. Чужой проект в снимок не входит. Закрытый стороне слой из выдачи выпадает.
+   * Фрагмент, который спорит с досье своего слоя, в ход не входит.
+   * Два разных числа при молчании досье остаются оба.
    */
-  async function fragmentsForTurn(session: SessionRecord, task: string): Promise<string[]> {
+  async function fragmentsForTurn(session: SessionRecord, task: string): Promise<TurnFragments> {
     if (!embeddings) {
-      return [];
+      return EMPTY_TURN_FRAGMENTS;
     }
     await ensureFragmentIndex(session.id);
     const query = await embeddings.embed(task, "query");
     if (!usableVector(query)) {
-      return [];
+      return EMPTY_TURN_FRAGMENTS;
     }
-    return loadFragmentRows(session.id)
+    const dossier = loadDossier(session.dossierId);
+    const claimsByLayer = {
+      material: dossier ? layerClaims(dossier, "material") : [],
+      serviceLayer: dossier ? layerClaims(dossier, "serviceLayer") : [],
+    };
+    const ranked: OpenFragment[] = [];
+    const visible: OpenFragment[] = [];
+    for (const item of loadFragmentRows(session.id)
       .map((fragment, index) => ({ fragment, index, score: cosine(query, fragment.vector) }))
-      .filter((item) => item.score > 0 && layerOpenToSide(session.side, item.fragment.layer))
-      .sort((left, right) => right.score - left.score || left.index - right.index)
-      .slice(0, FRAGMENT_LIMIT)
-      .map((item) => item.fragment.body);
+      .filter((item) => layerOpenToSide(session.side, item.fragment.layer))
+      .sort((left, right) => right.score - left.score || left.index - right.index)) {
+      const layer = item.fragment.layer;
+      if (layer !== "material" && layer !== "serviceLayer") {
+        continue;
+      }
+      if (contradictsLayer(item.fragment.body, claimsByLayer[layer])) {
+        continue;
+      }
+      const open = { layer, body: item.fragment.body, index: item.index };
+      visible.push(open);
+      if (item.score > 0) {
+        ranked.push(open);
+      }
+    }
+    return keepDisputedNumbers(ranked, visible, claimsByLayer);
   }
 
   /**
@@ -2083,7 +2280,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
   function characterTask(
     session: SessionRecord,
     task: string,
-    fragments: readonly string[],
+    turn: TurnFragments,
   ): { ok: true; text: string } | { ok: false } {
     const dossier = loadDossier(session.dossierId);
     const caseRow = database.prepare(`${caseQuery} WHERE cases.id = ?`).get(session.caseId) as Row | undefined;
@@ -2104,7 +2301,8 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
           serviceLayer: dossier.serviceLayer,
           notes: log ? [log] : [],
           history,
-          fragments,
+          fragments: turn.bodies,
+          numbersDisputed: turn.numbersDisputed,
           task,
         }),
       };
@@ -2119,7 +2317,8 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         material: dossier.material,
         notes: behavior ? [behavior] : [],
         history,
-        fragments,
+        fragments: turn.bodies,
+        numbersDisputed: turn.numbersDisputed,
         profile: caseRecord.portfolioSent ? loadProfile(session.executorId) : undefined,
         task,
       }),
