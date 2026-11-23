@@ -18,6 +18,14 @@ const OTHER = "маркер чужого проекта касса";
 const LATE = "новый файл после открытия сессии";
 const SERVICE_FRAGMENT = "внутренний лимит смены двенадцать";
 const WITHHOLD = "не произносится как факт";
+const NO_LIMIT = "Ограничения по весу нет.";
+const LIMIT_EXISTS = "Ограничение по весу есть.";
+const WEIGHT_500 = "Максимальный вес 500 кг.";
+const WEIGHT_800 = "Максимальный вес 800 кг.";
+const WEIGHT_1200 = "Максимальный вес 1200 кг.";
+const NEITHER_NUMBER = "Ни одно из этих чисел не произноси как факт.";
+const LIMIT_WITH_CAVEAT = "Ограничение по весу есть, исключений нет.";
+const NOT_WEIGHT = "Максимальный весь 500 кг.";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -41,7 +49,13 @@ function scriptedEmbeddings(): EmbeddingPort {
         text.includes(CRIB_FILE) ||
         text.includes(OTHER) ||
         text.includes(LATE) ||
-        text.includes(SERVICE_FRAGMENT);
+        text.includes(SERVICE_FRAGMENT) ||
+        text.includes(NO_LIMIT) ||
+        text.includes(WEIGHT_500) ||
+        text.includes(WEIGHT_800) ||
+        text.includes(WEIGHT_1200) ||
+        text.includes(LIMIT_WITH_CAVEAT) ||
+        text.includes(NOT_WEIGHT);
       return close ? [1, 0] : [0, 1];
     },
   };
@@ -92,7 +106,11 @@ const keyDraft = {
   secret: "sk-ant-api03-secret-WXYZ",
 };
 
-function prepare(trainer: ReturnType<typeof openTrainer>, title = "Внедрение склада") {
+function prepare(
+  trainer: ReturnType<typeof openTrainer>,
+  title = "Внедрение склада",
+  material = DOSSIER_FACT,
+) {
   assert.deepEqual(trainer.saveKey(keyDraft), { ok: true });
   const keyId = trainer.listKeys()[0]?.id;
   assert.ok(keyId);
@@ -100,12 +118,21 @@ function prepare(trainer: ReturnType<typeof openTrainer>, title = "Внедре�
   assert.ok(saved.ok);
   const approved = trainer.approveDossier({
     caseId: saved.caseRecord.id,
-    material: DOSSIER_FACT,
+    material,
     serviceLayer: DOSSIER_SERVICE,
     crib: DOSSIER_CRIB,
   });
   assert.ok(approved.ok);
   return { keyId, caseId: saved.caseRecord.id, customerId: saved.caseRecord.customerId, dossierId: approved.dossier.id };
+}
+
+function materialSection(prompt: string): string {
+  const start = prompt.indexOf("Материал проекта:\n");
+  const end = prompt.indexOf("\nСтенограмма:");
+  if (start < 0 || end <= start) {
+    return "";
+  }
+  return prompt.slice(start, end);
 }
 
 function addFile(
@@ -235,4 +262,113 @@ test("внутренняя команда получает фрагмент ма
   assert.equal(prompt.includes(WITHHOLD), true);
   assert.equal(prompt.includes(CRIB_FILE), false);
   assert.equal(prompt.includes(DOSSIER_CRIB), false);
+});
+
+test("фрагмент, который отрицает ограничение по весу, не входит, если досье говорит, что оно есть", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start(calls);
+  const prepared = prepare(trainer, "Внедрение склада", LIMIT_EXISTS);
+  addFile(trainer, prepared.caseId, "weight.txt", "material", `${NO_LIMIT}\n\n${PALLET}.`);
+
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(NO_LIMIT), false);
+  assert.equal(prompt.includes(LIMIT_EXISTS), true);
+  assert.equal(prompt.includes(PALLET), true);
+});
+
+test("фрагмент с другим максимальным весом, чем досье того же слоя, во вход не входит", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start(calls);
+  const prepared = prepare(trainer, "Внедрение склада", WEIGHT_800);
+  addFile(trainer, prepared.caseId, "weight.txt", "material", `${WEIGHT_500}\n\n${PALLET}.`);
+
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes("500"), false);
+  assert.equal(prompt.includes("800"), true);
+  assert.equal(prompt.includes(PALLET), true);
+  assert.equal(prompt.includes(NEITHER_NUMBER), false);
+});
+
+test("два разных максимальных веса остаются во входе, и ни одно не произносится как факт", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start(calls);
+  const prepared = prepare(trainer);
+  addFile(trainer, prepared.caseId, "light.txt", "material", WEIGHT_500);
+  addFile(trainer, prepared.caseId, "heavy.txt", "material", WEIGHT_1200);
+  const dossier = trainer.readApprovedDossier(prepared.caseId);
+  assert.ok(dossier);
+  assert.equal(dossier.material.includes("вес"), false);
+
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.reply(openedSession.session.id, "Задай вопрос про максимальный вес."));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  const material = materialSection(prompt);
+  assert.equal(prompt.includes("500"), true);
+  assert.equal(prompt.includes("1200"), true);
+  assert.equal(prompt.includes(NEITHER_NUMBER), true);
+  assert.equal(material.includes("500"), false);
+  assert.equal(material.includes("1200"), false);
+  assert.equal(prompt.includes("777"), false);
+});
+
+test("один вес при молчании досье может попасть во вход и не произносится как факт", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start(calls);
+  const prepared = prepare(trainer);
+  addFile(trainer, prepared.caseId, "light.txt", "material", WEIGHT_500);
+  addFile(trainer, prepared.caseId, "term.txt", "material", DISTANT);
+
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.reply(openedSession.session.id, "Задай вопрос про максимальный вес."));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  const material = materialSection(prompt);
+  assert.equal(prompt.includes(WEIGHT_500), true);
+  assert.equal(prompt.includes(WITHHOLD), true);
+  assert.equal(prompt.includes(NEITHER_NUMBER), false);
+  assert.equal(prompt.includes(DISTANT), false);
+  assert.equal(material.includes("500"), false);
+});
+
+test("оговорка «исключений нет» не отменяет названное ограничение", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start(calls);
+  const prepared = prepare(trainer, "Внедрение склада", LIMIT_EXISTS);
+  addFile(trainer, prepared.caseId, "caveat.txt", "material", LIMIT_WITH_CAVEAT);
+
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(LIMIT_WITH_CAVEAT), true);
+  assert.equal(prompt.includes(NEITHER_NUMBER), false);
+});
+
+test("слово «весь» не спорит с максимальным весом", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start(calls);
+  const prepared = prepare(trainer);
+  addFile(trainer, prepared.caseId, "all.txt", "material", NOT_WEIGHT);
+  addFile(trainer, prepared.caseId, "heavy.txt", "material", WEIGHT_1200);
+
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.reply(openedSession.session.id, "Задай вопрос про максимальный вес."));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(NOT_WEIGHT), true);
+  assert.equal(prompt.includes(WEIGHT_1200), true);
+  assert.equal(prompt.includes(NEITHER_NUMBER), false);
 });
