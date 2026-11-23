@@ -185,17 +185,37 @@ test("следующая сессия читает ход и не получае
 });
 
 test("пробел закрывает поздний разбор, сигнал и расхождение остаются", async () => {
-  const trainer = start(
-    recorded(
-      [],
-      [
-        reviewText({ gaps: [GAP], watch: [WATCH], divergence: ["Склад назван закрытым."] }),
-        reviewText({ covered: [GAP, WATCH, "Склад назван закрытым."] }),
-      ],
-    ),
-  );
+  const reviews: string[] = [
+    reviewText({ gaps: [GAP], watch: [WATCH], divergence: ["Склад назван закрытым."] }),
+  ];
+  const trainer = start({
+    async *complete(call) {
+      const text = call.messages[0]?.text ?? "";
+      if (!text.includes("Разбери законченную сессию")) {
+        yield "Склад принимает паллеты.";
+        return;
+      }
+      const next = reviews.shift();
+      if (next) {
+        yield next;
+        return;
+      }
+      const gapId = text.match(/Открытые пробелы:\n([0-9a-f-]+):/)?.[1];
+      const watchId = text.match(/([0-9a-f-]{36})/)?.[1];
+      if (!reviews.length && gapId && text.includes("Срок назван.")) {
+        yield reviewText({ covered: ["Назвать срок внедрения.", gapId, watchId ?? ""] });
+        return;
+      }
+      yield reviewText({ covered: ["Назвать срок внедрения."] });
+    },
+  });
   const prepared = prepare(trainer);
   await rehearse(trainer, prepared, "аналитик", "заказчик", "Срок не назван.");
+  await rehearse(trainer, prepared, "аналитик", "заказчик", "Другая формулировка.");
+  assert.equal(
+    trainer.readPreparationEntries(prepared.caseId, "аналитик", "владелец").find((entry) => entry.kind === "gap")?.status,
+    "open",
+  );
   await rehearse(trainer, prepared, "аналитик", "заказчик", "Срок назван.");
 
   const entries = trainer.readPreparationEntries(prepared.caseId, "аналитик", "владелец");
@@ -335,6 +355,74 @@ test("правка входит в досье только после приём
   assert.equal(modelCalls, callsAfterReview);
   assert.deepEqual(trainer.acceptProposal(material.id), { ok: false, reason: "kind" });
   assert.deepEqual(trainer.acceptProposal("нет-такой-записи"), { ok: false, reason: "missing" });
+});
+
+test("линия заказчика теряет отдельное предложение служебного слоя и после приёмки", async () => {
+  const privateSentence = "Внутренняя оценка сроков секретна.";
+  const proposal = "ПРАВКА-СЛУЖЕБНОГО: не называть маржу вслух.";
+  const calls: ModelCall[] = [];
+  const trainer = start({
+    async *complete(call) {
+      calls.push({
+        protocol: call.protocol,
+        baseAddress: call.baseAddress,
+        modelName: call.modelName,
+        secret: call.secret,
+        messages: call.messages.map((message) => ({ role: message.role, text: message.text })),
+      });
+      const text = call.messages[0]?.text ?? "";
+      if (text.includes("Разбери законченную сессию")) {
+        yield reviewText({
+          line: `Давить на срок. ${privateSentence} ${proposal}`,
+          proposals: [{ layer: "serviceLayer", text: proposal }],
+        });
+        return;
+      }
+      yield "Склад принимает паллеты.";
+    },
+  });
+  assert.deepEqual(trainer.saveKey(keyDraft), { ok: true });
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const savedCase = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+  assert.ok(savedCase.ok);
+  const approved = trainer.approveDossier({
+    caseId: savedCase.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: `Маржа подрядчика 12%. ${privateSentence}`,
+    crib: GAP,
+  });
+  assert.ok(approved.ok);
+  const prepared = { keyId, caseId: savedCase.caseRecord.id, dossierId: approved.dossier.id };
+  await rehearse(trainer, prepared, "аналитик", "заказчик", "Срок не назван.");
+
+  const open = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: prepared.dossierId,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  assert.ok(open.ok);
+  await take(trainer.openingQuestion(open.session.id));
+  const opening = calls.at(-1)?.messages[0]?.text ?? "";
+  assert.equal(opening.includes("Давить на срок."), true);
+  assert.equal(opening.includes(privateSentence), false);
+  assert.equal(opening.includes(proposal), false);
+
+  const entry = trainer
+    .readPreparationEntries(prepared.caseId, "аналитик", "владелец")
+    .find((item) => item.kind === "proposal");
+  assert.ok(entry);
+  assert.equal(trainer.acceptProposal(entry.id).ok, true);
+  await take(trainer.reply(open.session.id, "Какой срок?"));
+  const later = calls.at(-1)?.messages[0]?.text ?? "";
+  assert.equal(later.includes(privateSentence), false);
+  assert.equal(later.includes(proposal), false);
+  assert.equal(later.includes("Давить на срок."), true);
+  assert.equal(trainer.readSession(open.session.id)?.dossierId, prepared.dossierId);
 });
 
 test("разбор без блока хода и сбой разбора ход не меняют", async () => {

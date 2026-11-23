@@ -753,7 +753,8 @@ function heldFileText(files: readonly { name: string; layer: DossierLayerName; t
 
 /**
  * Задание на разбор.
- * Досье и тексты файлов — те, с которыми открыта сессия. Ход подготовки сюда не входит.
+ * Досье и тексты файлов — те, с которыми открыта сессия.
+ * Из хода сюда входят только открытые пробелы и их идентификаторы.
  * Числовой оценки разбор не ставит.
  */
 function reviewPrompt(input: {
@@ -762,7 +763,9 @@ function reviewPrompt(input: {
   crib: string;
   files: readonly { name: string; layer: DossierLayerName; text: string }[];
   history: readonly TranscriptLine[];
+  gaps: readonly { id: string; text: string }[];
 }): string {
+  const openGaps = input.gaps.length === 0 ? "нет" : input.gaps.map((gap) => `${gap.id}: ${gap.text}`).join("\n");
   return [
     "Разбери законченную сессию.",
     "Числовой оценки не ставь.",
@@ -771,10 +774,13 @@ function reviewPrompt(input: {
     "Отметь, где речь разошлась с текстом файла проекта.",
     "Назови вопросы шпаргалки проекта, которые не прозвучали.",
     "В конце, с новой строки, напиши маркер ХОД и следом один JSON-объект.",
-    "Поля JSON: gaps, covered, watch, divergence — массивы строк; line — строка линии поведения без текста служебного слоя; proposals — массив объектов с полями layer и text.",
+    "Поля JSON: gaps, watch, divergence — массивы строк; covered — массив идентификаторов открытых пробелов; line — строка линии поведения без текста служебного слоя; proposals — массив объектов с полями layer и text.",
     "layer в proposals — только material или serviceLayer. text — дополнение этого слоя, не замена всего досье.",
-    "covered называет пробел, который в этой сессии прозвучал. Сигнал следить и расхождение сами не снимаются.",
+    "В covered ставь идентификатор пробела, который в этой сессии прозвучал. Своя формулировка пробел не закрывает. Сигнал следить и расхождение сами не снимаются.",
     "Числовой оценки нет и в JSON.",
+    "",
+    "Открытые пробелы:",
+    openGaps,
     "",
     "Досье, с которым открыта сессия:",
     "Материал проекта:",
@@ -882,32 +888,62 @@ function splitReview(text: string): { prose: string; facts?: ReviewFacts } {
   return { prose: text.slice(0, at).trim(), facts };
 }
 
-/** Убирает из линии текст служебного слоя и открытые служебные записи. */
-function behaviorLine(notes: readonly string[], entries: readonly PreparationEntry[], serviceLayer: string): string {
-  const hidden = [serviceLayer.trim()];
-  for (const entry of entries) {
-    if (entry.status !== "open") {
-      continue;
+/** Режет текст на предложения. Короткий обрывок из линии не вырезается. */
+function servicePieces(text: string): string[] {
+  return text
+    .split(/\n+|(?<=[.!?])\s+/)
+    .map((part) => part.trim())
+    .filter((part) => part.length >= 8);
+}
+
+/**
+ * Тексты, которых не должно быть в линии заказчика.
+ * Статус записи не открывает служебный текст: снятый сигнал и принятая правка остаются скрытыми.
+ */
+function hiddenServiceTexts(serviceLayer: string, entries: readonly PreparationEntry[]): string[] {
+  const hidden = new Set<string>();
+  const add = (value: string): void => {
+    const text = value.trim();
+    if (text) {
+      hidden.add(text);
     }
+    for (const piece of servicePieces(value)) {
+      hidden.add(piece);
+    }
+  };
+  add(serviceLayer);
+  for (const entry of entries) {
     if (entry.kind === "watch" || (entry.kind === "proposal" && entry.layer === "serviceLayer")) {
-      const body = entry.text.trim();
-      if (body) {
-        hidden.push(body);
-      }
+      add(entry.text);
     }
   }
-  const parts = [...notes];
+  return [...hidden].sort((left, right) => right.length - left.length);
+}
+
+/** Вырезает служебные тексты. Обычная линия поведения остаётся. */
+function withoutServiceText(text: string, secrets: readonly string[]): string {
+  let next = text;
+  for (const secret of secrets) {
+    next = next.split(secret).join("");
+  }
+  return next.trim();
+}
+
+/** Убирает из линии текст служебного слоя и служебные записи любого статуса. */
+function behaviorLine(notes: readonly string[], entries: readonly PreparationEntry[], serviceLayer: string): string {
+  const secrets = hiddenServiceTexts(serviceLayer, entries);
+  const parts: string[] = [];
+  for (const note of notes) {
+    const text = withoutServiceText(note, secrets);
+    if (text) {
+      parts.push(text);
+    }
+  }
   for (const entry of entries) {
     if (entry.status !== "open" || entry.kind !== "line") {
       continue;
     }
-    let text = entry.text;
-    for (const secret of hidden) {
-      if (secret) {
-        text = text.split(secret).join("");
-      }
-    }
-    text = text.trim();
+    const text = withoutServiceText(entry.text, secrets);
     if (text) {
       parts.push(text);
     }
@@ -1600,15 +1636,24 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     return row ? readPreparationEntry(row) : undefined;
   }
 
-  /** Дописывает ход тройки из фактов разбора. Пробел из covered закрывается. Сигнал и расхождение нет. */
+  /** Дописывает ход тройки из фактов разбора. Пробел закрывается по идентификатору. Сигнал и расхождение нет. */
   function applyReviewFacts(session: SessionRecord, facts: ReviewFacts): void {
-    const covered = new Set(facts.covered);
+    const coveredBodies = new Set<string>();
+    const findGap = database.prepare(
+      `SELECT body FROM preparation_entries
+       WHERE id = ? AND case_id = ? AND role = ? AND executor_id = ? AND kind = 'gap' AND status = 'open'`,
+    );
     const closeGap = database.prepare(
       `UPDATE preparation_entries SET status = 'closed'
-       WHERE case_id = ? AND role = ? AND executor_id = ? AND kind = 'gap' AND status = 'open' AND body = ?`,
+       WHERE id = ? AND case_id = ? AND role = ? AND executor_id = ? AND kind = 'gap' AND status = 'open'`,
     );
-    for (const item of covered) {
-      closeGap.run(session.caseId, session.role, session.executorId, item);
+    for (const id of facts.covered) {
+      const row = findGap.get(id, session.caseId, session.role, session.executorId) as Row | undefined;
+      if (!row) {
+        continue;
+      }
+      coveredBodies.add(textColumn(row, "body"));
+      closeGap.run(id, session.caseId, session.role, session.executorId);
     }
     const insert = database.prepare(
       `INSERT INTO preparation_entries (
@@ -1621,7 +1666,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
          AND ((? IS NULL AND layer IS NULL) OR layer = ?)`,
     );
     const add = (kind: PreparationKind, body: string, layer: "material" | "serviceLayer" | null): void => {
-      if (kind === "gap" && covered.has(body)) {
+      if (kind === "gap" && coveredBodies.has(body)) {
         return;
       }
       if (kind !== "line" && sameOpen.get(session.caseId, session.role, session.executorId, kind, body, layer, layer)) {
@@ -2119,6 +2164,9 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
                 crib: dossier.crib,
                 files: loadHeldFiles(session.id),
                 history: readTranscriptRows(session.id),
+                gaps: loadPreparationEntries(session.caseId, session.role, session.executorId)
+                  .filter((entry) => entry.kind === "gap" && entry.status === "open")
+                  .map((entry) => ({ id: entry.id, text: entry.text })),
               }),
             },
           ],
