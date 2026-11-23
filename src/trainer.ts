@@ -858,10 +858,13 @@ function layerOpenToSide(side: Side, layer: DossierLayerName): boolean {
   return side === "внутренняя команда" && layer === "serviceLayer";
 }
 
-/** Утверждение о предмете: ограничения нет, ограничение есть или названо максимальное число. */
+/**
+ * Утверждение о предмете: ограничения нет, ограничение есть или названо максимальное число.
+ * Единица хранится как слово. 500 кг и 500 т — разные числа. 1000 кг в 1 т не переводится.
+ */
 type MatterClaim =
   | { matter: string; kind: "absent" | "present" }
-  | { matter: string; kind: "number"; value: number };
+  | { matter: string; kind: "number"; value: number; unit: string };
 
 function sentences(text: string): string[] {
   return text
@@ -886,29 +889,35 @@ function sameMatter(left: string, right: string): boolean {
   return matterKey(left) === matterKey(right);
 }
 
-/** Снимает утверждения об ограничении и о максимальном числе. Другой спор текст не выдумывает. */
+function pushRestrictions(claims: MatterClaim[], folded: string, pattern: RegExp, kind: "absent" | "present"): void {
+  for (const match of folded.matchAll(pattern)) {
+    const matter = match[1];
+    if (matter) {
+      claims.push({ matter, kind });
+    }
+  }
+}
+
+/** Снимает все ограничения предложения и максимальные числа с дробью. Другой спор текст не выдумывает. */
 function claimsIn(text: string): MatterClaim[] {
   const claims: MatterClaim[] = [];
   for (const sentence of sentences(text)) {
     const folded = sentence.toLocaleLowerCase("ru");
-    const absent =
-      folded.match(/ограничени[а-яё]*\s+по\s+([а-яё]{3,})\s+нет(?![а-яё])/u) ??
-      folded.match(/нет(?![а-яё])\s+ограничени[а-яё]*\s+по\s+([а-яё]{3,})/u);
-    const present =
-      folded.match(/ограничени[а-яё]*\s+по\s+([а-яё]{3,})\s+есть(?![а-яё])/u) ??
-      folded.match(/есть(?![а-яё])\s+ограничени[а-яё]*\s+по\s+([а-яё]{3,})/u);
-    if (absent?.[1]) {
-      claims.push({ matter: absent[1], kind: "absent" });
-    }
-    if (present?.[1]) {
-      claims.push({ matter: present[1], kind: "present" });
-    }
-    for (const match of folded.matchAll(/максимальн[а-яё]*\s+([а-яё]{3,})\s+(\d+)/gu)) {
+    pushRestrictions(claims, folded, /ограничени[а-яё]*\s+по\s+([а-яё]{3,})\s+нет(?![а-яё])/gu, "absent");
+    pushRestrictions(claims, folded, /нет(?![а-яё])\s+ограничени[а-яё]*\s+по\s+([а-яё]{3,})/gu, "absent");
+    pushRestrictions(claims, folded, /ограничени[а-яё]*\s+по\s+([а-яё]{3,})\s+есть(?![а-яё])/gu, "present");
+    pushRestrictions(claims, folded, /есть(?![а-яё])\s+ограничени[а-яё]*\s+по\s+([а-яё]{3,})/gu, "present");
+    for (const match of folded.matchAll(/максимальн[а-яё]*\s+([а-яё]{3,})\s+(\d+(?:[.,]\d+)?)(?:\s+([а-яё]{1,12}))?/gu)) {
       const matter = match[1];
-      const value = Number(match[2]);
-      if (matter && Number.isInteger(value)) {
-        claims.push({ matter, kind: "number", value });
+      const raw = match[2];
+      if (!matter || !raw) {
+        continue;
       }
+      const value = Number(raw.replace(",", "."));
+      if (!Number.isFinite(value)) {
+        continue;
+      }
+      claims.push({ matter, kind: "number", value, unit: match[3] ?? "" });
     }
   }
   return claims;
@@ -920,7 +929,10 @@ function claimsConflict(left: MatterClaim, right: MatterClaim): boolean {
     return false;
   }
   if (left.kind === "number" && right.kind === "number") {
-    return left.value !== right.value;
+    if (left.value !== right.value) {
+      return true;
+    }
+    return left.unit !== "" && right.unit !== "" && left.unit !== right.unit;
   }
   return (left.kind === "absent") !== (right.kind === "absent");
 }
@@ -947,12 +959,21 @@ type OpenFragment = {
   index: number;
 };
 
+/** Разные величины или разные названные единицы. Пустая единица с «кг» не спорит. */
+function quantitiesDiffer(left: MatterClaim & { kind: "number" }, right: MatterClaim & { kind: "number" }): boolean {
+  if (left.value !== right.value) {
+    return true;
+  }
+  return left.unit !== "" && right.unit !== "" && left.unit !== right.unit;
+}
+
 /**
  * Оставляет оба числа, если досье своё число не назвало.
- * Фраза про спор добавляется, только когда чисел больше одного.
+ * Второе число входит и при нулевой близости, если первое уже в ходе.
  */
 function keepDisputedNumbers(
   ranked: readonly OpenFragment[],
+  visible: readonly OpenFragment[],
   claimsByLayer: { material: readonly MatterClaim[]; serviceLayer: readonly MatterClaim[] },
 ): TurnFragments {
   const selected = ranked.slice(0, FRAGMENT_LIMIT);
@@ -960,7 +981,7 @@ function keepDisputedNumbers(
   const extra: OpenFragment[] = [];
   let numbersDisputed = false;
   for (const layer of ["material", "serviceLayer"] as const) {
-    const numbered = ranked
+    const numbered = visible
       .filter((item) => item.layer === layer)
       .flatMap((item) =>
         claimsIn(item.body)
@@ -981,8 +1002,10 @@ function keepDisputedNumbers(
         continue;
       }
       const group = numbered.filter((entry) => sameMatter(entry.claim.matter, matter));
-      const values = new Set(group.map((entry) => entry.claim.value));
-      if (values.size < 2 || !group.some((entry) => chosen.has(entry.item.index))) {
+      const differs = group.some((left, index) =>
+        group.slice(index + 1).some((right) => quantitiesDiffer(left.claim, right.claim)),
+      );
+      if (!differs || !group.some((entry) => chosen.has(entry.item.index))) {
         continue;
       }
       numbersDisputed = true;
@@ -2227,9 +2250,10 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       serviceLayer: dossier ? layerClaims(dossier, "serviceLayer") : [],
     };
     const ranked: OpenFragment[] = [];
+    const visible: OpenFragment[] = [];
     for (const item of loadFragmentRows(session.id)
       .map((fragment, index) => ({ fragment, index, score: cosine(query, fragment.vector) }))
-      .filter((item) => item.score > 0 && layerOpenToSide(session.side, item.fragment.layer))
+      .filter((item) => layerOpenToSide(session.side, item.fragment.layer))
       .sort((left, right) => right.score - left.score || left.index - right.index)) {
       const layer = item.fragment.layer;
       if (layer !== "material" && layer !== "serviceLayer") {
@@ -2238,9 +2262,13 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       if (contradictsLayer(item.fragment.body, claimsByLayer[layer])) {
         continue;
       }
-      ranked.push({ layer, body: item.fragment.body, index: item.index });
+      const open = { layer, body: item.fragment.body, index: item.index };
+      visible.push(open);
+      if (item.score > 0) {
+        ranked.push(open);
+      }
     }
-    return keepDisputedNumbers(ranked, claimsByLayer);
+    return keepDisputedNumbers(ranked, visible, claimsByLayer);
   }
 
   /**
