@@ -213,6 +213,18 @@ test("ошибка записи не останавливает веб", async (
     setPortfolioSent() {
       return { ok: false, reason: "missing" };
     },
+    readPreparationEntries() {
+      return [];
+    },
+    readPreparationEntry() {
+      return undefined;
+    },
+    dismissPreparation() {
+      return { ok: false, reason: "missing" };
+    },
+    acceptProposal() {
+      return { ok: false, reason: "missing" };
+    },
   });
 
   try {
@@ -1188,5 +1200,123 @@ test("сбой разбора на вебе оставляет стеногра�
     assert.deepEqual(trainer.readPreparation(saved.caseRecord.id, "аналитик", "владелец"), notes);
   } finally {
     await close(server);
+  }
+});
+
+test("веб снимает сигнал и расхождение и принимает правку, не трогая открытую сессию", async () => {
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, {
+    async *complete(call) {
+      const text = call.messages[0]?.text ?? "";
+      if (text.includes("Разбери законченную сессию")) {
+        yield `Разбор без оценки.\nХОД\n${JSON.stringify({
+          gaps: ["Спросить про сроки."],
+          covered: [],
+          watch: ["СИГНАЛ-СЛЕДИТЬ"],
+          divergence: ["Склад назван закрытым."],
+          line: "Давить на срок.",
+          proposals: [{ layer: "material", text: "Склад принимает европаллеты." }],
+        })}`;
+        return;
+      }
+      yield "Склад принимает паллеты.";
+    },
+  });
+  assert.deepEqual(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-WXYZ",
+    }),
+    { ok: true },
+  );
+  const keyId = trainer.listKeys()[0]?.id ?? "";
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+  assert.ok(saved.ok);
+  const approved = trainer.approveDossier({
+    caseId: saved.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: "Маржа подрядчика 12%.",
+    crib: "Спросить про сроки.",
+  });
+  assert.ok(approved.ok);
+  const first = trainer.openSession({
+    caseId: saved.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.ok(first.ok);
+  assert.ok((await trainer.finishSession(first.session.id)).ok);
+  const open = trainer.openSession({
+    caseId: saved.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.ok(open.ok);
+  const entries = trainer.readPreparationEntries(saved.caseRecord.id, "аналитик", "владелец");
+  const watch = entries.find((entry) => entry.kind === "watch");
+  const divergence = entries.find((entry) => entry.kind === "divergence");
+  const proposal = entries.find((entry) => entry.kind === "proposal");
+  const gap = entries.find((entry) => entry.kind === "gap");
+  assert.ok(watch && divergence && proposal && gap);
+
+  const server = await startWeb(trainer);
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    const before = await (await fetch(`${base}/cases/${saved.caseRecord.id}`)).text();
+    assert.equal(before.includes("СИГНАЛ-СЛЕДИТЬ"), true);
+    assert.equal(before.includes("Склад назван закрытым."), true);
+    assert.equal(before.includes("Спросить про сроки."), true);
+    assert.equal(before.includes("Склад принимает европаллеты."), true);
+    assert.equal(before.includes(">Снять<"), true);
+    assert.equal(before.includes(">Принять правку<"), true);
+
+    const dismissed = await fetch(`${base}/cases/${saved.caseRecord.id}/preparation`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ entryId: watch.id, act: "dismiss" }),
+    });
+    assert.equal(dismissed.status, 200);
+    await fetch(`${base}/cases/${saved.caseRecord.id}/preparation`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ entryId: divergence.id, act: "dismiss" }),
+    });
+    await fetch(`${base}/cases/${saved.caseRecord.id}/preparation`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ entryId: gap.id, act: "dismiss" }),
+    });
+    const accepted = await fetch(`${base}/cases/${saved.caseRecord.id}/preparation`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ entryId: proposal.id, act: "accept" }),
+    });
+    const page = await accepted.text();
+    assert.equal(page.includes("СИГНАЛ-СЛЕДИТЬ"), false);
+    assert.equal(page.includes("Склад назван закрытым."), false);
+    assert.equal(page.includes("Спросить про сроки."), true);
+    assert.equal(page.includes("Склад принимает европаллеты."), true);
+    assert.equal(trainer.readPreparationEntry(watch.id)?.status, "closed");
+    assert.equal(trainer.readPreparationEntry(divergence.id)?.status, "closed");
+    assert.equal(trainer.readPreparationEntry(gap.id)?.status, "open");
+    assert.equal(trainer.readPreparationEntry(proposal.id)?.status, "accepted");
+    assert.equal(trainer.readSession(open.session.id)?.dossierId, approved.dossier.id);
+    assert.equal(trainer.readDossier(approved.dossier.id)?.material, "Склад принимает паллеты.");
+    assert.equal(trainer.readApprovedDossier(saved.caseRecord.id)?.material.includes("Склад принимает европаллеты."), true);
+  } finally {
+    await close(server);
+    trainer.close();
   }
 });
