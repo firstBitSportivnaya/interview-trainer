@@ -610,6 +610,7 @@ test("веб открывает сессию заказчика, и стеног
     assert.equal(created.status, 200);
     const open = trainer.listOpenSessions()[0];
     assert.ok(open);
+    assert.equal(open.executorId, "владелец");
     assert.equal(open.keyId, keyId);
     assert.equal(open.side, "заказчик");
     assert.equal(new URL(created.url).pathname, `/sessions/${open.id}`);

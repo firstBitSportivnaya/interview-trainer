@@ -1221,6 +1221,9 @@ test("сессия другой тройки создаётся", () => {
   const openedSession = openAnalyst(trainer, prepared);
   assert.ok(openedSession.ok);
 
+  assert.deepEqual(trainer.assignExecutor({ executorId: "другой-исполнитель", caseId: prepared.caseId }), {
+    ok: true,
+  });
   const otherExecutor = openAnalyst(trainer, prepared, "другой-исполнитель");
   assert.ok(otherExecutor.ok);
 

@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import {
   customerVoices,
   DRAFT_LIMIT,
+  OWNER_EXECUTOR_ID,
   PERFORMER_ROLES,
   type ApproveDossierResult,
   type CaseRecord,
@@ -86,11 +87,13 @@ const PROTOCOL_LABEL: Record<KeySummary["protocol"], string> = {
 const KEY_ERROR: Record<Exclude<SaveKeyResult, { ok: true }>["reason"], string> = {
   incomplete: "Заполните протокол, базовый адрес, имя модели и секрет.",
   protocol: "Выберите протокол Anthropic или совместимый с OpenAI.",
+  forbidden: "Ключ записывает владелец.",
 };
 
 const CASE_ERROR: Record<Exclude<SaveCaseResult, { ok: true }>["reason"], string> = {
   incomplete: "Укажите заказчика и название проекта.",
   missing: "Заказчик не найден.",
+  forbidden: "Проект создаёт владелец.",
 };
 
 const SESSION_ERROR: Record<Exclude<OpenSessionResult, { ok: true }>["reason"] | "character", string> = {
@@ -99,6 +102,7 @@ const SESSION_ERROR: Record<Exclude<OpenSessionResult, { ok: true }>["reason"] |
   role: "Выберите роль исполнителя.",
   side: "Сессия этой страницы открывается на стороне заказчика.",
   open: "Сессия этой тройки уже открыта.",
+  assignment: "Назначения на этот проект нет.",
   character: "Выберите персонажа заказчика.",
 };
 
@@ -112,6 +116,7 @@ const DRAFT_ERROR: Record<Exclude<DraftDossierResult, { ok: true }>["reason"], s
 
 const FILE_ERROR: Record<Exclude<AddSourceFileResult, { ok: true }>["reason"], string> = {
   layer: "Выберите слой. Тренажёр слой не назначает сам.",
+  forbidden: "Слой файла называет владелец.",
   incomplete: "Укажите имя файла и извлечённый текст.",
   missing: "Проект не найден.",
 };
@@ -701,14 +706,14 @@ function redirect(response: ServerResponse, location: string): void {
 }
 
 function knownKeyError(reason: string | null): string | undefined {
-  if (reason === "incomplete" || reason === "protocol") {
+  if (reason === "incomplete" || reason === "protocol" || reason === "forbidden") {
     return KEY_ERROR[reason];
   }
   return undefined;
 }
 
 function knownCaseError(reason: string | null): string | undefined {
-  if (reason === "incomplete" || reason === "missing") {
+  if (reason === "incomplete" || reason === "missing" || reason === "forbidden") {
     return CASE_ERROR[reason];
   }
   return undefined;
@@ -721,6 +726,7 @@ function knownSessionError(reason: string | null): string | undefined {
     reason === "role" ||
     reason === "side" ||
     reason === "open" ||
+    reason === "assignment" ||
     reason === "character"
   ) {
     return SESSION_ERROR[reason];
@@ -729,7 +735,7 @@ function knownSessionError(reason: string | null): string | undefined {
 }
 
 function knownFileError(reason: string | null): string | undefined {
-  if (reason === "layer" || reason === "incomplete" || reason === "missing") {
+  if (reason === "layer" || reason === "incomplete" || reason === "missing" || reason === "forbidden") {
     return FILE_ERROR[reason];
   }
   return undefined;
@@ -1120,7 +1126,7 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
       side: "заказчик",
       character,
       role: fields.get("role") ?? "",
-      executorId: "владелец",
+      executorId: OWNER_EXECUTOR_ID,
       keyId: fields.get("keyId") ?? "",
     });
     redirect(response, opened.ok ? `/sessions/${encodeURIComponent(opened.session.id)}` : `${casePath(item.id)}?sessionError=${opened.reason}`);

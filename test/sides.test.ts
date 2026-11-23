@@ -311,7 +311,7 @@ test("любая пара роли и персонажа открывается,
       side,
       character,
       role,
-      executorId: `${role}:${character}`,
+      executorId: "владелец",
       keyId: prepared.keyId,
     });
     assert.ok(openedSession.ok);
