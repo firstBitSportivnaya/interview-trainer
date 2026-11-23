@@ -374,3 +374,241 @@ test("персонаж внутренней команды читает служ
   assert.equal(calls[1]?.messages[0]?.text.includes("роли «аналитик»"), true);
   assert.equal(calls.length, 2);
 });
+
+test("правка досье не меняет реплики открытой сессии", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start(recorded(calls));
+  const prepared = prepare(trainer);
+  const openedSession = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: prepared.dossierId,
+    side: "внутренняя команда",
+    character: "руководитель проекта",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  assert.ok(openedSession.ok);
+
+  const revised = trainer.approveDossier({
+    caseId: prepared.caseId,
+    material: "Склад принимает короба.",
+    serviceLayer: "Маржа подрядчика 20%.",
+    crib: "Спросить про возвраты.",
+  });
+  assert.ok(revised.ok);
+  assert.notEqual(revised.dossier.id, prepared.dossierId);
+
+  assert.deepEqual(await take(trainer.reply(openedSession.session.id, "Какие паллеты принимает склад?")), [
+    { kind: "speech", text: "Склад принимает паллеты." },
+  ]);
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(materialOf(prompt), "Склад принимает паллеты.");
+  assert.equal(prompt.includes("Маржа подрядчика 12%."), true);
+  assert.equal(prompt.includes("короба"), false);
+  assert.equal(prompt.includes("Маржа подрядчика 20%."), false);
+  assert.equal(JSON.stringify(trainer.readTranscript(openedSession.session.id)).includes("короба"), false);
+  assert.equal(JSON.stringify(trainer.readTranscript(openedSession.session.id)).includes("20%"), false);
+  assert.equal(trainer.readSession(openedSession.session.id)?.dossierId, prepared.dossierId);
+});
+
+test("новое утверждение досье читает следующая сессия", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start({
+    async *complete(call) {
+      calls.push({
+        protocol: call.protocol,
+        baseAddress: call.baseAddress,
+        modelName: call.modelName,
+        secret: call.secret,
+        messages: call.messages.map((message) => ({ role: message.role, text: message.text })),
+      });
+      yield materialOf(call.messages[0]?.text ?? "");
+    },
+  });
+  const prepared = prepare(trainer);
+  const openedSession = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: prepared.dossierId,
+    side: "внутренняя команда",
+    character: "руководитель проекта",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  assert.ok(openedSession.ok);
+
+  const revised = trainer.approveDossier({
+    caseId: prepared.caseId,
+    material: "Склад принимает короба.",
+    serviceLayer: "Маржа подрядчика 20%.",
+    crib: "Спросить про возвраты.",
+  });
+  assert.ok(revised.ok);
+  assert.equal(trainer.readApprovedDossier(prepared.caseId)?.id, revised.dossier.id);
+  assert.deepEqual(
+    trainer.openSession({
+      caseId: prepared.caseId,
+      dossierId: revised.dossier.id,
+      side: "внутренняя команда",
+      character: "руководитель проекта",
+      role: "аналитик",
+      executorId: "владелец",
+      keyId: prepared.keyId,
+    }),
+    { ok: false, reason: "open" },
+  );
+
+  assert.deepEqual(await take(trainer.reply(openedSession.session.id, "Что принимает склад?")), [
+    { kind: "speech", text: "Склад принимает паллеты." },
+  ]);
+
+  const next = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: revised.dossier.id,
+    side: "внутренняя команда",
+    character: "руководитель проекта",
+    role: "разработчик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  assert.ok(next.ok);
+  assert.notEqual(next.session.id, openedSession.session.id);
+
+  assert.deepEqual(await take(trainer.reply(next.session.id, "Что принимает склад?")), [
+    { kind: "speech", text: "Склад принимает короба." },
+  ]);
+  assert.deepEqual(await take(trainer.reply(openedSession.session.id, "Какие паллеты принимает склад?")), [
+    { kind: "speech", text: "Склад принимает паллеты." },
+  ]);
+
+  const nextSessionPrompt = calls[1]?.messages[0]?.text ?? "";
+  const openedSessionLaterPrompt = calls[2]?.messages[0]?.text ?? "";
+  assert.equal(materialOf(openedSessionLaterPrompt), "Склад принимает паллеты.");
+  assert.equal(openedSessionLaterPrompt.includes("Маржа подрядчика 12%."), true);
+  assert.equal(openedSessionLaterPrompt.includes("короба"), false);
+  assert.equal(openedSessionLaterPrompt.includes("Маржа подрядчика 20%."), false);
+  assert.equal(materialOf(nextSessionPrompt), "Склад принимает короба.");
+  assert.equal(nextSessionPrompt.includes("Маржа подрядчика 20%."), true);
+  assert.equal(nextSessionPrompt.includes("Склад принимает паллеты."), false);
+  assert.equal(nextSessionPrompt.includes("Маржа подрядчика 12%."), false);
+  assert.equal(trainer.readSession(openedSession.session.id)?.dossierId, prepared.dossierId);
+  assert.equal(trainer.readSession(next.session.id)?.dossierId, revised.dossier.id);
+});
+
+test("смена стороны или персонажа при открытой тройке вторую сессию не создаёт", () => {
+  const trainer = start();
+  assert.deepEqual(trainer.saveKey(keyDraft), { ok: true });
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const savedCase = trainer.saveCase({
+    customerName: "Север",
+    title: "Внедрение склада",
+    characters: ["Анна", "Борис"],
+  });
+  assert.ok(savedCase.ok);
+  const approved = trainer.approveDossier({
+    caseId: savedCase.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: "Маржа подрядчика 12%.",
+    crib: "Спросить про сроки.",
+  });
+  assert.ok(approved.ok);
+  const openedSession = trainer.openSession({
+    caseId: savedCase.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.ok(openedSession.ok);
+
+  assert.deepEqual(
+    trainer.openSession({
+      caseId: savedCase.caseRecord.id,
+      dossierId: approved.dossier.id,
+      side: "внутренняя команда",
+      character: "Анна",
+      role: "аналитик",
+      executorId: "владелец",
+      keyId,
+    }),
+    { ok: false, reason: "open" },
+  );
+  assert.deepEqual(
+    trainer.openSession({
+      caseId: savedCase.caseRecord.id,
+      dossierId: approved.dossier.id,
+      side: "заказчик",
+      character: "Борис",
+      role: "аналитик",
+      executorId: "владелец",
+      keyId,
+    }),
+    { ok: false, reason: "open" },
+  );
+
+  assert.deepEqual(trainer.listOpenSessions(), [openedSession.session]);
+  assert.equal(trainer.readSession(openedSession.session.id)?.side, "заказчик");
+  assert.equal(trainer.readSession(openedSession.session.id)?.character, "Анна");
+});
+
+test("две открытые тройки одного проекта не смешивают стенограммы", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start({
+    async *complete(call) {
+      calls.push({
+        protocol: call.protocol,
+        baseAddress: call.baseAddress,
+        modelName: call.modelName,
+        secret: call.secret,
+        messages: call.messages.map((message) => ({ role: message.role, text: message.text })),
+      });
+      const task = call.messages[0]?.text.split("\n\n").at(-1) ?? "";
+      yield `ответ: ${task}`;
+    },
+  });
+  const prepared = prepare(trainer);
+  const analyst = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: prepared.dossierId,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  const developer = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: prepared.dossierId,
+    side: "заказчик",
+    character: "Анна",
+    role: "разработчик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  assert.ok(analyst.ok);
+  assert.ok(developer.ok);
+  assert.notEqual(analyst.session.id, developer.session.id);
+
+  assert.deepEqual(await take(trainer.reply(analyst.session.id, "Вопрос аналитика")), [
+    { kind: "speech", text: "ответ: Вопрос аналитика" },
+  ]);
+  assert.deepEqual(await take(trainer.reply(developer.session.id, "Вопрос разработчика")), [
+    { kind: "speech", text: "ответ: Вопрос разработчика" },
+  ]);
+
+  assert.deepEqual(trainer.readTranscript(analyst.session.id), [
+    { speaker: "исполнитель", kind: "реплика", text: "Вопрос аналитика" },
+    { speaker: "персонаж", kind: "ответ", text: "ответ: Вопрос аналитика" },
+  ]);
+  assert.deepEqual(trainer.readTranscript(developer.session.id), [
+    { speaker: "исполнитель", kind: "реплика", text: "Вопрос разработчика" },
+    { speaker: "персонаж", kind: "ответ", text: "ответ: Вопрос разработчика" },
+  ]);
+  const developerPrompt = calls[1]?.messages[0]?.text ?? "";
+  assert.equal(developerPrompt.includes("Вопрос аналитика"), false);
+  assert.equal(developerPrompt.includes("ответ: Вопрос аналитика"), false);
+});
