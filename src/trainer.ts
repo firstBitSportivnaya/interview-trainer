@@ -93,6 +93,11 @@ export const DOSSIER_LAYER_NAMES = ["material", "serviceLayer", "crib"] as const
 /** Слой файла проекта: материал проекта, служебный слой или шпаргалка проекта. */
 export type DossierLayerName = (typeof DOSSIER_LAYER_NAMES)[number];
 
+/** Номер слайда, сохранённый вместе с текстом файла. */
+export type SourcePlace = {
+  slide: number;
+};
+
 /**
  * Файл проекта с уже извлечённым текстом.
  * Слой записан так, как его назвал владелец. Имя файла слой не задаёт.
@@ -103,7 +108,20 @@ export type SourceFileRecord = {
   name: string;
   layer: DossierLayerName;
   extractedText: string;
+  places: SourcePlace[];
 };
+
+/** Файл проекта без текста. В слой не входит и в черновик не попадает. */
+export type UnreadFileRecord = {
+  id: string;
+  caseId: string;
+  name: string;
+};
+
+/** Отказ отметить непрочитанный файл: поля пустые, проекта нет или отмечает не владелец. */
+export type NoteUnreadFileResult =
+  | { ok: true; file: UnreadFileRecord }
+  | { ok: false; reason: "incomplete" | "missing" | "forbidden" };
 
 /** Отказ записать файл: слоя нет в каталоге, поля пустые, проекта нет или слой называет не владелец. */
 export type AddSourceFileResult =
@@ -385,6 +403,22 @@ function schemaSql(): string {
 
     CREATE INDEX IF NOT EXISTS source_files_case
       ON source_files(case_id);
+
+    CREATE TABLE IF NOT EXISTS source_places (
+      file_id TEXT NOT NULL REFERENCES source_files(id),
+      position INTEGER NOT NULL,
+      slide INTEGER NOT NULL CHECK (slide >= 1),
+      PRIMARY KEY (file_id, position)
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS unread_files (
+      id TEXT PRIMARY KEY,
+      case_id TEXT NOT NULL REFERENCES cases(id),
+      name TEXT NOT NULL
+    ) STRICT;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS unread_files_case_name
+      ON unread_files(case_id, name);
 
     CREATE TABLE IF NOT EXISTS keys (
       id TEXT PRIMARY KEY,
@@ -1294,7 +1328,7 @@ function readDossierRecord(row: Row): DossierRecord {
   };
 }
 
-function readSourceFileRecord(row: Row): SourceFileRecord {
+function readSourceFileRecord(row: Row, places: SourcePlace[]): SourceFileRecord {
   const layer = textColumn(row, "layer");
   if (!isDossierLayer(layer)) {
     throw new Error("Запись хранилища повреждена");
@@ -1305,7 +1339,30 @@ function readSourceFileRecord(row: Row): SourceFileRecord {
     name: textColumn(row, "name"),
     layer,
     extractedText: textColumn(row, "extracted_text"),
+    places,
   };
+}
+
+function readUnreadFileRecord(row: Row): UnreadFileRecord {
+  return {
+    id: textColumn(row, "id"),
+    caseId: textColumn(row, "case_id"),
+    name: textColumn(row, "name"),
+  };
+}
+
+/** Оставляет только номера слайдов, которые можно сохранить. */
+function keptPlaces(places: readonly SourcePlace[] | undefined): SourcePlace[] {
+  if (!places) {
+    return [];
+  }
+  const kept: SourcePlace[] = [];
+  for (const place of places) {
+    if (Number.isSafeInteger(place.slide) && place.slide >= 1) {
+      kept.push({ slide: place.slide });
+    }
+  }
+  return kept;
 }
 
 function isSessionStatus(value: string): value is SessionStatus {
@@ -1450,6 +1507,13 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
     return { key: { ...stored, secret } };
   }
 
+  function loadPlaces(fileId: string): SourcePlace[] {
+    const rows = database
+      .prepare("SELECT slide FROM source_places WHERE file_id = ? ORDER BY position")
+      .all(fileId) as Row[];
+    return rows.map((row) => ({ slide: integerColumn(row, "slide") }));
+  }
+
   function loadSourceFiles(caseId: string): SourceFileRecord[] {
     const rows = database
       .prepare(
@@ -1457,7 +1521,14 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
          FROM source_files WHERE case_id = ? ORDER BY rowid`,
       )
       .all(caseId) as Row[];
-    return rows.map((row) => readSourceFileRecord(row));
+    return rows.map((row) => readSourceFileRecord(row, loadPlaces(textColumn(row, "id"))));
+  }
+
+  function loadUnreadFiles(caseId: string): UnreadFileRecord[] {
+    const rows = database
+      .prepare("SELECT id, case_id, name FROM unread_files WHERE case_id = ? ORDER BY rowid")
+      .all(caseId) as Row[];
+    return rows.map((row) => readUnreadFileRecord(row));
   }
 
   /** Снимок текстов файлов на момент открытия. Поздний файл сюда не входит. */
@@ -1995,6 +2066,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       name: string;
       layer: string;
       extractedText: string;
+      places?: readonly SourcePlace[];
       executorId?: string;
     }): AddSourceFileResult {
       if (foreignExecutor(draft.executorId)) {
@@ -2013,16 +2085,25 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
       if (!caseExists(caseId)) {
         return { ok: false, reason: "missing" };
       }
+      const places = keptPlaces(draft.places);
       const file: SourceFileRecord = {
         id: randomUUID(),
         caseId,
         name,
         layer,
         extractedText,
+        places,
       };
-      database
-        .prepare("INSERT INTO source_files (id, case_id, name, layer, extracted_text) VALUES (?, ?, ?, ?, ?)")
-        .run(file.id, file.caseId, file.name, file.layer, file.extractedText);
+      inTransaction(database, () => {
+        database
+          .prepare("INSERT INTO source_files (id, case_id, name, layer, extracted_text) VALUES (?, ?, ?, ?, ?)")
+          .run(file.id, file.caseId, file.name, file.layer, file.extractedText);
+        const insertPlace = database.prepare(
+          "INSERT INTO source_places (file_id, position, slide) VALUES (?, ?, ?)",
+        );
+        places.forEach((place, position) => insertPlace.run(file.id, position, place.slide));
+        database.prepare("DELETE FROM unread_files WHERE case_id = ? AND name = ?").run(file.caseId, file.name);
+      });
       return { ok: true, file };
     },
 
@@ -2032,6 +2113,43 @@ export function openTrainer(directory: string, model: ModelPort = liveModel()) {
         return [];
       }
       return loadSourceFiles(caseId);
+    },
+
+    /**
+     * Записывает файл без текста.
+     * Слой не назначает и абзац не сочиняет: в черновик такая запись не входит.
+     */
+    noteUnreadFile(draft: { caseId: string; name: string; executorId?: string }): NoteUnreadFileResult {
+      if (foreignExecutor(draft.executorId)) {
+        return { ok: false, reason: "forbidden" };
+      }
+      const caseId = draft.caseId.trim();
+      const name = draft.name.trim();
+      if (!caseId || !name) {
+        return { ok: false, reason: "incomplete" };
+      }
+      if (!caseExists(caseId)) {
+        return { ok: false, reason: "missing" };
+      }
+      const file: UnreadFileRecord = { id: randomUUID(), caseId, name };
+      database
+        .prepare("INSERT OR IGNORE INTO unread_files (id, case_id, name) VALUES (?, ?, ?)")
+        .run(file.id, file.caseId, file.name);
+      const stored = database
+        .prepare("SELECT id, case_id, name FROM unread_files WHERE case_id = ? AND name = ?")
+        .get(caseId, name) as Row | undefined;
+      if (!stored) {
+        return { ok: false, reason: "missing" };
+      }
+      return { ok: true, file: readUnreadFileRecord(stored) };
+    },
+
+    /** Возвращает непрочитанные файлы проекта. Нет проекта — списка нет. */
+    listUnreadFiles(caseId: string): UnreadFileRecord[] {
+      if (!caseExists(caseId)) {
+        return [];
+      }
+      return loadUnreadFiles(caseId);
     },
 
     /**
