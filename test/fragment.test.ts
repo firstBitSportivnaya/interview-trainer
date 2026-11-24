@@ -32,6 +32,11 @@ const WEIGHT_18 = "Максимальный вес 1,8 кг.";
 const WEIGHT_15_DOT = "Максимальный вес 1.5 кг.";
 const WEIGHT_500_T = "Максимальный вес 500 т.";
 const WEIGHT_1500 = "Максимальный вес 1500 кг.";
+const FIRST_HALF = "Первая половина набора.";
+const SECOND_HALF = "Вторая половина набора.";
+const NEIGHBOUR = "Полный соседний файл.";
+const PREVIOUS_TEXT = "Прежний текст файла про приёмку.";
+const NEXT_TEXT = "Новый текст файла про приёмку.";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -462,4 +467,148 @@ test("далёкий другой вес входит вместе с близк
   assert.equal(prompt.includes(WEIGHT_500), true);
   assert.equal(prompt.includes(WEIGHT_1500), true);
   assert.equal(prompt.includes(NEITHER_NUMBER), true);
+});
+
+test("оборванный набор векторов в поиск не входит, полный набор другого файла входит", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = openTrainer(tempDirectory(), recorded(calls), {
+    async embed(text, role) {
+      if (text.includes(SECOND_HALF)) {
+        return [];
+      }
+      return scriptedEmbeddings().embed(text, role);
+    },
+  });
+  opened.push(trainer);
+  const prepared = prepare(trainer);
+  addFile(
+    trainer,
+    prepared.caseId,
+    "broken.txt",
+    "material",
+    `${PALLET}. ${FIRST_HALF}\n\n${SECOND_HALF}`,
+  );
+  addFile(trainer, prepared.caseId, "whole.txt", "material", `${NEIGHBOUR} ${PALLET}.`);
+
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(FIRST_HALF), false);
+  assert.equal(prompt.includes(SECOND_HALF), false);
+  assert.equal(prompt.includes(NEIGHBOUR), true);
+});
+
+test("исключение на середине набора не кладёт частичный файл в поиск", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = openTrainer(tempDirectory(), recorded(calls), {
+    async embed(text, role) {
+      if (text.includes(SECOND_HALF)) {
+        throw new Error("обрыв расчёта");
+      }
+      return scriptedEmbeddings().embed(text, role);
+    },
+  });
+  opened.push(trainer);
+  const prepared = prepare(trainer);
+  addFile(
+    trainer,
+    prepared.caseId,
+    "broken.txt",
+    "material",
+    `${PALLET}. ${FIRST_HALF}\n\n${SECOND_HALF}`,
+  );
+  addFile(trainer, prepared.caseId, "whole.txt", "material", `${NEIGHBOUR} ${PALLET}.`);
+
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(FIRST_HALF), false);
+  assert.equal(prompt.includes(SECOND_HALF), false);
+  assert.equal(prompt.includes(NEIGHBOUR), true);
+});
+
+test("следующая сессия видит фрагменты только нового текста файла", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start(calls);
+  const prepared = prepare(trainer);
+  addFile(trainer, prepared.caseId, "places.txt", "material", `${PREVIOUS_TEXT} ${PALLET}.`);
+  const first = openCustomer(trainer, prepared);
+  assert.ok(first.ok);
+  await take(trainer.openingQuestion(first.session.id));
+  assert.equal(calls[0]?.messages[0]?.text.includes(PREVIOUS_TEXT), true);
+
+  const finished = await trainer.finishSession(first.session.id);
+  assert.ok(finished.ok);
+  addFile(trainer, prepared.caseId, "places.txt", "material", `${NEXT_TEXT} ${PALLET}.\n\nХвост нового текста. ${PALLET}.`);
+  const second = openCustomer(trainer, prepared);
+  assert.ok(second.ok);
+  await take(trainer.openingQuestion(second.session.id));
+
+  const prompt = calls.at(-1)?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(NEXT_TEXT), true);
+  assert.equal(prompt.includes("Хвост нового текста."), true);
+  assert.equal(prompt.includes(PREVIOUS_TEXT), false);
+});
+
+test("открытая сессия держит прежний текст, пока новый набор не полон", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = openTrainer(tempDirectory(), recorded(calls), {
+    async embed(text, role) {
+      if (text.includes(NEXT_TEXT)) {
+        return [];
+      }
+      return scriptedEmbeddings().embed(text, role);
+    },
+  });
+  opened.push(trainer);
+  const prepared = prepare(trainer);
+  addFile(trainer, prepared.caseId, "places.txt", "material", `${PREVIOUS_TEXT} ${PALLET}.`);
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+  assert.equal(calls[0]?.messages[0]?.text.includes(PREVIOUS_TEXT), true);
+
+  addFile(trainer, prepared.caseId, "places.txt", "material", `${NEXT_TEXT} ${PALLET}.\n\n${SECOND_HALF}`);
+  calls.length = 0;
+  await take(trainer.reply(openedSession.session.id, "Что с приёмкой?"));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(PREVIOUS_TEXT), true);
+  assert.equal(prompt.includes(NEXT_TEXT), false);
+  assert.equal(prompt.includes(SECOND_HALF), false);
+});
+
+test("пустой текст не становится готовым, непустой файл в поиск входит", async () => {
+  const calls: ModelCall[] = [];
+  const embedded: string[] = [];
+  const trainer = openTrainer(tempDirectory(), recorded(calls), {
+    async embed(text, role) {
+      embedded.push(text);
+      return scriptedEmbeddings().embed(text, role);
+    },
+  });
+  opened.push(trainer);
+  const prepared = prepare(trainer);
+  assert.equal(
+    trainer.addSourceFile({
+      caseId: prepared.caseId,
+      name: "empty.txt",
+      layer: "material",
+      extractedText: "   ",
+    }).ok,
+    false,
+  );
+  addFile(trainer, prepared.caseId, "places.txt", "material", `${PALLET}.`);
+
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(PALLET), true);
+  assert.equal(embedded.some((text) => text.trim() === ""), false);
 });
