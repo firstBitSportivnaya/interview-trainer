@@ -1600,6 +1600,24 @@ test("страница показывает непрочитанный файл 
     assert.equal(read.includes("скан.pdf — Материал проекта"), true);
     assert.equal(read.includes("чужой.pdf"), false);
     assert.equal(read.includes("Склад принимает паллеты."), false);
+
+    assert.ok(
+      trainer.addSourceFile({
+        caseId: saved.caseRecord.id,
+        name: "протокол.xlsx",
+        layer: "serviceLayer",
+        extractedText: "ТЕКСТ-СЛОЯ",
+      }).ok,
+    );
+    assert.ok(trainer.noteUnreadFile({ caseId: saved.caseRecord.id, name: "протокол.xlsx" }).ok);
+    const both = await (await fetch(`${base}/cases/${saved.caseRecord.id}`)).text();
+    assert.equal(both.includes("протокол.xlsx — Служебный слой"), true);
+    assert.equal(both.includes("протокол.xlsx — не прочитан"), false);
+    assert.equal(both.includes("ТЕКСТ-СЛОЯ"), false);
+    assert.equal(
+      trainer.listSourceFiles(saved.caseRecord.id).some((file) => file.name === "протокол.xlsx" && file.extractedText === "ТЕКСТ-СЛОЯ"),
+      true,
+    );
   } finally {
     await close(server);
   }

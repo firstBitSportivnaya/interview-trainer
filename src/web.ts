@@ -601,7 +601,9 @@ function renderSession(trainer: Trainer, session: SessionRecord, error?: string)
 /** Список файлов и форма слоя. Первый пункт списка пустой: слой не выбран заранее. */
 function renderSourceFiles(trainer: Trainer, item: CaseRecord, error?: string): string {
   const files = trainer.listSourceFiles(item.id);
-  const unread = trainer.listUnreadFiles(item.id);
+  const readNames = new Set(files.map((file) => file.name));
+  // Имя в названном слое уже прочитано. Поздняя отметка без текста страницу не перебивает и текст слоя не стирает.
+  const unread = trainer.listUnreadFiles(item.id).filter((file) => !readNames.has(file.name));
   const items =
     files.length === 0
       ? unread.length === 0
