@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync 
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { join } from "node:path";
 
+import { LOCAL_EMBEDDING_MODEL, unitVector } from "./embeddings.ts";
 import { liveModel, ModelFailure, type ModelPort } from "./model.ts";
 import { isSealedSecret, openSecret, sealSecret } from "./os-secret.ts";
 
@@ -223,11 +224,13 @@ export const ABSENT_FACT = "В материале проекта этого не
 /**
  * Порт эмбеддингов хода.
  * Проверка подставляет записанный порт и живую модель не вызывает.
- * passage — текст фрагмента файла, query — текст хода.
+ * Ядро передаёт роль и текст без префикса. Префикс passage и query ставит живой адаптер.
+ * modelName отличает индекс: другое имя строит новый, чужие векторы в поиск не входят.
  */
 export type EmbeddingRole = "passage" | "query";
 
 export type EmbeddingPort = {
+  modelName?: string;
   embed(text: string, role: EmbeddingRole): Promise<readonly number[]>;
 };
 
@@ -495,7 +498,8 @@ function schemaSql(): string {
       session_id TEXT NOT NULL REFERENCES sessions(id),
       layer TEXT NOT NULL CHECK (layer IN ('material', 'serviceLayer')),
       body TEXT NOT NULL,
-      vector TEXT NOT NULL
+      vector TEXT NOT NULL,
+      model_name TEXT NOT NULL
     ) STRICT;
 
     CREATE INDEX IF NOT EXISTS session_fragments_session
@@ -666,6 +670,21 @@ function ensureProfileShape(database: DatabaseSync): void {
   });
 }
 
+/**
+ * Прежний индекс фрагментов не знал имя модели.
+ * Колонка добавляется пустой: старые векторы в текущий поиск не входят, строки сессий остаются.
+ */
+function ensureFragmentShape(database: DatabaseSync): void {
+  const rows = database.prepare("PRAGMA table_info(session_fragments)").all() as Row[];
+  if (rows.length === 0) {
+    return;
+  }
+  const names = new Set(rows.map((row) => textColumn(row, "name")));
+  if (!names.has("model_name")) {
+    database.exec("ALTER TABLE session_fragments ADD COLUMN model_name TEXT NOT NULL DEFAULT ''");
+  }
+}
+
 /** Прежнее хранилище без отметки портфолио получает колонку. Уже записанный проект остаётся без отметки. */
 function ensureCaseShape(database: DatabaseSync): void {
   const rows = database.prepare("PRAGMA table_info(cases)").all() as Row[];
@@ -822,8 +841,10 @@ function packFragment(paragraph: string): string[] {
   return packed;
 }
 
-function usableVector(value: readonly unknown[]): value is readonly number[] {
-  return value.length > 0 && value.every((item) => typeof item === "number" && Number.isFinite(item));
+/** Имя модели индекса. Пустое имя — локальная модель установки. */
+function embeddingModelName(port: EmbeddingPort): string {
+  const name = port.modelName?.trim() ?? "";
+  return name.length > 0 ? name : LOCAL_EMBEDDING_MODEL;
 }
 
 /** Близость двух векторов. Чужая длина, ноль и нечисло в сравнение не входят. */
@@ -1043,10 +1064,10 @@ function readStoredVector(raw: string): number[] | undefined {
   } catch {
     return undefined;
   }
-  if (!Array.isArray(value) || !usableVector(value)) {
+  if (!Array.isArray(value)) {
     return undefined;
   }
-  return [...value];
+  return unitVector(value);
 }
 
 /**
@@ -1734,6 +1755,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     ensureCaseShape(database);
     ensureSessionShape(database);
     ensureProfileShape(database);
+    ensureFragmentShape(database);
     migrateLegacyKeys(database, directory);
     if (hasPlaintextSecret(database) || vacuumPending(database)) {
       setVacuumPending(database, true);
@@ -2159,8 +2181,9 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     }
     const rows: { layer: "material" | "serviceLayer"; body: string; vector: readonly number[] }[] = [];
     for (const body of bodies) {
-      const vector = await embeddings.embed(body, "passage");
-      if (!usableVector(vector)) {
+      const raw = await embeddings.embed(body, "passage");
+      const vector = Array.isArray(raw) ? unitVector(raw) : undefined;
+      if (!vector) {
         return undefined;
       }
       rows.push({ layer: file.layer, body, vector });
@@ -2170,14 +2193,18 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
 
   /**
    * Считает векторы текстов, с которыми открыта сессия, вне транзакции.
-   * Файл входит в поиск только полным набором. Пустой текст и обрыв готовыми не считаются.
-   * Шпаргалка проекта в индекс не входит. Повторный ход тот же набор не пересчитывает.
+   * Файл входит в поиск только полным набором. Пустой текст, обрыв, ноль и чужая длина готовыми не считаются.
+   * Шпаргалка проекта в индекс не входит. Повторный ход тот же набор этой модели не пересчитывает.
+   * Другое имя модели строит свой индекс и чужие векторы не подхватывает.
    */
   async function buildFragmentIndex(sessionId: string): Promise<void> {
     if (!embeddings) {
       return;
     }
-    const ready = database.prepare("SELECT id FROM session_fragments WHERE session_id = ? LIMIT 1").get(sessionId);
+    const modelName = embeddingModelName(embeddings);
+    const ready = database
+      .prepare("SELECT id FROM session_fragments WHERE session_id = ? AND model_name = ? LIMIT 1")
+      .get(sessionId, modelName);
     if (ready) {
       return;
     }
@@ -2196,15 +2223,17 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       return;
     }
     inTransaction(database, () => {
-      const again = database.prepare("SELECT id FROM session_fragments WHERE session_id = ? LIMIT 1").get(sessionId);
+      const again = database
+        .prepare("SELECT id FROM session_fragments WHERE session_id = ? AND model_name = ? LIMIT 1")
+        .get(sessionId, modelName);
       if (again) {
         return;
       }
       const insert = database.prepare(
-        "INSERT INTO session_fragments (id, session_id, layer, body, vector) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO session_fragments (id, session_id, layer, body, vector, model_name) VALUES (?, ?, ?, ?, ?, ?)",
       );
       for (const row of rows) {
-        insert.run(randomUUID(), sessionId, row.layer, row.body, JSON.stringify(row.vector));
+        insert.run(randomUUID(), sessionId, row.layer, row.body, JSON.stringify(row.vector), modelName);
       }
     });
   }
@@ -2230,9 +2259,14 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
   }
 
   function loadFragmentRows(sessionId: string): { layer: DossierLayerName; body: string; vector: number[] }[] {
+    if (!embeddings) {
+      return [];
+    }
     const rows = database
-      .prepare("SELECT layer, body, vector FROM session_fragments WHERE session_id = ? ORDER BY rowid")
-      .all(sessionId) as Row[];
+      .prepare(
+        "SELECT layer, body, vector FROM session_fragments WHERE session_id = ? AND model_name = ? ORDER BY rowid",
+      )
+      .all(sessionId, embeddingModelName(embeddings)) as Row[];
     const fragments: { layer: DossierLayerName; body: string; vector: number[] }[] = [];
     for (const row of rows) {
       const layer = textColumn(row, "layer");
@@ -2256,8 +2290,15 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       return EMPTY_TURN_FRAGMENTS;
     }
     await ensureFragmentIndex(session.id);
-    const query = await embeddings.embed(task, "query");
-    if (!usableVector(query)) {
+    let rawQuery: readonly number[];
+    try {
+      rawQuery = await embeddings.embed(task, "query");
+    } catch {
+      // Неполная модель не обрывает ход: вопрос идёт без фрагмента.
+      return EMPTY_TURN_FRAGMENTS;
+    }
+    const query = Array.isArray(rawQuery) ? unitVector(rawQuery) : undefined;
+    if (!query) {
       return EMPTY_TURN_FRAGMENTS;
     }
     const dossier = loadDossier(session.dossierId);

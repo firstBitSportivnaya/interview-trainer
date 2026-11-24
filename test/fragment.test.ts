@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { after, test } from "node:test";
 
 import { type ModelCall, type ModelPort } from "../src/model.ts";
@@ -37,6 +38,7 @@ const SECOND_HALF = "Вторая половина набора.";
 const NEIGHBOUR = "Полный соседний файл.";
 const PREVIOUS_TEXT = "Прежний текст файла про приёмку.";
 const NEXT_TEXT = "Новый текст файла про приёмку.";
+const OTHER_MODEL = "чужой вектор другой модели";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -47,12 +49,19 @@ function tempDirectory(): string {
   return directory;
 }
 
+/** Ось единичного вектора длины 384. Близкий фрагмент и запрос смотрят в одну сторону. */
+function axis(index: 0 | 1): number[] {
+  const vector = Array.from({ length: 384 }, () => 0);
+  vector[index] = 1;
+  return vector;
+}
+
 /** Близкий фрагмент и запрос хода смотрят в одну сторону. Далёкий текст — в другую. */
 function scriptedEmbeddings(): EmbeddingPort {
   return {
     async embed(text, role) {
       if (role === "query") {
-        return [1, 0];
+        return axis(0);
       }
       const close =
         text.includes(PALLET) ||
@@ -71,7 +80,7 @@ function scriptedEmbeddings(): EmbeddingPort {
         text.includes(WEIGHT_18) ||
         text.includes(WEIGHT_15_DOT) ||
         text.includes(WEIGHT_500_T);
-      return close ? [1, 0] : [0, 1];
+      return close ? axis(0) : axis(1);
     },
   };
 }
@@ -611,4 +620,241 @@ test("пустой текст не становится готовым, непу
   const prompt = calls[0]?.messages[0]?.text ?? "";
   assert.equal(prompt.includes(PALLET), true);
   assert.equal(embedded.some((text) => text.trim() === ""), false);
+});
+
+test("нулевой вектор не делает файл готовым, полный набор соседа входит", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = openTrainer(tempDirectory(), recorded(calls), {
+    async embed(text, role) {
+      if (role === "query" || text.includes(WEIGHT_500)) {
+        return axis(0);
+      }
+      return Array.from({ length: 384 }, () => 0);
+    },
+  });
+  opened.push(trainer);
+  const prepared = prepare(trainer);
+  addFile(trainer, prepared.caseId, "zero.txt", "material", WEIGHT_1500);
+  addFile(trainer, prepared.caseId, "ready.txt", "material", WEIGHT_500);
+
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(WEIGHT_1500), false);
+  assert.equal(prompt.includes(WEIGHT_500), true);
+  assert.equal(prompt.includes(NEITHER_NUMBER), false);
+});
+
+test("вектор не той длины не делает файл готовым, полный набор соседа входит", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = openTrainer(tempDirectory(), recorded(calls), {
+    async embed(text, role) {
+      if (role === "query" || text.includes(WEIGHT_500)) {
+        return axis(0);
+      }
+      return [1, 0];
+    },
+  });
+  opened.push(trainer);
+  const prepared = prepare(trainer);
+  addFile(trainer, prepared.caseId, "short.txt", "material", WEIGHT_1500);
+  addFile(trainer, prepared.caseId, "ready.txt", "material", WEIGHT_500);
+
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(WEIGHT_1500), false);
+  assert.equal(prompt.includes(WEIGHT_500), true);
+  assert.equal(prompt.includes(NEITHER_NUMBER), false);
+});
+
+test("векторы другой модели в сравнение текущего индекса не входят", async () => {
+  const calls: ModelCall[] = [];
+  const directory = tempDirectory();
+  const other = openTrainer(directory, recorded(calls), {
+    modelName: "другая-модель",
+    async embed(text, role) {
+      if (role === "query" || text.includes(OTHER_MODEL)) {
+        return axis(0);
+      }
+      return axis(1);
+    },
+  });
+  opened.push(other);
+  const prepared = prepare(other);
+  addFile(other, prepared.caseId, "foreign-model.txt", "material", OTHER_MODEL);
+  addFile(other, prepared.caseId, "places.txt", "material", PALLET);
+  const openedSession = openCustomer(other, prepared);
+  assert.ok(openedSession.ok);
+  await take(other.openingQuestion(openedSession.session.id));
+  other.close();
+
+  const current = openTrainer(directory, recorded(calls), {
+    modelName: "multilingual-e5-small",
+    async embed(text, role) {
+      if (role === "query" || text.includes(PALLET)) {
+        return axis(0);
+      }
+      return axis(1);
+    },
+  });
+  opened.push(current);
+  calls.length = 0;
+  await take(current.reply(openedSession.session.id, "Задай вопрос про приёмку."));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(PALLET), true);
+  assert.equal(prompt.includes(OTHER_MODEL), false);
+});
+
+test("сохранённый вектор фрагмента нормирован по L2", async () => {
+  const calls: ModelCall[] = [];
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, recorded(calls), {
+    async embed(text, role) {
+      if (role === "query") {
+        return axis(0);
+      }
+      const vector = axis(0);
+      vector[0] = 3;
+      vector[1] = 4;
+      return vector;
+    },
+  });
+  opened.push(trainer);
+  const prepared = prepare(trainer);
+  addFile(trainer, prepared.caseId, "places.txt", "material", PALLET);
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+  trainer.close();
+
+  const database = new DatabaseSync(join(directory, "store.sqlite"));
+  try {
+    const rows = database.prepare("SELECT vector FROM session_fragments").all() as { vector: string }[];
+    assert.equal(rows.length, 1);
+    const vector = JSON.parse(rows[0]?.vector ?? "[]") as number[];
+    assert.equal(vector.length, 384);
+    assert.ok(Math.abs(Math.hypot(...vector) - 1) < 1e-9);
+    assert.ok(Math.abs((vector[0] ?? 0) - 0.6) < 1e-9);
+    assert.ok(Math.abs((vector[1] ?? 0) - 0.8) < 1e-9);
+  } finally {
+    database.close();
+  }
+});
+
+test("слишком большой вектор сохраняется единичным, а не нулевым", async () => {
+  const calls: ModelCall[] = [];
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, recorded(calls), {
+    async embed(text, role) {
+      if (role === "query") {
+        return axis(0);
+      }
+      const vector = axis(0);
+      vector[0] = 1e200;
+      return vector;
+    },
+  });
+  opened.push(trainer);
+  const prepared = prepare(trainer);
+  addFile(trainer, prepared.caseId, "places.txt", "material", PALLET);
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+  trainer.close();
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(PALLET), true);
+  const database = new DatabaseSync(join(directory, "store.sqlite"));
+  try {
+    const rows = database.prepare("SELECT vector FROM session_fragments").all() as { vector: string }[];
+    assert.equal(rows.length, 1);
+    const vector = JSON.parse(rows[0]?.vector ?? "[]") as number[];
+    assert.equal(vector[0], 1);
+    assert.equal(vector[1], 0);
+    assert.ok(Math.abs(Math.hypot(...vector) - 1) < 1e-9);
+  } finally {
+    database.close();
+  }
+});
+
+test("сбой расчёта на ходе не обрывает вопрос и не кладёт фрагмент во вход", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = openTrainer(tempDirectory(), recorded(calls), {
+    async embed(text, role) {
+      if (role === "query") {
+        throw new Error("модель не прочитана");
+      }
+      return scriptedEmbeddings().embed(text, role);
+    },
+  });
+  opened.push(trainer);
+  const prepared = prepare(trainer);
+  addFile(trainer, prepared.caseId, "places.txt", "material", PALLET);
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(DOSSIER_FACT), true);
+  assert.equal(prompt.includes(PALLET), false);
+});
+
+test("прежний индекс без имени модели остаётся и в текущий поиск не входит", async () => {
+  const calls: ModelCall[] = [];
+  const directory = tempDirectory();
+  const created = new DatabaseSync(join(directory, "store.sqlite"));
+  created.exec(`
+    CREATE TABLE session_fragments (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      layer TEXT NOT NULL,
+      body TEXT NOT NULL,
+      vector TEXT NOT NULL
+    ) STRICT
+  `);
+  created.close();
+
+  const trainer = openTrainer(directory, recorded(calls), scriptedEmbeddings());
+  opened.push(trainer);
+  const prepared = prepare(trainer);
+  addFile(trainer, prepared.caseId, "places.txt", "material", PALLET);
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+  trainer.close();
+
+  const planted = new DatabaseSync(join(directory, "store.sqlite"));
+  planted
+    .prepare(
+      "INSERT INTO session_fragments (id, session_id, layer, body, vector, model_name) VALUES ('old', ?, 'material', ?, ?, '')",
+    )
+    .run(openedSession.session.id, OTHER_MODEL, JSON.stringify(axis(0)));
+  planted.close();
+
+  const current = openTrainer(directory, recorded(calls), scriptedEmbeddings());
+  opened.push(current);
+  calls.length = 0;
+  await take(current.reply(openedSession.session.id, "Задай вопрос про приёмку."));
+  current.close();
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(PALLET), true);
+  assert.equal(prompt.includes(OTHER_MODEL), false);
+
+  const check = new DatabaseSync(join(directory, "store.sqlite"));
+  try {
+    const old = check.prepare("SELECT body, model_name FROM session_fragments WHERE id = 'old'").get() as
+      | { body: string; model_name: string }
+      | undefined;
+    assert.equal(old?.body, OTHER_MODEL);
+    assert.equal(old?.model_name, "");
+  } finally {
+    check.close();
+  }
 });
