@@ -1,5 +1,7 @@
-import { inflateRawSync, inflateSync } from "node:zlib";
+import { join } from "node:path";
+import { deflateSync, inflateRawSync, inflateSync } from "node:zlib";
 
+import { installationRecognizer, type PageRecognizer } from "./recognize.ts";
 import {
   DOSSIER_LAYER_NAMES,
   type AddSourceFileResult,
@@ -14,10 +16,11 @@ import {
  * Чтение файла проекта вне ядра.
  * Ядро получает текст и слой, который назвал владелец.
  * Пустой и нечитаемый файл остаётся без текста: абзац не сочиняется.
+ * Скан и картинка отдают байты локальному распознавателю. Чужой службе файл не уходит.
  */
 
 export type ReadProjectFileResult =
-  | { ready: true; text: string; places: SourcePlace[] }
+  | { ready: true; text: string; places: SourcePlace[]; recognized: boolean }
   | { ready: false };
 
 export type AcceptProjectFileResult =
@@ -33,10 +36,14 @@ type ProjectFileStore = {
     layer: string;
     extractedText: string;
     places?: readonly SourcePlace[];
+    recognized?: boolean;
     executorId?: string;
   }): AddSourceFileResult;
   noteUnreadFile(draft: { caseId: string; name: string; executorId?: string }): NoteUnreadFileResult;
 };
+
+/** Каталог установки тот же, что у весов модели: data/models/tesseract. */
+const defaultRecognizer = installationRecognizer(join(process.cwd(), "data"));
 
 const LAYER_LABEL: Record<DossierLayerName, string> = {
   material: "материал проекта",
@@ -44,10 +51,15 @@ const LAYER_LABEL: Record<DossierLayerName, string> = {
   crib: "шпаргалка проекта",
 };
 
-/** Читает DOCX, PPTX, XLSX, TXT или PDF. Чужой формат и пустой текст неготовы. */
-export function readProjectFile(name: string, bytes: Uint8Array): ReadProjectFileResult {
+/** Читает DOCX, PPTX, XLSX, TXT, PDF или картинку. Чужой формат и пустой текст неготовы. */
+export async function readProjectFile(
+  name: string,
+  bytes: Uint8Array,
+  recognize: PageRecognizer = defaultRecognizer,
+): Promise<ReadProjectFileResult> {
   try {
-    switch (extension(name)) {
+    const ext = extension(name);
+    switch (ext) {
       case ".docx":
         return readOfficeText(bytes, readDocx);
       case ".pptx":
@@ -57,8 +69,11 @@ export function readProjectFile(name: string, bytes: Uint8Array): ReadProjectFil
       case ".txt":
         return readTxt(bytes);
       case ".pdf":
-        return readPdf(bytes);
+        return await readPdf(bytes, recognize);
       default:
+        if (isImageName(ext)) {
+          return await readImage(bytes, recognize);
+        }
         return { ready: false };
     }
   } catch {
@@ -70,15 +85,18 @@ export function readProjectFile(name: string, bytes: Uint8Array): ReadProjectFil
  * Кладёт прочитанный файл в названный слой.
  * Без слоя файл никуда не входит. Непрочитанный остаётся без текста.
  */
-export function acceptProjectFile(
+export async function acceptProjectFile(
   store: ProjectFileStore,
   draft: { caseId: string; name: string; bytes: Uint8Array; layer?: string; executorId?: string },
-): AcceptProjectFileResult {
+  recognize?: PageRecognizer,
+): Promise<AcceptProjectFileResult> {
   const name = draft.name.trim();
   if (!name) {
     return { ok: false, reason: "incomplete" };
   }
-  const read = readProjectFile(name, draft.bytes);
+  const read = recognize
+    ? await readProjectFile(name, draft.bytes, recognize)
+    : await readProjectFile(name, draft.bytes);
   if (!read.ready) {
     const noted = store.noteUnreadFile({ caseId: draft.caseId, name, executorId: draft.executorId });
     if (!noted.ok) {
@@ -96,6 +114,7 @@ export function acceptProjectFile(
     layer,
     extractedText: read.text,
     places: read.places,
+    recognized: read.recognized,
     executorId: draft.executorId,
   });
   if (!saved.ok) {
@@ -134,12 +153,34 @@ function extension(name: string): string {
   return base.slice(dot);
 }
 
-function readyText(text: string, places: SourcePlace[] = []): ReadProjectFileResult {
+function isImageName(ext: string): boolean {
+  return (
+    ext === ".png" ||
+    ext === ".jpg" ||
+    ext === ".jpeg" ||
+    ext === ".webp" ||
+    ext === ".gif" ||
+    ext === ".bmp" ||
+    ext === ".tif" ||
+    ext === ".tiff"
+  );
+}
+
+/** Картинка целиком. Без распознавателя и без надписи файл неготов. */
+async function readImage(bytes: Uint8Array, recognize: PageRecognizer | undefined): Promise<ReadProjectFileResult> {
+  if (!recognize || bytes.length === 0 || bytes.length > TEXT_LIMIT) {
+    return { ready: false };
+  }
+  const text = (await recognize.recognize(bytes)).trim();
+  return readyText(text, [], true);
+}
+
+function readyText(text: string, places: SourcePlace[] = [], recognized = false): ReadProjectFileResult {
   const trimmed = text.trim();
   if (!trimmed) {
     return { ready: false };
   }
-  return { ready: true, text: trimmed, places };
+  return { ready: true, text: trimmed, places, recognized };
 }
 
 function readOfficeText(
@@ -206,15 +247,31 @@ function readTxt(bytes: Uint8Array): ReadProjectFileResult {
   return readyText(decoded);
 }
 
-function readPdf(bytes: Uint8Array): ReadProjectFileResult {
+async function readPdf(bytes: Uint8Array, recognize: PageRecognizer | undefined): Promise<ReadProjectFileResult> {
+  const data = Buffer.from(bytes);
   const parts: string[] = [];
-  for (const stream of pdfStreams(Buffer.from(bytes))) {
+  for (const stream of pdfStreams(data)) {
     const text = textFromPdfContent(stream);
     if (text.trim()) {
       parts.push(text);
     }
   }
-  return readyText(parts.join("\n"));
+  const textLayer = readyText(parts.join("\n"));
+  if (textLayer.ready || !recognize) {
+    return textLayer;
+  }
+  const lines: string[] = [];
+  for (const image of pdfImages(data)) {
+    try {
+      const text = (await recognize.recognize(image)).trim();
+      if (text) {
+        lines.push(text);
+      }
+    } catch {
+      // Сбой распознавания надписью не становится.
+    }
+  }
+  return readyText(lines.join("\n"), [], true);
 }
 
 function decodeText(bytes: Uint8Array): string | undefined {
@@ -579,9 +636,10 @@ function inflateZip(method: number, compressed: Buffer): Uint8Array | undefined 
   }
 }
 
-function pdfStreams(data: Buffer): Buffer[] {
+/** Потоки PDF в порядке файла. Граница берётся из /Length, если она есть. */
+function pdfRawStreams(data: Buffer): { dictionary: string; raw: Buffer }[] {
   const latin = data.toString("latin1");
-  const streams: Buffer[] = [];
+  const objects: { dictionary: string; raw: Buffer }[] = [];
   let from = 0;
   while (from < latin.length) {
     const at = latin.indexOf("stream", from);
@@ -605,35 +663,162 @@ function pdfStreams(data: Buffer): Buffer[] {
     if (end < start || end > data.length) {
       break;
     }
-    const raw = data.subarray(start, end);
-    from = (length ? end : end + "endstream".length);
-    if (dictionary.includes("/Subtype") && dictionary.includes("/Image")) {
+    objects.push({ dictionary, raw: data.subarray(start, end) });
+    from = length ? end : end + "endstream".length;
+  }
+  return objects;
+}
+
+/** Картинки страницы. Текстовый поток сюда не входит. */
+function pdfImages(data: Buffer): Buffer[] {
+  const images: Buffer[] = [];
+  for (const object of pdfRawStreams(data)) {
+    if (!isPdfImage(object.dictionary)) {
       continue;
     }
-    if (dictionary.includes("FlateDecode")) {
+    const decoded = pdfImageBytes(object.dictionary, object.raw);
+    if (decoded && decoded.length > 0) {
+      images.push(decoded);
+    }
+  }
+  return images;
+}
+
+/** JPEG остаётся как в файле. Восьмибитные точки становятся PNG. Чужой фильтр картинкой не считается. */
+function pdfImageBytes(dictionary: string, raw: Buffer): Buffer | undefined {
+  const flate = dictionary.includes("FlateDecode");
+  const jpeg = dictionary.includes("DCTDecode");
+  if (jpeg && !flate) {
+    return raw.length <= TEXT_LIMIT ? raw : undefined;
+  }
+  if (flate && !jpeg && !dictionary.includes("JPXDecode") && !dictionary.includes("CCITTFaxDecode")) {
+    try {
+      const inflated = inflateSync(raw, { maxOutputLength: TEXT_LIMIT });
+      return pngFromPdfSamples(dictionary, inflated);
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function isPdfImage(dictionary: string): boolean {
+  return /\/Subtype\s*\/Image\b/.test(dictionary);
+}
+
+/** Сырые точки без ширины и числа каналов распознавателю не отдаются. */
+function pngFromPdfSamples(dictionary: string, samples: Buffer): Buffer | undefined {
+  const width = pdfDictionaryNumber(dictionary, "Width");
+  const height = pdfDictionaryNumber(dictionary, "Height");
+  const bits = pdfDictionaryNumber(dictionary, "BitsPerComponent");
+  const channels = dictionary.includes("/DeviceGray") ? 1 : dictionary.includes("/DeviceRGB") ? 3 : 0;
+  if (!width || !height || bits !== 8 || channels === 0) {
+    return undefined;
+  }
+  if (samples.length !== width * height * channels) {
+    return undefined;
+  }
+  return png(width, height, channels, samples);
+}
+
+function pdfDictionaryNumber(dictionary: string, name: string): number | undefined {
+  const match = new RegExp(`/${name}\\s+(\\d+)`).exec(dictionary);
+  if (!match) {
+    return undefined;
+  }
+  const value = Number(match[1]);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    return undefined;
+  }
+  return value;
+}
+
+function png(width: number, height: number, channels: 1 | 3, samples: Buffer): Buffer | undefined {
+  const row = width * channels;
+  const raw = Buffer.alloc((row + 1) * height);
+  for (let y = 0; y < height; y += 1) {
+    raw[y * (row + 1)] = 0;
+    samples.copy(raw, y * (row + 1) + 1, y * row, (y + 1) * row);
+  }
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8;
+  header[9] = channels === 1 ? 0 : 2;
+  const body = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", deflateSync(raw)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+  return body.length <= TEXT_LIMIT ? body : undefined;
+}
+
+function pngChunk(type: string, data: Buffer): Buffer {
+  const name = Buffer.from(type, "ascii");
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length, 0);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([name, data])), 0);
+  return Buffer.concat([length, name, data, crc]);
+}
+
+function crc32(bytes: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      const mask = -(crc & 1);
+      crc = (crc >>> 1) ^ (0xedb88320 & mask);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pdfStreams(data: Buffer): Buffer[] {
+  const streams: Buffer[] = [];
+  for (const object of pdfRawStreams(data)) {
+    if (isPdfImage(object.dictionary)) {
+      continue;
+    }
+    if (object.dictionary.includes("FlateDecode")) {
       try {
-        streams.push(inflateSync(raw, { maxOutputLength: TEXT_LIMIT }));
+        streams.push(inflateSync(object.raw, { maxOutputLength: TEXT_LIMIT }));
       } catch {
         continue;
       }
     } else {
-      streams.push(raw);
+      streams.push(object.raw);
     }
   }
   return streams;
 }
 
-/** Словарь этого потока, а не предыдущего объекта. */
+/** Словарь этого потока целиком, вместе с вложенным /DecodeParms. Чужой объект не захватывается. */
 function streamDictionary(latin: string, streamAt: number): string {
-  const dictEnd = latin.lastIndexOf(">>", streamAt);
-  if (dictEnd < 0) {
+  const close = latin.lastIndexOf(">>", streamAt);
+  if (close < 0) {
     return "";
   }
-  const dictStart = latin.lastIndexOf("<<", dictEnd);
-  if (dictStart < 0) {
-    return "";
+  let depth = 0;
+  let index = close + 1;
+  while (index >= 1) {
+    if (latin[index] === ">" && latin[index - 1] === ">") {
+      depth += 1;
+      index -= 2;
+      continue;
+    }
+    if (latin[index] === "<" && latin[index - 1] === "<") {
+      depth -= 1;
+      if (depth === 0) {
+        return latin.slice(index - 1, close + 2);
+      }
+      index -= 2;
+      continue;
+    }
+    index -= 1;
   }
-  return latin.slice(dictStart, dictEnd + 2);
+  return "";
 }
 
 function textFromPdfContent(content: Buffer): string {
