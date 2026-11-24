@@ -39,6 +39,7 @@ const NEIGHBOUR = "Полный соседний файл.";
 const PREVIOUS_TEXT = "Прежний текст файла про приёмку.";
 const NEXT_TEXT = "Новый текст файла про приёмку.";
 const OTHER_MODEL = "чужой вектор другой модели";
+const RECOGNIZED_SCAN = "ночная выгрузка со сканера";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -79,7 +80,8 @@ function scriptedEmbeddings(): EmbeddingPort {
         text.includes(WEIGHT_15) ||
         text.includes(WEIGHT_18) ||
         text.includes(WEIGHT_15_DOT) ||
-        text.includes(WEIGHT_500_T);
+        text.includes(WEIGHT_500_T) ||
+        text.includes(RECOGNIZED_SCAN);
       return close ? axis(0) : axis(1);
     },
   };
@@ -857,4 +859,29 @@ test("прежний индекс без имени модели остаётс�
   } finally {
     check.close();
   }
+});
+
+test("распознанный скан в поиск этой поставки не входит", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start(calls);
+  const prepared = prepare(trainer);
+  assert.ok(
+    trainer
+      .addSourceFile({
+        caseId: prepared.caseId,
+        name: "скан.pdf",
+        layer: "material",
+        extractedText: RECOGNIZED_SCAN,
+        recognized: true,
+      }).ok,
+  );
+  addFile(trainer, prepared.caseId, "places.txt", "material", PALLET);
+
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(PALLET), true);
+  assert.equal(prompt.includes(RECOGNIZED_SCAN), false);
 });

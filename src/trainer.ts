@@ -110,6 +110,8 @@ export type SourceFileRecord = {
   layer: DossierLayerName;
   extractedText: string;
   places: SourcePlace[];
+  /** Надпись снята с картинки. В поиск этой поставки такой текст не входит. */
+  recognized: boolean;
 };
 
 /** Файл проекта без текста. В слой не входит и в черновик не попадает. */
@@ -427,7 +429,8 @@ function schemaSql(): string {
       case_id TEXT NOT NULL REFERENCES cases(id),
       name TEXT NOT NULL,
       layer TEXT NOT NULL CHECK (layer IN ('material', 'serviceLayer', 'crib')),
-      extracted_text TEXT NOT NULL
+      extracted_text TEXT NOT NULL,
+      recognized INTEGER NOT NULL DEFAULT 0
     ) STRICT;
 
     CREATE INDEX IF NOT EXISTS source_files_case
@@ -490,7 +493,8 @@ function schemaSql(): string {
       session_id TEXT NOT NULL REFERENCES sessions(id),
       name TEXT NOT NULL,
       layer TEXT NOT NULL CHECK (layer IN ('material', 'serviceLayer', 'crib')),
-      extracted_text TEXT NOT NULL
+      extracted_text TEXT NOT NULL,
+      recognized INTEGER NOT NULL DEFAULT 0
     ) STRICT;
 
     CREATE INDEX IF NOT EXISTS session_files_session
@@ -697,6 +701,23 @@ function ensureFragmentShape(database: DatabaseSync): void {
   const names = new Set(rows.map((row) => textColumn(row, "name")));
   if (!names.has("model_name")) {
     database.exec("ALTER TABLE session_fragments ADD COLUMN model_name TEXT NOT NULL DEFAULT ''");
+  }
+}
+
+/**
+ * Прежний файл не был распознан с картинки.
+ * Колонка добавляется нулём: записанный текст остаётся, поиск его не теряет.
+ */
+function ensureRecognizedShape(database: DatabaseSync): void {
+  for (const table of ["source_files", "session_files"]) {
+    const rows = database.prepare(`PRAGMA table_info(${table})`).all() as Row[];
+    if (rows.length === 0) {
+      continue;
+    }
+    const names = new Set(rows.map((row) => textColumn(row, "name")));
+    if (!names.has("recognized")) {
+      database.exec(`ALTER TABLE ${table} ADD COLUMN recognized INTEGER NOT NULL DEFAULT 0`);
+    }
   }
 }
 
@@ -1784,6 +1805,7 @@ function readSourceFileRecord(row: Row, places: SourcePlace[]): SourceFileRecord
     layer,
     extractedText: textColumn(row, "extracted_text"),
     places,
+    recognized: integerColumn(row, "recognized") === 1,
   };
 }
 
@@ -1858,6 +1880,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     ensureSessionShape(database);
     ensureProfileShape(database);
     ensureFragmentShape(database);
+    ensureRecognizedShape(database);
     migrateLegacyKeys(database, directory);
     if (hasPlaintextSecret(database) || vacuumPending(database)) {
       setVacuumPending(database, true);
@@ -1963,7 +1986,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
   function loadSourceFiles(caseId: string): SourceFileRecord[] {
     const rows = database
       .prepare(
-        `SELECT id, case_id, name, layer, extracted_text
+        `SELECT id, case_id, name, layer, extracted_text, recognized
          FROM source_files WHERE case_id = ? ORDER BY rowid`,
       )
       .all(caseId) as Row[];
@@ -1980,17 +2003,22 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
   /** Снимок текстов файлов на момент открытия. Поздний файл сюда не входит. */
   function rememberSessionFiles(sessionId: string, caseId: string): void {
     const insert = database.prepare(
-      "INSERT INTO session_files (id, session_id, name, layer, extracted_text) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO session_files (id, session_id, name, layer, extracted_text, recognized) VALUES (?, ?, ?, ?, ?, ?)",
     );
     for (const file of loadSourceFiles(caseId)) {
-      insert.run(randomUUID(), sessionId, file.name, file.layer, file.extractedText);
+      insert.run(randomUUID(), sessionId, file.name, file.layer, file.extractedText, file.recognized ? 1 : 0);
     }
   }
 
-  function loadHeldFiles(sessionId: string): { name: string; layer: DossierLayerName; text: string }[] {
+  function loadHeldFiles(sessionId: string): {
+    name: string;
+    layer: DossierLayerName;
+    text: string;
+    recognized: boolean;
+  }[] {
     const rows = database
       .prepare(
-        `SELECT name, layer, extracted_text
+        `SELECT name, layer, extracted_text, recognized
          FROM session_files WHERE session_id = ? ORDER BY rowid`,
       )
       .all(sessionId) as Row[];
@@ -1999,7 +2027,12 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       if (!isDossierLayer(layer)) {
         throw new Error("Запись хранилища повреждена");
       }
-      return { name: textColumn(row, "name"), layer, text: textColumn(row, "extracted_text") };
+      return {
+        name: textColumn(row, "name"),
+        layer,
+        text: textColumn(row, "extracted_text"),
+        recognized: integerColumn(row, "recognized") === 1,
+      };
     });
   }
 
@@ -2296,6 +2329,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     name: string;
     layer: DossierLayerName;
     text: string;
+    recognized: boolean;
   }): Promise<IndexedRow[] | undefined> {
     if (!embeddings || (file.layer !== "material" && file.layer !== "serviceLayer")) {
       return undefined;
@@ -2317,6 +2351,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     name: string;
     layer: DossierLayerName;
     text: string;
+    recognized: boolean;
   }): Promise<IndexedRow[] | undefined> {
     if (!embeddings || (file.layer !== "material" && file.layer !== "serviceLayer")) {
       return undefined;
@@ -2363,6 +2398,9 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     const rows: { layer: "material" | "serviceLayer"; body: string; vector: readonly number[] }[] = [];
     const edgeRows: { layer: "material" | "serviceLayer"; body: string; vector: readonly number[] }[] = [];
     for (const file of loadHeldFiles(sessionId)) {
+      if (file.recognized) {
+        continue;
+      }
       try {
         const complete = await vectorsOfFile(file);
         if (complete) {
@@ -2781,6 +2819,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       layer: string;
       extractedText: string;
       places?: readonly SourcePlace[];
+      recognized?: boolean;
       executorId?: string;
     }): AddSourceFileResult {
       if (foreignExecutor(draft.executorId)) {
@@ -2800,6 +2839,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         return { ok: false, reason: "missing" };
       }
       const places = keptPlaces(draft.places);
+      const recognized = draft.recognized === true;
       const file: SourceFileRecord = {
         id: randomUUID(),
         caseId,
@@ -2807,6 +2847,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         layer,
         extractedText,
         places,
+        recognized,
       };
       inTransaction(database, () => {
         const previous = database
@@ -2820,8 +2861,10 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
           removeFile.run(id);
         }
         database
-          .prepare("INSERT INTO source_files (id, case_id, name, layer, extracted_text) VALUES (?, ?, ?, ?, ?)")
-          .run(file.id, file.caseId, file.name, file.layer, file.extractedText);
+          .prepare(
+            "INSERT INTO source_files (id, case_id, name, layer, extracted_text, recognized) VALUES (?, ?, ?, ?, ?, ?)",
+          )
+          .run(file.id, file.caseId, file.name, file.layer, file.extractedText, recognized ? 1 : 0);
         const insertPlace = database.prepare(
           "INSERT INTO source_places (file_id, position, slide) VALUES (?, ?, ?)",
         );

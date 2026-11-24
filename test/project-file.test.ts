@@ -2,13 +2,18 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { after, test } from "node:test";
-import { deflateRawSync, deflateSync } from "node:zlib";
+import { deflateRawSync, deflateSync, inflateSync } from "node:zlib";
 
+import { type ModelPort } from "../src/model.ts";
 import { acceptProjectFile, readProjectFile } from "../src/project-file.ts";
 import { openTrainer } from "../src/trainer.ts";
 
 const PHRASE = "Приёмка паллет на рампе";
+const SCAN = "склад принимает паллеты";
+const PAGE = Uint8Array.of(0x53, 0x43, 0x41, 0x4e, 0x01, 0x02, 0x03, 0x04);
+const BLANK = Uint8Array.of(0xff, 0xd8, 0xff, 0xd9);
 const HEADER = "Вес паллеты";
 const VALUE = "840";
 
@@ -138,12 +143,12 @@ after(() => {
   }
 });
 
-test("DOCX попадает в материал проекта, который назвал владелец", () => {
+test("DOCX попадает в материал проекта, который назвал владелец", async () => {
   const { trainer, caseId } = start();
   const before = trainer.readApprovedDossier(caseId);
   const name = "паллеты.docx";
 
-  const unread = acceptProjectFile(trainer, {
+  const unread = await acceptProjectFile(trainer, {
     caseId,
     name,
     bytes: Buffer.from(PHRASE, "utf8"),
@@ -154,7 +159,7 @@ test("DOCX попадает в материал проекта, который �
   assert.equal(JSON.stringify(trainer.listSourceFiles(caseId)).includes(PHRASE), false);
   assert.equal(trainer.listUnreadFiles(caseId).some((file) => file.name === name), true);
 
-  const taken = acceptProjectFile(trainer, {
+  const taken = await acceptProjectFile(trainer, {
     caseId,
     name,
     bytes: docx(PHRASE),
@@ -173,9 +178,9 @@ test("DOCX попадает в материал проекта, который �
   assert.deepEqual(trainer.readApprovedDossier(caseId), before);
 });
 
-test("PPTX сохраняет фразу и номер слайда", () => {
+test("PPTX сохраняет фразу и номер слайда", async () => {
   const { trainer, caseId } = start();
-  const taken = acceptProjectFile(trainer, {
+  const taken = await acceptProjectFile(trainer, {
     caseId,
     name: "слайды.pptx",
     bytes: pptx(["Титул", PHRASE]),
@@ -194,8 +199,8 @@ test("PPTX сохраняет фразу и номер слайда", () => {
   assert.equal(stored?.extractedText.includes(PHRASE), true);
 });
 
-test("XLSX отдаёт заголовок столбца и значение", () => {
-  const read = readProjectFile("вес.xlsx", xlsx(HEADER, VALUE));
+test("XLSX отдаёт заголовок столбца и значение", async () => {
+  const read = await readProjectFile("вес.xlsx", xlsx(HEADER, VALUE));
   assert.equal(read.ready, true);
   if (!read.ready) {
     return;
@@ -204,9 +209,9 @@ test("XLSX отдаёт заголовок столбца и значение", 
   assert.equal(read.text.includes(VALUE), true);
 });
 
-test("TXT в понятной кодировке читается, а неразборчивый не готов", () => {
+test("TXT в понятной кодировке читается, а неразборчивый не готов", async () => {
   const { trainer, caseId } = start();
-  const encoded = acceptProjectFile(trainer, {
+  const encoded = await acceptProjectFile(trainer, {
     caseId,
     name: "заметка.txt",
     bytes: Buffer.from(`\uFEFF${PHRASE}`, "utf8"),
@@ -223,18 +228,18 @@ test("TXT в понятной кодировке читается, а нераз
     0xcf, 0xf0, 0xe8, 0xb8, 0xec, 0xea, 0xe0, 0x20, 0xef, 0xe0, 0xeb, 0xeb, 0xe5, 0xf2, 0x20, 0xed, 0xe0, 0x20, 0xf0,
     0xe0, 0xec, 0xef, 0xe5,
   ]);
-  const legacy = readProjectFile("заметка-1251.txt", windows1251);
+  const legacy = await readProjectFile("заметка-1251.txt", windows1251);
   assert.equal(legacy.ready, true);
   if (legacy.ready) {
     assert.equal(legacy.text.includes(PHRASE), true);
   }
 
   const garbage = Uint8Array.from([0xff, 0x00, 0x80]);
-  const read = readProjectFile("битый.txt", garbage);
+  const read = await readProjectFile("битый.txt", garbage);
   assert.equal(read.ready, false);
   assert.equal(JSON.stringify(read).includes(PHRASE), false);
 
-  const unread = acceptProjectFile(trainer, {
+  const unread = await acceptProjectFile(trainer, {
     caseId,
     name: "битый.txt",
     bytes: garbage,
@@ -245,7 +250,7 @@ test("TXT в понятной кодировке читается, а нераз
   assert.equal(trainer.listSourceFiles(caseId).some((file) => file.name === "битый.txt"), false);
   assert.equal(trainer.listUnreadFiles(caseId).some((file) => file.name === "битый.txt"), true);
 
-  const empty = acceptProjectFile(trainer, {
+  const empty = await acceptProjectFile(trainer, {
     caseId,
     name: "пустой.txt",
     bytes: new Uint8Array(),
@@ -257,16 +262,16 @@ test("TXT в понятной кодировке читается, а нераз
   assert.equal(JSON.stringify(empty).includes(PHRASE), false);
 });
 
-test("PDF без текстового слоя не прочитан и абзац не выдуман", () => {
+test("PDF без текстового слоя не прочитан и абзац не выдуман", async () => {
   const { trainer, caseId } = start();
   const before = trainer.readApprovedDossier(caseId);
-  const withText = readProjectFile("текст.pdf", pdf(`BT (${PHRASE}) Tj ET`));
+  const withText = await readProjectFile("текст.pdf", pdf(`BT (${PHRASE}) Tj ET`));
   assert.equal(withText.ready, true);
   if (withText.ready) {
     assert.equal(withText.text.includes(PHRASE), true);
   }
 
-  const refused = acceptProjectFile(trainer, {
+  const refused = await acceptProjectFile(trainer, {
     caseId,
     name: "скан.pdf",
     bytes: pdf("0 0 10 10 re f"),
@@ -276,7 +281,7 @@ test("PDF без текстового слоя не прочитан и абза
   assert.deepEqual(refused, { ok: false, reason: "forbidden" });
   assert.deepEqual(trainer.listUnreadFiles(caseId), []);
 
-  const unread = acceptProjectFile(trainer, {
+  const unread = await acceptProjectFile(trainer, {
     caseId,
     name: "скан.pdf",
     bytes: pdf("0 0 10 10 re f"),
@@ -291,9 +296,9 @@ test("PDF без текстового слоя не прочитан и абза
   assert.deepEqual(trainer.readApprovedDossier(caseId), before);
 });
 
-test("прочитанный файл без названного слоя ни в один слой не входит", () => {
+test("прочитанный файл без названного слоя ни в один слой не входит", async () => {
   const { trainer, caseId } = start();
-  const taken = acceptProjectFile(trainer, {
+  const taken = await acceptProjectFile(trainer, {
     caseId,
     name: "служебный-слой.docx",
     bytes: docx(PHRASE),
@@ -311,13 +316,13 @@ test("прочитанный файл без названного слоя ни 
   }
 });
 
-test("TXT с управляющим байтом не готов", () => {
-  assert.equal(readProjectFile("nul.txt", Uint8Array.of(0)).ready, false);
-  assert.equal(readProjectFile("nul.txt", Buffer.from("а\0б", "utf8")).ready, false);
+test("TXT с управляющим байтом не готов", async () => {
+  assert.equal((await readProjectFile("nul.txt", Uint8Array.of(0))).ready, false);
+  assert.equal((await readProjectFile("nul.txt", Buffer.from("а\0б", "utf8"))).ready, false);
 });
 
-test("XLSX не сдвигает значение и не берёт чужую строку", () => {
-  const read = readProjectFile(
+test("XLSX не сдвигает значение и не берёт чужую строку", async () => {
+  const read = await readProjectFile(
     "вес.xlsx",
     zip({
       "xl/sharedStrings.xml": `<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>ЧУЖОЙ</t></si></sst>`,
@@ -338,8 +343,8 @@ test("XLSX не сдвигает значение и не берёт чужую 
   assert.equal(read.text.includes("Вес"), true);
 });
 
-test("DOCX читает числовую ссылку один раз", () => {
-  const read = readProjectFile(
+test("DOCX читает числовую ссылку один раз", async () => {
+  const read = await readProjectFile(
     "ссылка.docx",
     zip({
       "word/document.xml": `<?xml version="1.0"?>
@@ -353,8 +358,8 @@ test("DOCX читает числовую ссылку один раз", () => {
   }
 });
 
-test("PPTX держит абзацы и порядок показа", () => {
-  const paragraphs = readProjectFile(
+test("PPTX держит абзацы и порядок показа", async () => {
+  const paragraphs = await readProjectFile(
     "абзацы.pptx",
     zip({ "ppt/slides/slide1.xml": slideXml(["Net", "weight"]) }),
   );
@@ -363,7 +368,7 @@ test("PPTX держит абзацы и порядок показа", () => {
     assert.equal(paragraphs.text, "Net\nweight");
   }
 
-  const ordered = readProjectFile(
+  const ordered = await readProjectFile(
     "порядок.pptx",
     zip({
       "ppt/slides/slide1.xml": slideXml([PHRASE]),
@@ -382,8 +387,8 @@ test("PPTX держит абзацы и порядок показа", () => {
   assert.deepEqual(ordered.places, [{ slide: 1 }, { slide: 2 }]);
 });
 
-test("PDF не берёт комментарий и сжатый текст, картинка рядом не гасит страницу", () => {
-  const commented = readProjectFile("комментарий.pdf", pdf(`% (Выдуманный абзац) Tj\nBT (${PHRASE}) Tj ET`));
+test("PDF не берёт комментарий и сжатый текст, картинка рядом не гасит страницу", async () => {
+  const commented = await readProjectFile("комментарий.pdf", pdf(`% (Выдуманный абзац) Tj\nBT (${PHRASE}) Tj ET`));
   assert.equal(commented.ready, true);
   if (commented.ready) {
     assert.equal(commented.text.includes(PHRASE), true);
@@ -392,7 +397,7 @@ test("PDF не берёт комментарий и сжатый текст, к�
 
   const content = Buffer.from(`BT (${PHRASE}) Tj ET`, "utf8");
   const compressed = deflateSync(content);
-  const inflated = readProjectFile(
+  const inflated = await readProjectFile(
     "сжатый.pdf",
     Buffer.concat([
       Buffer.from(`%PDF-1.4\n1 0 obj\n<< /Filter /FlateDecode /Length ${compressed.length} >>\nstream\n`),
@@ -406,7 +411,7 @@ test("PDF не берёт комментарий и сжатый текст, к�
   }
 
   const page = Buffer.from(`BT (${PHRASE}) Tj ET`, "utf8");
-  const besideImage = readProjectFile(
+  const besideImage = await readProjectFile(
     "рядом.pdf",
     Buffer.concat([
       Buffer.from("%PDF-1.4\n1 0 obj\n<< /Subtype /Image /Length 4 >>\nstream\nXXXX\nendstream\nendobj\n2 0 obj\n"),
@@ -421,7 +426,7 @@ test("PDF не берёт комментарий и сжатый текст, к�
   }
 });
 
-test("номер слайда, который не помещается в хранилище, не записывается", () => {
+test("номер слайда, который не помещается в хранилище, не записывается", async () => {
   const { trainer, caseId } = start();
   const saved = trainer.addSourceFile({
     caseId,
@@ -435,6 +440,261 @@ test("номер слайда, который не помещается в хр�
     assert.deepEqual(saved.file.places, [{ slide: 2 }]);
   }
   assert.deepEqual(trainer.listSourceFiles(caseId)[0]?.places, [{ slide: 2 }]);
+});
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) {
+    return false;
+  }
+  for (let index = 0; index < left.byteLength; index += 1) {
+    if (left[index] !== right[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Надпись знает только распознаватель и только по байтам этой картинки. В файле фразы нет. */
+function recognizePage(image: Uint8Array, text: string) {
+  return {
+    async recognize(page: Uint8Array) {
+      return sameBytes(page, image) ? text : "";
+    },
+  };
+}
+
+function pdfFlateImage(samples: Buffer, width: number, height: number, gray: boolean): Buffer {
+  const compressed = deflateSync(samples);
+  const color = gray ? "/DeviceGray" : "/DeviceRGB";
+  const content = Buffer.from("q 10 0 0 10 0 0 cm /Im0 Do Q");
+  const dictionary = `<< /Type /XObject /Subtype /Image /Width ${width} /Height ${height} /ColorSpace ${color} /BitsPerComponent 8 /Filter /FlateDecode /Length ${compressed.length} >>`;
+  return Buffer.concat([
+    Buffer.from(`%PDF-1.4\n1 0 obj\n${dictionary}\nstream\n`),
+    compressed,
+    Buffer.from(`\nendstream\nendobj\n2 0 obj\n<< /Length ${content.length} >>\nstream\n`),
+    content,
+    Buffer.from("\nendstream\nendobj\n"),
+  ]);
+}
+
+function pngSample(image: Uint8Array): number | undefined {
+  const data = Buffer.from(image);
+  if (data[0] !== 0x89 || data[1] !== 0x50) {
+    return undefined;
+  }
+  let offset = 8;
+  while (offset + 12 <= data.length) {
+    const length = data.readUInt32BE(offset);
+    const type = data.toString("ascii", offset + 4, offset + 8);
+    const chunk = data.subarray(offset + 8, offset + 8 + length);
+    if (type === "IDAT") {
+      return inflateSync(chunk)[1];
+    }
+    offset += 12 + length;
+  }
+  return undefined;
+}
+
+/** PDF без текстового слоя: картинка страницы и оператор показа, без Tj. */
+function pdfImage(image: Uint8Array): Buffer {
+  const pixels = Buffer.from(image);
+  const content = Buffer.from("q 100 0 0 100 0 0 cm /Im0 Do Q");
+  return Buffer.concat([
+    Buffer.from(
+      `%PDF-1.4\n1 0 obj\n<< /Type /XObject /Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode /Length ${pixels.length} >>\nstream\n`,
+    ),
+    pixels,
+    Buffer.from(`\nendstream\nendobj\n2 0 obj\n<< /Length ${content.length} >>\nstream\n`),
+    content,
+    Buffer.from("\nendstream\nendobj\n"),
+  ]);
+}
+
+function recordingModel(seen: string[]): ModelPort {
+  return {
+    async *complete(call) {
+      seen.push(call.messages.map((message) => message.text).join("\n"));
+      yield JSON.stringify({ material: "Черновик.", serviceLayer: "", crib: "" });
+    },
+  };
+}
+
+test("скан pdf с надписью входит в черновик названного слоя", async () => {
+  const seen: string[] = [];
+  const trainer = openTrainer(tempDirectory(), recordingModel(seen));
+  opened.push(trainer);
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада" });
+  assert.ok(saved.ok);
+  const caseId = saved.caseRecord.id;
+  const approved = trainer.approveDossier({
+    caseId,
+    material: "Другой факт.",
+    serviceLayer: "Маржа подрядчика.",
+    crib: "Спросить про сроки.",
+  });
+  assert.ok(approved.ok);
+  assert.deepEqual(trainer.saveKey({
+    protocol: "anthropic",
+    baseAddress: "https://api.anthropic.com",
+    modelName: "claude-sonnet",
+    secret: "sk-ant-api03-secret-WXYZ",
+  }), { ok: true });
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+
+  const read = await readProjectFile("скан.pdf", pdfImage(PAGE), recognizePage(PAGE, SCAN));
+  assert.equal(read.ready, true);
+  if (read.ready) {
+    assert.equal(read.text.includes(SCAN), true);
+    assert.equal(read.recognized, true);
+  }
+  assert.equal(Buffer.from(pdfImage(PAGE)).toString("utf8").includes(SCAN), false);
+
+  const taken = await acceptProjectFile(
+    trainer,
+    { caseId, name: "скан.pdf", bytes: pdfImage(PAGE), layer: "материал проекта" },
+    recognizePage(PAGE, SCAN),
+  );
+  assert.equal(taken.ok, true);
+  assert.equal(taken.ready, true);
+  assert.equal(taken.filed, true);
+  if (taken.ok && taken.ready && taken.filed) {
+    assert.equal(taken.file.extractedText.includes(SCAN), true);
+    assert.equal(taken.file.layer, "material");
+    assert.equal(taken.file.recognized, true);
+  }
+
+  const drafted = await trainer.draftDossier({
+    caseId,
+    keyId,
+    material: "Другой факт.",
+    serviceLayer: "",
+    crib: "",
+  });
+  assert.equal(drafted.ok, true);
+  assert.equal(seen[0]?.includes(SCAN), true);
+  assert.equal(seen[0]?.includes("Другой факт."), true);
+});
+
+test("картинка без надписи не прочитана и абзац не выдуман", async () => {
+  const { trainer, caseId } = start();
+  const before = trainer.readApprovedDossier(caseId);
+  const read = await readProjectFile("пустая.png", BLANK, recognizePage(PAGE, SCAN));
+  assert.equal(read.ready, false);
+  assert.equal(JSON.stringify(read).includes(SCAN), false);
+
+  const unread = await acceptProjectFile(
+    trainer,
+    { caseId, name: "пустая.png", bytes: BLANK, layer: "материал проекта" },
+    recognizePage(PAGE, SCAN),
+  );
+  assert.equal(unread.ok, true);
+  assert.equal(unread.ready, false);
+  assert.equal(JSON.stringify(unread).includes(SCAN), false);
+  assert.equal(trainer.listSourceFiles(caseId).some((file) => file.name === "пустая.png"), false);
+  assert.equal(trainer.listUnreadFiles(caseId).some((file) => file.name === "пустая.png"), true);
+  assert.deepEqual(trainer.readApprovedDossier(caseId), before);
+
+  const drawing = await readProjectFile("рисунок.pdf", pdf("0 0 10 10 re f"), recognizePage(PAGE, SCAN));
+  assert.equal(drawing.ready, false);
+  assert.equal(JSON.stringify(drawing).includes(SCAN), false);
+});
+
+test("распознанный скан без названного слоя ни в один слой не входит", async () => {
+  const { trainer, caseId } = start();
+  const taken = await acceptProjectFile(
+    trainer,
+    { caseId, name: "скан.pdf", bytes: pdfImage(PAGE) },
+    recognizePage(PAGE, SCAN),
+  );
+  assert.equal(taken.ok, true);
+  assert.equal(taken.ready, true);
+  assert.equal(taken.filed, false);
+  if (taken.ok && taken.ready && !taken.filed) {
+    assert.equal(taken.text.includes(SCAN), true);
+  }
+  assert.deepEqual(trainer.listSourceFiles(caseId), []);
+  assert.deepEqual(trainer.listUnreadFiles(caseId), []);
+});
+
+test("текст pdf не подменяется распознаванием, pptx из рисунка не читается", async () => {
+  const inventsParagraph = {
+    async recognize() {
+      return "Выдуманный абзац";
+    },
+  };
+  const text = await readProjectFile("текст.pdf", pdf(`BT (${PHRASE}) Tj ET`), inventsParagraph);
+  assert.equal(text.ready, true);
+  if (text.ready) {
+    assert.equal(text.text.includes(PHRASE), true);
+    assert.equal(text.text.includes("Выдуманный абзац"), false);
+    assert.equal(text.recognized, false);
+  }
+
+  const slide = await readProjectFile("рисунок.pptx", pptx([""]), inventsParagraph);
+  assert.equal(slide.ready, false);
+  assert.equal(JSON.stringify(slide).includes("Выдуманный абзац"), false);
+  const sheet = await readProjectFile("рисунок.xlsx", xlsx("", ""), inventsParagraph);
+  assert.equal(sheet.ready, false);
+});
+
+test("сжатые точки страницы приходят распознавателю картинкой", async () => {
+  const seen: Uint8Array[] = [];
+  const read = await readProjectFile("точки.pdf", pdfFlateImage(Buffer.of(255), 1, 1, true), {
+    async recognize(image) {
+      seen.push(image);
+      return image[0] === 0x89 && image[1] === 0x50 ? SCAN : "";
+    },
+  });
+  assert.equal(read.ready, true);
+  if (read.ready) {
+    assert.equal(read.text.includes(SCAN), true);
+    assert.equal(read.recognized, true);
+  }
+  assert.equal(seen.length, 1);
+  assert.equal(pngSample(seen[0] ?? new Uint8Array()), 255);
+
+  const broken = await readProjectFile("битые-точки.pdf", pdfFlateImage(Buffer.of(1, 2, 3, 4), 1, 1, true), {
+    async recognize() {
+      return SCAN;
+    },
+  });
+  assert.equal(broken.ready, false);
+  assert.equal(JSON.stringify(broken).includes(SCAN), false);
+});
+
+test("прежний файл остаётся и без отметки распознавания", async () => {
+  const directory = tempDirectory();
+  const database = new DatabaseSync(join(directory, "store.sqlite"));
+  database.exec(`
+    CREATE TABLE customers (id TEXT PRIMARY KEY, name TEXT NOT NULL) STRICT;
+    CREATE TABLE cases (
+      id TEXT PRIMARY KEY,
+      customer_id TEXT NOT NULL REFERENCES customers(id),
+      title TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE source_files (
+      id TEXT PRIMARY KEY,
+      case_id TEXT NOT NULL REFERENCES cases(id),
+      name TEXT NOT NULL,
+      layer TEXT NOT NULL,
+      extracted_text TEXT NOT NULL
+    ) STRICT;
+    INSERT INTO customers (id, name) VALUES ('c1', 'Север');
+    INSERT INTO cases (id, customer_id, title) VALUES ('case-1', 'c1', 'Склад');
+    INSERT INTO source_files (id, case_id, name, layer, extracted_text)
+    VALUES ('file-1', 'case-1', 'заметка.txt', 'material', '${PHRASE}');
+  `);
+  database.close();
+
+  const trainer = openTrainer(directory);
+  opened.push(trainer);
+  const stored = trainer.listSourceFiles("case-1");
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0]?.name, "заметка.txt");
+  assert.equal(stored[0]?.extractedText, PHRASE);
+  assert.equal(stored[0]?.recognized, false);
+  assert.equal(trainer.readCase("case-1")?.title, "Склад");
 });
 
 function slideXml(paragraphs: readonly string[]): string {
