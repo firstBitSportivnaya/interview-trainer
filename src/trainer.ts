@@ -2688,6 +2688,30 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     },
 
     /**
+     * Первый ключ установки, секрет которого открывается.
+     * Список ключей по-прежнему отдаёт только хвост секрета.
+     */
+    readableKey(): KeyDraft | undefined {
+      const rows = database
+        .prepare("SELECT id, protocol, base_address, model_name, secret FROM keys ORDER BY rowid")
+        .all() as Row[];
+      for (const row of rows) {
+        const stored = readStoredKey(row, databaseFile);
+        const secret = revealSecret(stored.secret);
+        if (!secret?.trim()) {
+          continue;
+        }
+        return {
+          protocol: stored.protocol,
+          baseAddress: stored.baseAddress,
+          modelName: stored.modelName,
+          secret,
+        };
+      }
+      return undefined;
+    },
+
+    /**
      * Одним действием заводит заказчика и первый проект.
      * Пустое имя или название не создают проект. Пустой список персонажей остаётся пустым.
      */
