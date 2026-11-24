@@ -2147,8 +2147,30 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     }
   }
 
+  async function vectorsOfFile(
+    file: { layer: DossierLayerName; text: string },
+  ): Promise<{ layer: "material" | "serviceLayer"; body: string; vector: readonly number[] }[] | undefined> {
+    if (!embeddings || (file.layer !== "material" && file.layer !== "serviceLayer")) {
+      return undefined;
+    }
+    const bodies = splitFragments(file.text);
+    if (bodies.length === 0) {
+      return undefined;
+    }
+    const rows: { layer: "material" | "serviceLayer"; body: string; vector: readonly number[] }[] = [];
+    for (const body of bodies) {
+      const vector = await embeddings.embed(body, "passage");
+      if (!usableVector(vector)) {
+        return undefined;
+      }
+      rows.push({ layer: file.layer, body, vector });
+    }
+    return rows;
+  }
+
   /**
    * Считает векторы текстов, с которыми открыта сессия, вне транзакции.
+   * Файл входит в поиск только полным набором. Пустой текст и обрыв готовыми не считаются.
    * Шпаргалка проекта в индекс не входит. Повторный ход тот же набор не пересчитывает.
    */
   async function buildFragmentIndex(sessionId: string): Promise<void> {
@@ -2159,22 +2181,16 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     if (ready) {
       return;
     }
-    const pieces: { layer: "material" | "serviceLayer"; body: string }[] = [];
-    for (const file of loadHeldFiles(sessionId)) {
-      if (file.layer !== "material" && file.layer !== "serviceLayer") {
-        continue;
-      }
-      for (const body of splitFragments(file.text)) {
-        pieces.push({ layer: file.layer, body });
-      }
-    }
     const rows: { layer: "material" | "serviceLayer"; body: string; vector: readonly number[] }[] = [];
-    for (const piece of pieces) {
-      const vector = await embeddings.embed(piece.body, "passage");
-      if (!usableVector(vector)) {
-        continue;
+    for (const file of loadHeldFiles(sessionId)) {
+      try {
+        const complete = await vectorsOfFile(file);
+        if (complete) {
+          rows.push(...complete);
+        }
+      } catch {
+        // Обрыв расчёта оставляет этот файл неготовым. Уже собранные файлы сохраняются.
       }
-      rows.push({ layer: piece.layer, body: piece.body, vector });
     }
     if (rows.length === 0) {
       return;
@@ -2514,6 +2530,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     /**
      * Записывает файл проекта в названный слой.
      * Пустой или чужой слой файлом не становится: ядро слой по имени файла не выбирает.
+     * Повтор того же имени заменяет прежний текст. Открытая сессия держит свой снимок.
      * Запись не меняет утверждённое досье и сессию не открывает.
      */
     addSourceFile(draft: {
@@ -2550,6 +2567,16 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         places,
       };
       inTransaction(database, () => {
+        const previous = database
+          .prepare("SELECT id FROM source_files WHERE case_id = ? AND name = ?")
+          .all(file.caseId, file.name) as Row[];
+        const removePlaces = database.prepare("DELETE FROM source_places WHERE file_id = ?");
+        const removeFile = database.prepare("DELETE FROM source_files WHERE id = ?");
+        for (const row of previous) {
+          const id = textColumn(row, "id");
+          removePlaces.run(id);
+          removeFile.run(id);
+        }
         database
           .prepare("INSERT INTO source_files (id, case_id, name, layer, extracted_text) VALUES (?, ?, ?, ?, ?)")
           .run(file.id, file.caseId, file.name, file.layer, file.extractedText);
