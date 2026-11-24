@@ -20,6 +20,10 @@ const PDF_PROSE = "В протоколе тип паллеты связан с �
 const SERVICE_EDGE = "Служебный лимит";
 const CRIB_EDGE = "Шпаргалка проекта";
 const ASK_PALLET = "Задай вопрос про паллету.";
+const SIGNED_TABLE = "Тип паллеты\t-500\nFIN\t-600";
+const NO_HEIGHT = "Ограничения по высоте нет.";
+const HEIGHT_TABLE = "Тип паллеты\tМаксимальная высота\nEUR\t3";
+const HEIGHT_EDGE = "Тип паллеты — Максимальная высота";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -212,4 +216,52 @@ test("абзац и pdf не становятся ребром графа", asyn
   assert.equal(prompt.includes(PDF_PROSE), true);
   assert.equal(prompt.includes(EDGE), false);
   assert.equal(prompt.includes(EDGE_RULE), false);
+});
+
+test("отрицательное число первой строки не называется", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start(calls);
+  const prepared = prepare(trainer);
+  addFile(trainer, prepared.caseId, "знаки.xlsx", "material", SIGNED_TABLE);
+
+  const openedSession = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: prepared.dossierId,
+    side: "заказчик",
+    character: "заказчик",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  assert.ok(openedSession.ok);
+  await take(trainer.reply(openedSession.session.id, ASK_PALLET));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes("-500"), false);
+  assert.equal(prompt.includes("-600"), false);
+  assert.equal(prompt.includes("Тип паллеты"), true);
+});
+
+test("связь про высоту не отдаётся, если досье отрицает ограничение по высоте", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = start(calls);
+  const prepared = prepare(trainer, NO_HEIGHT);
+  addFile(trainer, prepared.caseId, "высота.xlsx", "material", HEIGHT_TABLE);
+
+  const openedSession = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: prepared.dossierId,
+    side: "заказчик",
+    character: "заказчик",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  assert.ok(openedSession.ok);
+  await take(trainer.reply(openedSession.session.id, ASK_PALLET));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(HEIGHT_EDGE), false);
+  assert.equal(prompt.includes("Максимальная высота"), false);
+  assert.equal(prompt.includes(NO_HEIGHT), true);
 });

@@ -821,9 +821,22 @@ function spreadsheetName(name: string): boolean {
   return name.toLowerCase().endsWith(".xlsx");
 }
 
-/** Число ячейки. «500 кг» — число. Заголовок «Максимальный вес» — нет. */
+/** Число ячейки. «-500» и «500 кг» — числа. Заголовок «Максимальный вес» — нет. */
 function numericCell(cell: string): boolean {
-  return /^\d+(?:[.,]\d+)?(?:\s+[а-яёa-z]{1,12})?$/iu.test(cell);
+  return /^-?\d+(?:[.,]\d+)?(?:\s+[а-яёa-z]{1,12})?$/iu.test(cell);
+}
+
+/** Текст таблицы без числовых ячеек. Число не остаётся во фрагменте, если связи нет. */
+function textWithoutNumericCells(text: string): string {
+  return text
+    .split("\n")
+    .map((line) =>
+      line
+        .split("\t")
+        .filter((cell) => cell.trim().length > 0 && !numericCell(cell.trim()))
+        .join("\t"),
+    )
+    .join("\n");
 }
 
 /**
@@ -958,9 +971,19 @@ function matterKey(word: string): string {
   return folded;
 }
 
-/** Один предмет: то же слово или две формы «вес». */
+/**
+ * Основа не короче четырёх букв сводит падеж: «высоте» и «высота».
+ * «весы», «весь» и «весовой» с «вес» не сходятся.
+ */
+function matterStem(word: string): string {
+  const key = matterKey(word);
+  const stem = key.replace(/[аеёиоуыэюя]$/u, "");
+  return stem.length >= 4 ? stem : key;
+}
+
+/** Один предмет: то же слово, формы «вес» или общая основа. */
 function sameMatter(left: string, right: string): boolean {
-  return matterKey(left) === matterKey(right);
+  return matterStem(left) === matterStem(right);
 }
 
 function pushRestrictions(claims: MatterClaim[], folded: string, pattern: RegExp, kind: "absent" | "present"): void {
@@ -2277,11 +2300,12 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     if (!embeddings || (file.layer !== "material" && file.layer !== "serviceLayer")) {
       return undefined;
     }
+    const source = spreadsheetName(file.name) ? textWithoutNumericCells(file.text) : file.text;
     // Связь таблицы заменяет сырой фрагмент: число ячейки в ход не входит.
     if (spreadsheetName(file.name) && tableEdges(file.text).length > 0) {
       return [];
     }
-    const bodies = splitFragments(file.text);
+    const bodies = splitFragments(source);
     if (bodies.length === 0) {
       return undefined;
     }
