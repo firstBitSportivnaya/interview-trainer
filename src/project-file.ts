@@ -794,17 +794,31 @@ function pdfStreams(data: Buffer): Buffer[] {
   return streams;
 }
 
-/** Словарь этого потока, а не предыдущего объекта. */
+/** Словарь этого потока целиком, вместе с вложенным /DecodeParms. Чужой объект не захватывается. */
 function streamDictionary(latin: string, streamAt: number): string {
-  const dictEnd = latin.lastIndexOf(">>", streamAt);
-  if (dictEnd < 0) {
+  const close = latin.lastIndexOf(">>", streamAt);
+  if (close < 0) {
     return "";
   }
-  const dictStart = latin.lastIndexOf("<<", dictEnd);
-  if (dictStart < 0) {
-    return "";
+  let depth = 0;
+  let index = close + 1;
+  while (index >= 1) {
+    if (latin[index] === ">" && latin[index - 1] === ">") {
+      depth += 1;
+      index -= 2;
+      continue;
+    }
+    if (latin[index] === "<" && latin[index - 1] === "<") {
+      depth -= 1;
+      if (depth === 0) {
+        return latin.slice(index - 1, close + 2);
+      }
+      index -= 2;
+      continue;
+    }
+    index -= 1;
   }
-  return latin.slice(dictStart, dictEnd + 2);
+  return "";
 }
 
 function textFromPdfContent(content: Buffer): string {

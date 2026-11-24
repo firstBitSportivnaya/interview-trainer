@@ -13,7 +13,12 @@ type TesseractApi = {
   createWorker(
     langs: string,
     oem: number,
-    options: { langPath: string; cachePath: string; gzip: boolean },
+    options: {
+      langPath: string;
+      cachePath: string;
+      gzip: boolean;
+      errorHandler?: (error: unknown) => void;
+    },
   ): Promise<{
     recognize(image: Buffer): Promise<{ data: { text?: string } }>;
   }>;
@@ -24,7 +29,6 @@ type TesseractApi = {
  * Файл rus.traineddata лежит в каталоге на машине владельца.
  * Пока его нет, надписи нет и расчёт наружу не ходит.
  */
-/** Каталог rus.traineddata внутри каталога владельца. */
 export function installationRecognizer(ownerDirectory: string): PageRecognizer {
   return liveRecognizer(join(ownerDirectory, "models", "tesseract"));
 }
@@ -54,6 +58,8 @@ async function openWorker(modelDirectory: string): Promise<PageRecognizer> {
     langPath: modelDirectory,
     cachePath: modelDirectory,
     gzip: false,
+    // Отказ уже отклоняет обещание. Второй бросок из колбэка роняет процесс.
+    errorHandler() {},
   });
   return {
     async recognize(image) {

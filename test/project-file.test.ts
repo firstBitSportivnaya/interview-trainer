@@ -638,6 +638,24 @@ test("текст pdf не подменяется распознаванием, p
   assert.equal(sheet.ready, false);
 });
 
+test("вложенный словарь картинки не прячет надпись", async () => {
+  const pixels = Buffer.from(PAGE);
+  const content = Buffer.from("q 100 0 0 100 0 0 cm /Im0 Do Q");
+  const dictionary = `<< /Type /XObject /Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode /DecodeParms << /Predictor 1 >> /Length ${pixels.length} >>`;
+  const bytes = Buffer.concat([
+    Buffer.from(`%PDF-1.4\n1 0 obj\n${dictionary}\nstream\n`),
+    pixels,
+    Buffer.from(`\nendstream\nendobj\n2 0 obj\n<< /Length ${content.length} >>\nstream\n`),
+    content,
+    Buffer.from("\nendstream\nendobj\n"),
+  ]);
+  const read = await readProjectFile("вложенный.pdf", bytes, recognizePage(PAGE, SCAN));
+  assert.equal(read.ready, true);
+  if (read.ready) {
+    assert.equal(read.text.includes(SCAN), true);
+  }
+});
+
 test("сжатые точки страницы приходят распознавателю картинкой", async () => {
   const seen: Uint8Array[] = [];
   const read = await readProjectFile("точки.pdf", pdfFlateImage(Buffer.of(255), 1, 1, true), {
