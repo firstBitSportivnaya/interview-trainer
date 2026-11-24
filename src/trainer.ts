@@ -255,6 +255,12 @@ export type OpenSessionResult =
   | { ok: true; session: SessionRecord }
   | { ok: false; reason: "open" | "missing" | "role" | "side" | "incomplete" | "assignment" };
 
+/** Назначение исполнителя на проект. Владельцу отдельной строки нет. */
+export type AssignmentRecord = {
+  executorId: string;
+  caseId: string;
+};
+
 /** Отказ назначить исполнителя: поля пустые, проекта нет или назначает не владелец. */
 export type AssignExecutorResult =
   | { ok: true }
@@ -3080,6 +3086,20 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       }
       database.prepare("DELETE FROM assignments WHERE executor_id = ? AND case_id = ?").run(executorId, caseId);
       return { ok: true };
+    },
+
+    /** Возвращает назначения проекта в порядке записи. Нет проекта — списка нет. */
+    listAssignments(caseId: string): AssignmentRecord[] {
+      if (!caseExists(caseId)) {
+        return [];
+      }
+      const rows = database
+        .prepare("SELECT executor_id, case_id FROM assignments WHERE case_id = ? ORDER BY rowid")
+        .all(caseId) as Row[];
+      return rows.map((row) => ({
+        executorId: textColumn(row, "executor_id"),
+        caseId: textColumn(row, "case_id"),
+      }));
     },
 
     /**
