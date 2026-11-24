@@ -225,6 +225,18 @@ test("ошибка записи не останавливает веб", async (
     acceptProposal() {
       return { ok: false, reason: "missing" };
     },
+    assignExecutor() {
+      return { ok: false, reason: "missing" };
+    },
+    revokeAssignment() {
+      return { ok: false, reason: "missing" };
+    },
+    listUnreadFiles() {
+      return [];
+    },
+    listAssignments() {
+      return [];
+    },
   });
 
   try {
@@ -1319,5 +1331,321 @@ test("веб снимает сигнал и расхождение и прини
   } finally {
     await close(server);
     trainer.close();
+  }
+});
+
+test("страница записывает назначение, и то же ядро его видит", async () => {
+  const directory = tempDirectory();
+  const trainer = start(directory);
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+  assert.ok(saved.ok);
+  const approved = trainer.approveDossier({
+    caseId: saved.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: "Маржа подрядчика 12%.",
+    crib: "Спросить про сроки.",
+  });
+  assert.ok(approved.ok);
+  const dossier = approved.dossier;
+  assert.deepEqual(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-WXYZ",
+    }),
+    { ok: true },
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const server = await startWeb(trainer);
+
+  const executorId = "другой<script>";
+  const openAs = (role: string) =>
+    trainer.openSession({
+      caseId: saved.caseRecord.id,
+      dossierId: dossier.id,
+      side: "заказчик",
+      character: "Анна",
+      role,
+      executorId,
+      keyId,
+    });
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    const before = await (await fetch(`${base}/cases/${saved.caseRecord.id}`)).text();
+    assert.equal(before.includes("Записать назначение"), true);
+    assert.equal(before.includes("Назначений пока нет."), true);
+    assert.equal(before.includes('type="password"'), false);
+    assert.deepEqual(openAs("аналитик"), { ok: false, reason: "assignment" });
+
+    const empty = await fetch(`${base}/cases/${saved.caseRecord.id}/assignment`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ executorId: "  ", act: "assign" }),
+    });
+    const emptyPage = await empty.text();
+    assert.equal(empty.status, 200);
+    assert.equal(emptyPage.includes("Укажите исполнителя."), true);
+    assert.deepEqual(openAs("аналитик"), { ok: false, reason: "assignment" });
+
+    const foreign = await fetch(`${base}/cases/${saved.caseRecord.id}/assignment`, {
+      method: "POST",
+      headers: { ...headers, origin: "https://evil.example" },
+      body: new URLSearchParams({ executorId: "другой-исполнитель", act: "assign" }),
+    });
+    assert.equal(foreign.status, 403);
+    assert.deepEqual(openAs("аналитик"), { ok: false, reason: "assignment" });
+
+    const missing = await fetch(`${base}/cases/${encodeURIComponent("нет-такого-проекта")}/assignment`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ executorId: "другой-исполнитель", act: "assign" }),
+    });
+    assert.equal(missing.status, 404);
+
+    const assigned = await fetch(`${base}/cases/${saved.caseRecord.id}/assignment`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ executorId, act: "assign" }),
+    });
+    assert.equal(assigned.status, 200);
+    const assignedPage = await assigned.text();
+    assert.equal(assignedPage.includes("другой&lt;script&gt;"), true);
+    assert.equal(assignedPage.includes("другой<script>"), false);
+    assert.equal(assignedPage.includes("Назначений пока нет."), false);
+    assert.deepEqual(trainer.listAssignments(saved.caseRecord.id), [
+      { executorId, caseId: saved.caseRecord.id },
+    ]);
+    const seen = openAs("разработчик");
+    assert.ok(seen.ok);
+    assert.equal(seen.session.executorId, executorId);
+    assert.equal(seen.session.caseId, saved.caseRecord.id);
+    assert.deepEqual(trainer.readApprovedDossier(saved.caseRecord.id), dossier);
+  } finally {
+    await close(server);
+  }
+
+  const again = start(directory);
+  const stored = again.listCases().find((item) => item.title === "Внедрение склада");
+  assert.ok(stored);
+  const storedDossier = again.readApprovedDossier(stored.id);
+  const storedKey = again.listKeys()[0]?.id;
+  assert.ok(storedDossier && storedKey);
+  const reopened = again.openSession({
+    caseId: stored.id,
+    dossierId: storedDossier.id,
+    side: "заказчик",
+    character: "Анна",
+      role: "функциональный архитектор",
+      executorId: "другой<script>",
+      keyId: storedKey,
+    });
+    assert.ok(reopened.ok);
+    assert.equal(reopened.session.executorId, "другой<script>");
+    assert.deepEqual(again.listAssignments(stored.id), [{ executorId: "другой<script>", caseId: stored.id }]);
+  });
+
+test("страница отзывает назначение, и то же ядро его не видит", async () => {
+  const directory = tempDirectory();
+  const trainer = start(directory);
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+  assert.ok(saved.ok);
+  const approved = trainer.approveDossier({
+    caseId: saved.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: "Маржа подрядчика 12%.",
+    crib: "Спросить про сроки.",
+  });
+  assert.ok(approved.ok);
+  assert.deepEqual(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-WXYZ",
+    }),
+    { ok: true },
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  assert.deepEqual(trainer.assignExecutor({ executorId: "другой-исполнитель", caseId: saved.caseRecord.id }), {
+    ok: true,
+  });
+  const held = trainer.openSession({
+    caseId: saved.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "другой-исполнитель",
+    keyId,
+  });
+  assert.ok(held.ok);
+  const server = await startWeb(trainer);
+
+  const openAs = (role: string) =>
+    trainer.openSession({
+      caseId: saved.caseRecord.id,
+      dossierId: approved.dossier.id,
+      side: "заказчик",
+      character: "Анна",
+      role,
+      executorId: "другой-исполнитель",
+      keyId,
+    });
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+
+    const empty = await fetch(`${base}/cases/${saved.caseRecord.id}/assignment`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ executorId: "", act: "revoke" }),
+    });
+    const emptyPage = await empty.text();
+    assert.equal(emptyPage.includes("Укажите исполнителя."), true);
+    assert.equal(emptyPage.includes("другой-исполнитель"), true);
+    assert.ok(openAs("разработчик").ok);
+
+    const other = await fetch(`${base}/cases/${saved.caseRecord.id}/assignment`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ executorId: "никто", act: "revoke" }),
+    });
+    const otherPage = await other.text();
+    assert.equal(otherPage.includes("Назначения на этот проект нет."), true);
+    assert.equal(trainer.readSession(held.session.id)?.status, "open");
+
+    const foreign = await fetch(`${base}/cases/${saved.caseRecord.id}/assignment`, {
+      method: "POST",
+      headers: { ...headers, origin: "https://evil.example" },
+      body: new URLSearchParams({ executorId: "другой-исполнитель", act: "revoke" }),
+    });
+    assert.equal(foreign.status, 403);
+    assert.equal(trainer.readSession(held.session.id)?.dossierId, approved.dossier.id);
+
+    const revoked = await fetch(`${base}/cases/${saved.caseRecord.id}/assignment`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ executorId: "другой-исполнитель", act: "revoke" }),
+    });
+    const page = await revoked.text();
+    assert.equal(revoked.status, 200);
+    assert.equal(page.includes("Назначения на этот проект нет."), false);
+    assert.equal(page.includes("другой-исполнитель"), false);
+    assert.equal(page.includes("Назначений пока нет."), true);
+    assert.deepEqual(trainer.listAssignments(saved.caseRecord.id), []);
+    assert.equal(trainer.readSession(held.session.id)?.status, "open");
+    assert.equal(trainer.readSession(held.session.id)?.dossierId, approved.dossier.id);
+    assert.deepEqual(openAs("функциональный архитектор"), { ok: false, reason: "assignment" });
+  } finally {
+    await close(server);
+  }
+
+  const again = start(directory);
+  const stored = again.listCases().find((item) => item.title === "Внедрение склада");
+  assert.ok(stored);
+  const storedDossier = again.readApprovedDossier(stored.id);
+  const storedKey = again.listKeys()[0]?.id;
+  assert.ok(storedDossier && storedKey);
+  assert.deepEqual(
+    again.openSession({
+      caseId: stored.id,
+      dossierId: storedDossier.id,
+      side: "заказчик",
+      character: "Анна",
+      role: "технический архитектор",
+      executorId: "другой-исполнитель",
+      keyId: storedKey,
+    }),
+    { ok: false, reason: "assignment" },
+  );
+  assert.equal(again.readSession(held.session.id)?.status, "open");
+});
+
+test("страница показывает непрочитанный файл и не помечает файл в названном слое", async () => {
+  const trainer = start(tempDirectory());
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+  assert.ok(saved.ok);
+  const other = trainer.saveCase({ customerName: "Юг", title: "Касса", characters: [] });
+  assert.ok(other.ok);
+  assert.ok(trainer.noteUnreadFile({ caseId: saved.caseRecord.id, name: "скан.pdf" }).ok);
+  assert.ok(trainer.noteUnreadFile({ caseId: other.caseRecord.id, name: "чужой.pdf" }).ok);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const unread = await (await fetch(`${base}/cases/${saved.caseRecord.id}`)).text();
+    assert.equal(unread.includes("скан.pdf — не прочитан"), true);
+    assert.equal(unread.includes("чужой.pdf"), false);
+    assert.equal(unread.includes("скан.pdf — Материал проекта"), false);
+
+    assert.ok(
+      trainer.addSourceFile({
+        caseId: saved.caseRecord.id,
+        name: "скан.pdf",
+        layer: "material",
+        extractedText: "Склад принимает паллеты.",
+      }).ok,
+    );
+    const read = await (await fetch(`${base}/cases/${saved.caseRecord.id}`)).text();
+    assert.equal(read.includes("скан.pdf — не прочитан"), false);
+    assert.equal(read.includes("скан.pdf — Материал проекта"), true);
+    assert.equal(read.includes("чужой.pdf"), false);
+    assert.equal(read.includes("Склад принимает паллеты."), false);
+
+    assert.ok(
+      trainer.addSourceFile({
+        caseId: saved.caseRecord.id,
+        name: "протокол.xlsx",
+        layer: "serviceLayer",
+        extractedText: "ТЕКСТ-СЛОЯ",
+      }).ok,
+    );
+    assert.ok(trainer.noteUnreadFile({ caseId: saved.caseRecord.id, name: "протокол.xlsx" }).ok);
+    const both = await (await fetch(`${base}/cases/${saved.caseRecord.id}`)).text();
+    assert.equal(both.includes("протокол.xlsx — Служебный слой"), true);
+    assert.equal(both.includes("протокол.xlsx — не прочитан"), false);
+    assert.equal(both.includes("ТЕКСТ-СЛОЯ"), false);
+    assert.equal(
+      trainer.listSourceFiles(saved.caseRecord.id).some((file) => file.name === "протокол.xlsx" && file.extractedText === "ТЕКСТ-СЛОЯ"),
+      true,
+    );
+  } finally {
+    await close(server);
+  }
+});
+
+test("у веба первой версии нет отдельного входа для исполнителя, который не владелец", async () => {
+  const trainer = start(tempDirectory());
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+  assert.ok(saved.ok);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const home = await (await fetch(base)).text();
+    const cases = await (await fetch(`${base}/cases`)).text();
+    const project = await (await fetch(`${base}/cases/${saved.caseRecord.id}`)).text();
+    assert.equal(home.includes("не спрашивает пароль"), true);
+    assert.equal(home.includes("Войти"), false);
+    assert.equal(cases.includes("Войти"), false);
+    assert.equal(project.includes("Войти"), false);
+    assert.equal(project.includes('type="password"'), false);
+    assert.equal(project.includes('<select name="executorId"'), false);
+    assert.equal(project.includes("Отдельного входа для исполнителя, который не владелец, нет."), true);
+    assert.equal((await fetch(`${base}/login`)).status, 404);
+    assert.equal((await fetch(`${base}/executor`)).status, 404);
+    assert.equal((await fetch(`${base}/enter`)).status, 404);
+  } finally {
+    await close(server);
   }
 });

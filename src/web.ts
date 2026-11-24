@@ -16,12 +16,15 @@ import {
   type KeyDraft,
   type KeySummary,
   type AcceptProposalResult,
+  type AssignExecutorResult,
+  type AssignmentRecord,
   type DismissPreparationResult,
   type FinishSessionResult,
   type OpenSessionResult,
   type OwnerProfile,
   type PreparationEntry,
   type ReviewRecord,
+  type RevokeAssignmentResult,
   type SaveCaseResult,
   type SaveKeyResult,
   type SessionRecord,
@@ -29,6 +32,7 @@ import {
   type SourceFileRecord,
   type SpeechEvent,
   type TranscriptLine,
+  type UnreadFileRecord,
 } from "./trainer.ts";
 
 /** Ядро, которым веб пользуется тем же путём, что и проверка. */
@@ -74,9 +78,13 @@ type Trainer = {
   readPreparationEntry(entryId: string): PreparationEntry | undefined;
   dismissPreparation(entryId: string): DismissPreparationResult;
   acceptProposal(entryId: string): AcceptProposalResult;
+  assignExecutor(draft: { executorId: string; caseId: string; actorId?: string }): AssignExecutorResult;
+  revokeAssignment(draft: { executorId: string; caseId: string; actorId?: string }): RevokeAssignmentResult;
+  listUnreadFiles(caseId: string): UnreadFileRecord[];
+  listAssignments(caseId: string): AssignmentRecord[];
 };
 
-type CaseAction = "draft" | "approve" | "session" | "file" | "portfolio" | "preparation";
+type CaseAction = "draft" | "approve" | "session" | "file" | "portfolio" | "preparation" | "assignment";
 type SessionAction = "opening" | "ask" | "finish";
 
 const PROTOCOL_LABEL: Record<KeySummary["protocol"], string> = {
@@ -119,6 +127,12 @@ const FILE_ERROR: Record<Exclude<AddSourceFileResult, { ok: true }>["reason"], s
   forbidden: "Слой файла называет владелец.",
   incomplete: "Укажите имя файла и извлечённый текст.",
   missing: "Проект не найден.",
+};
+
+const ASSIGNMENT_ERROR: Record<Exclude<AssignExecutorResult, { ok: true }>["reason"], string> = {
+  incomplete: "Укажите исполнителя.",
+  missing: "Назначения на этот проект нет.",
+  forbidden: "Назначение записывает владелец.",
 };
 
 const LAYER_LABEL: Record<DossierLayerName, string> = {
@@ -587,11 +601,22 @@ function renderSession(trainer: Trainer, session: SessionRecord, error?: string)
 /** Список файлов и форма слоя. Первый пункт списка пустой: слой не выбран заранее. */
 function renderSourceFiles(trainer: Trainer, item: CaseRecord, error?: string): string {
   const files = trainer.listSourceFiles(item.id);
+  const readNames = new Set(files.map((file) => file.name));
+  // Имя в названном слое уже прочитано. Поздняя отметка без текста страницу не перебивает и текст слоя не стирает.
+  const unread = trainer.listUnreadFiles(item.id).filter((file) => !readNames.has(file.name));
   const items =
     files.length === 0
-      ? "<p>Файлов проекта пока нет.</p>"
+      ? unread.length === 0
+        ? "<p>Файлов проекта пока нет.</p>"
+        : ""
       : `<ul>${files
           .map((file) => `<li>${escapeHtml(file.name)} — ${escapeHtml(LAYER_LABEL[file.layer])}</li>`)
+          .join("")}</ul>`;
+  const unreadItems =
+    unread.length === 0
+      ? ""
+      : `<ul id="unread-files">${unread
+          .map((file) => `<li>${escapeHtml(file.name)} — не прочитан</li>`)
           .join("")}</ul>`;
   const options = (Object.entries(LAYER_LABEL) as [DossierLayerName, string][])
     .map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`)
@@ -600,6 +625,7 @@ function renderSourceFiles(trainer: Trainer, item: CaseRecord, error?: string): 
     <h2>Файлы проекта</h2>
     <p>Слой назначает владелец. Новый файл не меняет утверждённое досье и в сессию не попадает.</p>
     ${notice(error)}
+    ${unreadItems}
     ${items}
     <form method="post" action="${escapeHtml(casePath(item.id, "/file"))}">
       <label>Имя файла
@@ -619,6 +645,30 @@ function renderSourceFiles(trainer: Trainer, item: CaseRecord, error?: string): 
   </section>`;
 }
 
+/** Запись и отзыв назначения. Строку хранит ядро, страница второго списка не заводит. */
+function assignmentBlock(trainer: Trainer, item: CaseRecord, error?: string): string {
+  const assignments = trainer.listAssignments(item.id);
+  const items =
+    assignments.length === 0
+      ? "<p>Назначений пока нет.</p>"
+      : `<ul id="assignments">${assignments
+          .map((assignment) => `<li>${escapeHtml(assignment.executorId)}</li>`)
+          .join("")}</ul>`;
+  return `<section>
+    <h2>Назначение</h2>
+    <p>Владелец записывает назначение исполнителя на этот проект. Сессию по своему проекту владелец открывает без назначения. Отдельного входа для исполнителя, который не владелец, нет.</p>
+    ${notice(error)}
+    ${items}
+    <form method="post" action="${escapeHtml(casePath(item.id, "/assignment"))}">
+      <label>Исполнитель
+        <input name="executorId" autocomplete="off">
+      </label>
+      <button type="submit" name="act" value="assign">Записать назначение</button>
+      <button type="submit" name="act" value="revoke">Отозвать назначение</button>
+    </form>
+  </section>`;
+}
+
 function renderCase(
   trainer: Trainer,
   item: CaseRecord,
@@ -626,6 +676,7 @@ function renderCase(
   paste?: DossierLayers & { keyId: string },
   sessionError?: string,
   fileError?: string,
+  assignmentError?: string,
 ): string {
   const keys = trainer.listKeys();
   const draftForm =
@@ -656,6 +707,7 @@ function renderCase(
       <button type="submit" name="sent" value="0">Снять отметку «портфолио уже отправлено»</button>
     </form>
     ${notice(error)}
+    ${assignmentBlock(trainer, item, assignmentError)}
     ${renderSourceFiles(trainer, item, fileError)}
     ${preparationBlock(trainer, item)}
     ${approvedBlock(trainer, item, sessionError)}
@@ -741,6 +793,13 @@ function knownFileError(reason: string | null): string | undefined {
   return undefined;
 }
 
+function knownAssignmentError(reason: string | null): string | undefined {
+  if (reason === "incomplete" || reason === "missing" || reason === "forbidden") {
+    return ASSIGNMENT_ERROR[reason];
+  }
+  return undefined;
+}
+
 function knownDraftError(reason: string | null): string | undefined {
   if (
     reason === "incomplete" ||
@@ -786,7 +845,9 @@ function allowsFormPost(origin: string | string[] | undefined, port: number): bo
 }
 
 function caseTarget(pathname: string): { id: string; action?: CaseAction } | undefined {
-  const match = pathname.match(/^\/cases\/([^/]+)(?:\/(draft|approve|session|file|portfolio|preparation))?$/);
+  const match = pathname.match(
+    /^\/cases\/([^/]+)(?:\/(draft|approve|session|file|portfolio|preparation|assignment))?$/,
+  );
   const id = match?.[1];
   if (!id) {
     return undefined;
@@ -799,7 +860,8 @@ function caseTarget(pathname: string): { id: string; action?: CaseAction } | und
     action !== "session" &&
     action !== "file" &&
     action !== "portfolio" &&
-    action !== "preparation"
+    action !== "preparation" &&
+    action !== "assignment"
   ) {
     return undefined;
   }
@@ -926,6 +988,7 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
         undefined,
         knownSessionError(url.searchParams.get("sessionError")),
         knownFileError(url.searchParams.get("fileError")),
+        knownAssignmentError(url.searchParams.get("assignmentError")),
       ),
     );
     return;
@@ -1048,6 +1111,34 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
     const sent = fields.get("sent");
     if (sent === "1" || sent === "0") {
       trainer.setPortfolioSent(item.id, sent === "1");
+    }
+    redirect(response, casePath(item.id));
+    return;
+  }
+
+  if (target?.action === "assignment") {
+    const item = trainer.readCase(target.id);
+    if (!item) {
+      refuse(request, response, 404);
+      return;
+    }
+    const executorId = fields.get("executorId") ?? "";
+    const act = fields.get("act");
+    if (act === "assign") {
+      const assigned = trainer.assignExecutor({ executorId, caseId: item.id });
+      redirect(
+        response,
+        assigned.ok ? casePath(item.id) : `${casePath(item.id)}?assignmentError=${assigned.reason}`,
+      );
+      return;
+    }
+    if (act === "revoke") {
+      const revoked = trainer.revokeAssignment({ executorId, caseId: item.id });
+      redirect(
+        response,
+        revoked.ok ? casePath(item.id) : `${casePath(item.id)}?assignmentError=${revoked.reason}`,
+      );
+      return;
     }
     redirect(response, casePath(item.id));
     return;
