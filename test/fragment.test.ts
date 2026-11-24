@@ -747,6 +747,64 @@ test("сохранённый вектор фрагмента нормирова�
   }
 });
 
+test("слишком большой вектор сохраняется единичным, а не нулевым", async () => {
+  const calls: ModelCall[] = [];
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, recorded(calls), {
+    async embed(text, role) {
+      if (role === "query") {
+        return axis(0);
+      }
+      const vector = axis(0);
+      vector[0] = 1e200;
+      return vector;
+    },
+  });
+  opened.push(trainer);
+  const prepared = prepare(trainer);
+  addFile(trainer, prepared.caseId, "places.txt", "material", PALLET);
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+  trainer.close();
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(PALLET), true);
+  const database = new DatabaseSync(join(directory, "store.sqlite"));
+  try {
+    const rows = database.prepare("SELECT vector FROM session_fragments").all() as { vector: string }[];
+    assert.equal(rows.length, 1);
+    const vector = JSON.parse(rows[0]?.vector ?? "[]") as number[];
+    assert.equal(vector[0], 1);
+    assert.equal(vector[1], 0);
+    assert.ok(Math.abs(Math.hypot(...vector) - 1) < 1e-9);
+  } finally {
+    database.close();
+  }
+});
+
+test("сбой расчёта на ходе не обрывает вопрос и не кладёт фрагмент во вход", async () => {
+  const calls: ModelCall[] = [];
+  const trainer = openTrainer(tempDirectory(), recorded(calls), {
+    async embed(text, role) {
+      if (role === "query") {
+        throw new Error("модель не прочитана");
+      }
+      return scriptedEmbeddings().embed(text, role);
+    },
+  });
+  opened.push(trainer);
+  const prepared = prepare(trainer);
+  addFile(trainer, prepared.caseId, "places.txt", "material", PALLET);
+  const openedSession = openCustomer(trainer, prepared);
+  assert.ok(openedSession.ok);
+  await take(trainer.openingQuestion(openedSession.session.id));
+
+  const prompt = calls[0]?.messages[0]?.text ?? "";
+  assert.equal(prompt.includes(DOSSIER_FACT), true);
+  assert.equal(prompt.includes(PALLET), false);
+});
+
 test("прежний индекс без имени модели остаётся и в текущий поиск не входит", async () => {
   const calls: ModelCall[] = [];
   const directory = tempDirectory();

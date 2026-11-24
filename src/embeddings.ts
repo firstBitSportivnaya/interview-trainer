@@ -27,24 +27,26 @@ export type InstallationEmbeddings = {
   embed(text: string, role: "passage" | "query"): Promise<readonly number[]>;
 };
 
-/** Единичный вектор длины 384. Ноль, другая длина и нечисло сюда не входят. */
+/**
+ * Единичный вектор длины 384.
+ * Ноль, другая длина, нечисло и бесконечная норма сюда не входят.
+ * Норма считается устойчиво: квадрат 1e200 не становится бесконечностью и не даёт нулевой вектор.
+ */
 export function unitVector(value: readonly unknown[]): number[] | undefined {
   if (value.length !== EMBEDDING_DIMENSION) {
     return undefined;
   }
   const numbers: number[] = [];
-  let sum = 0;
   for (const item of value) {
     if (typeof item !== "number" || !Number.isFinite(item)) {
       return undefined;
     }
     numbers.push(item);
-    sum += item * item;
   }
-  if (sum === 0) {
+  const norm = Math.hypot(...numbers);
+  if (!Number.isFinite(norm) || norm === 0) {
     return undefined;
   }
-  const norm = Math.sqrt(sum);
   return numbers.map((item) => item / norm);
 }
 

@@ -18,6 +18,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+        env:
+          # На Linux x64 скрипт иначе качает CUDA с GitHub. Процессору она не нужна.
+          ONNXRUNTIME_NODE_INSTALL_CUDA: skip
       - name: Типы
         run: npm run typecheck
       - name: Тесты

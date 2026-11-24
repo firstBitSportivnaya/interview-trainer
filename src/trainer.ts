@@ -2290,7 +2290,13 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       return EMPTY_TURN_FRAGMENTS;
     }
     await ensureFragmentIndex(session.id);
-    const rawQuery = await embeddings.embed(task, "query");
+    let rawQuery: readonly number[];
+    try {
+      rawQuery = await embeddings.embed(task, "query");
+    } catch {
+      // Неполная модель не обрывает ход: вопрос идёт без фрагмента.
+      return EMPTY_TURN_FRAGMENTS;
+    }
     const query = Array.isArray(rawQuery) ? unitVector(rawQuery) : undefined;
     if (!query) {
       return EMPTY_TURN_FRAGMENTS;
