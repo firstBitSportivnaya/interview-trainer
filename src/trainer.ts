@@ -351,6 +351,9 @@ const FRAGMENT_CHARS = 400;
 /** Фрагмент уточняет вопрос. Фактом досье он не становится. */
 const FRAGMENT_RULE = "Фрагмент уточняет вопрос и не произносится как факт.";
 
+/** Связь таблицы уточняет вопрос. Число ячейки фактом не называется. */
+const TABLE_EDGE_RULE = "Связь таблицы уточняет вопрос. Число из таблицы не называй.";
+
 /** Досье число не называет, а фрагменты одного слоя называют разные. Ни одно не факт. */
 const DISPUTED_NUMBERS_RULE = "Фрагменты называют разные числа. Ни одно из этих чисел не произноси как факт.";
 
@@ -504,6 +507,18 @@ function schemaSql(): string {
 
     CREATE INDEX IF NOT EXISTS session_fragments_session
       ON session_fragments(session_id);
+
+    CREATE TABLE IF NOT EXISTS session_edges (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id),
+      layer TEXT NOT NULL CHECK (layer IN ('material', 'serviceLayer')),
+      body TEXT NOT NULL,
+      vector TEXT NOT NULL,
+      model_name TEXT NOT NULL
+    ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS session_edges_session
+      ON session_edges(session_id);
 
     CREATE TABLE IF NOT EXISTS preparation_notes (
       id TEXT PRIMARY KEY,
@@ -801,6 +816,44 @@ function splitFragments(text: string): string[] {
   return fragments;
 }
 
+/** Файл таблицы. Абзац, pdf и прочие форматы связь не задают. */
+function spreadsheetName(name: string): boolean {
+  return name.toLowerCase().endsWith(".xlsx");
+}
+
+/** Число ячейки. «500 кг» — число. Заголовок «Максимальный вес» — нет. */
+function numericCell(cell: string): boolean {
+  return /^\d+(?:[.,]\d+)?(?:\s+[а-яёa-z]{1,12})?$/iu.test(cell);
+}
+
+/**
+ * Связь столбцов, которую таблица уже задала первой строкой.
+ * Числа ячеек в текст связи не входят. Одна колонка связи не даёт.
+ */
+function tableEdges(text: string): string[] {
+  const rows: string[][] = [];
+  for (const line of text.split(/\n/)) {
+    const cells = line.split("\t").map((cell) => cell.trim());
+    if (cells.some((cell) => cell.length > 0)) {
+      rows.push(cells);
+    }
+  }
+  if (rows.length < 2) {
+    return [];
+  }
+  const headers = (rows[0] ?? [])
+    .map((cell) => cell.trim())
+    .filter((cell) => cell.length > 0 && !numericCell(cell));
+  if (headers.length < 2) {
+    return [];
+  }
+  const linked = rows.slice(1).some((row) => row.some((cell) => cell.length > 0));
+  if (!linked) {
+    return [];
+  }
+  return [headers.join(" — ")];
+}
+
 function packFragment(paragraph: string): string[] {
   if (paragraph.length <= FRAGMENT_CHARS) {
     return [paragraph];
@@ -967,12 +1020,26 @@ function contradictsLayer(body: string, approved: readonly MatterClaim[]): boole
   return claimsIn(body).some((claim) => approved.some((item) => claimsConflict(claim, item)));
 }
 
+function mentionsMatter(body: string, matter: string): boolean {
+  const words = body.toLocaleLowerCase("ru").match(/[а-яё]{3,}/gu) ?? [];
+  return words.some((word) => sameMatter(word, matter));
+}
+
+/** Досье говорит, что предмета нет: связь таблицы про него не отдаётся. */
+function edgeBlocked(body: string, approved: readonly MatterClaim[]): boolean {
+  if (contradictsLayer(body, approved)) {
+    return true;
+  }
+  return approved.some((claim) => claim.kind === "absent" && mentionsMatter(body, claim.matter));
+}
+
 type TurnFragments = {
   bodies: readonly string[];
   numbersDisputed: boolean;
+  edges: readonly string[];
 };
 
-const EMPTY_TURN_FRAGMENTS: TurnFragments = { bodies: [], numbersDisputed: false };
+const EMPTY_TURN_FRAGMENTS: TurnFragments = { bodies: [], numbersDisputed: false, edges: [] };
 
 type OpenFragment = {
   layer: "material" | "serviceLayer";
@@ -1042,6 +1109,7 @@ function keepDisputedNumbers(
   return {
     bodies: [...selected, ...extra].map((item) => item.body),
     numbersDisputed,
+    edges: [],
   };
 }
 
@@ -1055,6 +1123,13 @@ function fragmentLines(fragments: readonly string[], numbersDisputed: boolean): 
   }
   lines.push("", "Фрагмент:", fragments.join("\n\n"), "");
   return lines;
+}
+
+function edgeLines(edges: readonly string[]): string[] {
+  if (edges.length === 0) {
+    return [];
+  }
+  return [TABLE_EDGE_RULE, "", "Связь:", edges.join("\n"), ""];
 }
 
 function readStoredVector(raw: string): number[] | undefined {
@@ -1085,6 +1160,7 @@ function customerPrompt(input: {
   history: readonly TranscriptLine[];
   fragments: readonly string[];
   numbersDisputed: boolean;
+  edges: readonly string[];
   profile?: OwnerProfile;
   task: string;
 }): string {
@@ -1117,7 +1193,8 @@ function customerPrompt(input: {
     );
   }
   lines.push("Материал проекта:", input.material, "", "Стенограмма:", historyText(input.history), "");
-  lines.push(...fragmentLines(input.fragments, input.numbersDisputed), input.task);
+  lines.push(...fragmentLines(input.fragments, input.numbersDisputed));
+  lines.push(...edgeLines(input.edges), input.task);
   return lines.join("\n");
 }
 
@@ -1134,6 +1211,7 @@ function internalPrompt(input: {
   history: readonly TranscriptLine[];
   fragments: readonly string[];
   numbersDisputed: boolean;
+  edges: readonly string[];
   task: string;
 }): string {
   return [
@@ -1157,6 +1235,7 @@ function internalPrompt(input: {
     historyText(input.history),
     "",
     ...fragmentLines(input.fragments, input.numbersDisputed),
+    ...edgeLines(input.edges),
     input.task,
   ].join("\n");
 }
@@ -2169,26 +2248,63 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     }
   }
 
-  async function vectorsOfFile(
-    file: { layer: DossierLayerName; text: string },
-  ): Promise<{ layer: "material" | "serviceLayer"; body: string; vector: readonly number[] }[] | undefined> {
-    if (!embeddings || (file.layer !== "material" && file.layer !== "serviceLayer")) {
+  type IndexedRow = { layer: "material" | "serviceLayer"; body: string; vector: readonly number[] };
+
+  async function embedRows(
+    layer: "material" | "serviceLayer",
+    bodies: readonly string[],
+  ): Promise<IndexedRow[] | undefined> {
+    if (!embeddings) {
       return undefined;
     }
-    const bodies = splitFragments(file.text);
-    if (bodies.length === 0) {
-      return undefined;
-    }
-    const rows: { layer: "material" | "serviceLayer"; body: string; vector: readonly number[] }[] = [];
+    const rows: IndexedRow[] = [];
     for (const body of bodies) {
       const raw = await embeddings.embed(body, "passage");
       const vector = Array.isArray(raw) ? unitVector(raw) : undefined;
       if (!vector) {
         return undefined;
       }
-      rows.push({ layer: file.layer, body, vector });
+      rows.push({ layer, body, vector });
     }
     return rows;
+  }
+
+  async function vectorsOfFile(file: {
+    name: string;
+    layer: DossierLayerName;
+    text: string;
+  }): Promise<IndexedRow[] | undefined> {
+    if (!embeddings || (file.layer !== "material" && file.layer !== "serviceLayer")) {
+      return undefined;
+    }
+    // Связь таблицы заменяет сырой фрагмент: число ячейки в ход не входит.
+    if (spreadsheetName(file.name) && tableEdges(file.text).length > 0) {
+      return [];
+    }
+    const bodies = splitFragments(file.text);
+    if (bodies.length === 0) {
+      return undefined;
+    }
+    return embedRows(file.layer, bodies);
+  }
+
+  /** Ребро только из файла таблицы. Абзац и pdf дают пустой набор, не обрыв. */
+  async function edgesOfFile(file: {
+    name: string;
+    layer: DossierLayerName;
+    text: string;
+  }): Promise<IndexedRow[] | undefined> {
+    if (!embeddings || (file.layer !== "material" && file.layer !== "serviceLayer")) {
+      return undefined;
+    }
+    if (!spreadsheetName(file.name)) {
+      return [];
+    }
+    const bodies = tableEdges(file.text);
+    if (bodies.length === 0) {
+      return [];
+    }
+    return embedRows(file.layer, bodies);
   }
 
   /**
@@ -2196,37 +2312,51 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
    * Файл входит в поиск только полным набором. Пустой текст, обрыв, ноль и чужая длина готовыми не считаются.
    * Шпаргалка проекта в индекс не входит. Повторный ход тот же набор этой модели не пересчитывает.
    * Другое имя модели строит свой индекс и чужие векторы не подхватывает.
+   * Связь пишется вместе с фрагментами и только из файла таблицы.
    */
+  function searchIndexReady(sessionId: string, modelName: string): boolean {
+    const fragment = database
+      .prepare("SELECT id FROM session_fragments WHERE session_id = ? AND model_name = ? LIMIT 1")
+      .get(sessionId, modelName);
+    if (fragment) {
+      return true;
+    }
+    return (
+      database
+        .prepare("SELECT id FROM session_edges WHERE session_id = ? AND model_name = ? LIMIT 1")
+        .get(sessionId, modelName) !== undefined
+    );
+  }
+
   async function buildFragmentIndex(sessionId: string): Promise<void> {
     if (!embeddings) {
       return;
     }
     const modelName = embeddingModelName(embeddings);
-    const ready = database
-      .prepare("SELECT id FROM session_fragments WHERE session_id = ? AND model_name = ? LIMIT 1")
-      .get(sessionId, modelName);
-    if (ready) {
+    if (searchIndexReady(sessionId, modelName)) {
       return;
     }
     const rows: { layer: "material" | "serviceLayer"; body: string; vector: readonly number[] }[] = [];
+    const edgeRows: { layer: "material" | "serviceLayer"; body: string; vector: readonly number[] }[] = [];
     for (const file of loadHeldFiles(sessionId)) {
       try {
         const complete = await vectorsOfFile(file);
         if (complete) {
           rows.push(...complete);
         }
+        const edges = await edgesOfFile(file);
+        if (edges) {
+          edgeRows.push(...edges);
+        }
       } catch {
         // Обрыв расчёта оставляет этот файл неготовым. Уже собранные файлы сохраняются.
       }
     }
-    if (rows.length === 0) {
+    if (rows.length === 0 && edgeRows.length === 0) {
       return;
     }
     inTransaction(database, () => {
-      const again = database
-        .prepare("SELECT id FROM session_fragments WHERE session_id = ? AND model_name = ? LIMIT 1")
-        .get(sessionId, modelName);
-      if (again) {
+      if (searchIndexReady(sessionId, modelName)) {
         return;
       }
       const insert = database.prepare(
@@ -2234,6 +2364,12 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       );
       for (const row of rows) {
         insert.run(randomUUID(), sessionId, row.layer, row.body, JSON.stringify(row.vector), modelName);
+      }
+      const insertEdge = database.prepare(
+        "INSERT INTO session_edges (id, session_id, layer, body, vector, model_name) VALUES (?, ?, ?, ?, ?, ?)",
+      );
+      for (const row of edgeRows) {
+        insertEdge.run(randomUUID(), sessionId, row.layer, row.body, JSON.stringify(row.vector), modelName);
       }
     });
   }
@@ -2279,11 +2415,33 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     return fragments;
   }
 
+  function loadEdgeRows(sessionId: string): { layer: DossierLayerName; body: string; vector: number[] }[] {
+    if (!embeddings) {
+      return [];
+    }
+    const rows = database
+      .prepare(
+        "SELECT layer, body, vector FROM session_edges WHERE session_id = ? AND model_name = ? ORDER BY rowid",
+      )
+      .all(sessionId, embeddingModelName(embeddings)) as Row[];
+    const edges: { layer: DossierLayerName; body: string; vector: number[] }[] = [];
+    for (const row of rows) {
+      const layer = textColumn(row, "layer");
+      const vector = readStoredVector(textColumn(row, "vector"));
+      if ((layer !== "material" && layer !== "serviceLayer") || !vector) {
+        continue;
+      }
+      edges.push({ layer, body: textColumn(row, "body"), vector });
+    }
+    return edges;
+  }
+
   /**
    * Близкие фрагменты снимка сессии.
    * Запрос — текст этого хода. Чужой проект в снимок не входит. Закрытый стороне слой из выдачи выпадает.
    * Фрагмент, который спорит с досье своего слоя, в ход не входит.
    * Два разных числа при молчании досье остаются оба.
+   * Связь таблицы входит туда же и без числа ячейки. Связь, которой досье противоречит, не входит.
    */
   async function fragmentsForTurn(session: SessionRecord, task: string): Promise<TurnFragments> {
     if (!embeddings) {
@@ -2325,7 +2483,24 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         ranked.push(open);
       }
     }
-    return keepDisputedNumbers(ranked, visible, claimsByLayer);
+    const edges: string[] = [];
+    for (const item of loadEdgeRows(session.id)
+      .map((edge, index) => ({ edge, index, score: cosine(query, edge.vector) }))
+      .filter((item) => layerOpenToSide(session.side, item.edge.layer))
+      .sort((left, right) => right.score - left.score || left.index - right.index)) {
+      const layer = item.edge.layer;
+      if (layer !== "material" && layer !== "serviceLayer") {
+        continue;
+      }
+      if (item.score <= 0 || edgeBlocked(item.edge.body, claimsByLayer[layer])) {
+        continue;
+      }
+      edges.push(item.edge.body);
+      if (edges.length >= FRAGMENT_LIMIT) {
+        break;
+      }
+    }
+    return { ...keepDisputedNumbers(ranked, visible, claimsByLayer), edges };
   }
 
   /**
@@ -2360,6 +2535,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
           history,
           fragments: turn.bodies,
           numbersDisputed: turn.numbersDisputed,
+          edges: turn.edges,
           task,
         }),
       };
@@ -2376,6 +2552,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         history,
         fragments: turn.bodies,
         numbersDisputed: turn.numbersDisputed,
+        edges: turn.edges,
         profile: caseRecord.portfolioSent ? loadProfile(session.executorId) : undefined,
         task,
       }),
