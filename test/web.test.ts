@@ -1261,6 +1261,151 @@ test("сбой разбора на вебе оставляет стеногра�
   }
 });
 
+test("страница не закрывает сессию без разбора", async () => {
+  let reviews = 0;
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, {
+    async *complete(call) {
+      const text = call.messages[0]?.text ?? "";
+      if (text.includes("Разбери законченную сессию")) {
+        reviews += 1;
+        if (reviews < 3) {
+          throw new ModelFailure("model");
+        }
+        yield REVIEW;
+        return;
+      }
+      yield "Склад принимает паллеты.";
+    },
+  });
+  opened.push(trainer);
+  assert.deepEqual(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-WXYZ",
+    }),
+    { ok: true },
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+  assert.ok(saved.ok);
+  const approved = trainer.approveDossier({
+    caseId: saved.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: "Маржа подрядчика 12%.",
+    crib: "Спросить про сроки.",
+  });
+  assert.ok(approved.ok);
+  assert.ok(
+    trainer.writePreparation({
+      caseId: saved.caseRecord.id,
+      role: "аналитик",
+      executorId: "владелец",
+      note: "НЕ-ПИСАТЬ-В-РАЗБОР",
+    }).ok,
+  );
+  const notes = trainer.readPreparation(saved.caseRecord.id, "аналитик", "владелец");
+  const openedSession = trainer.openSession({
+    caseId: saved.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.ok(openedSession.ok);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    const sessionFields = new URLSearchParams({
+      side: "заказчик",
+      character: "Анна",
+      role: "аналитик",
+      keyId,
+    });
+
+    const before = await (await fetch(`${base}/sessions/${openedSession.session.id}`)).text();
+    assert.equal(before.includes("Закончить сессию"), true);
+    assert.equal(before.includes("Закрыть без разбора"), false);
+    assert.equal(before.includes("/close"), false);
+
+    const closed = await fetch(`${base}/sessions/${openedSession.session.id}/close`, {
+      method: "POST",
+      headers,
+      body: "",
+    });
+    assert.equal(closed.status, 404);
+    assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
+    assert.equal(trainer.readReview(openedSession.session.id), undefined);
+
+    const first = await fetch(`${base}/sessions/${openedSession.session.id}/finish`, {
+      method: "POST",
+      headers,
+      body: "",
+    });
+    const firstPage = await first.text();
+    assert.equal(first.status, 200);
+    assert.equal(firstPage.includes("Модель вернула ошибку."), true);
+    assert.equal(firstPage.includes("Закончить сессию"), true);
+    assert.equal(firstPage.includes("<h2>Разбор</h2>"), false);
+    assert.equal(firstPage.includes("Закрыть без разбора"), false);
+
+    const second = await fetch(`${base}/sessions/${openedSession.session.id}/finish`, {
+      method: "POST",
+      headers,
+      body: "",
+    });
+    const secondPage = await second.text();
+    assert.equal(second.status, 200);
+    assert.equal(secondPage.includes("Закончить сессию"), true);
+    assert.equal(secondPage.includes("<h2>Разбор</h2>"), false);
+    assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
+    assert.equal(trainer.readReview(openedSession.session.id), undefined);
+    assert.deepEqual(trainer.readPreparation(saved.caseRecord.id, "аналитик", "владелец"), notes);
+
+    const blocked = await fetch(`${base}/cases/${saved.caseRecord.id}/session`, {
+      method: "POST",
+      headers,
+      body: sessionFields,
+    });
+    const blockedPage = await blocked.text();
+    assert.equal(blocked.status, 200);
+    assert.equal(new URL(blocked.url).pathname, `/cases/${saved.caseRecord.id}`);
+    assert.equal(blockedPage.includes("Сессия этой тройки уже открыта."), true);
+    assert.equal(trainer.listOpenSessions().length, 1);
+
+    const finished = await fetch(`${base}/sessions/${openedSession.session.id}/finish`, {
+      method: "POST",
+      headers,
+      body: "",
+    });
+    const finishedPage = await finished.text();
+    assert.equal(finished.status, 200);
+    assert.equal(finishedPage.includes(REVIEW), true);
+    assert.equal(finishedPage.includes("Закончить сессию"), false);
+    assert.equal(trainer.readSession(openedSession.session.id)?.status, "finished");
+
+    const again = await fetch(`${base}/cases/${saved.caseRecord.id}/session`, {
+      method: "POST",
+      headers,
+      body: sessionFields,
+    });
+    assert.equal(again.status, 200);
+    assert.match(new URL(again.url).pathname, /^\/sessions\//);
+    assert.notEqual(new URL(again.url).pathname, `/sessions/${openedSession.session.id}`);
+    assert.equal(reviews, 3);
+  } finally {
+    await close(server);
+  }
+});
+
 test("веб снимает сигнал и расхождение и принимает правку, не трогая открытую сессию", async () => {
   const directory = tempDirectory();
   const trainer = openTrainer(directory, {

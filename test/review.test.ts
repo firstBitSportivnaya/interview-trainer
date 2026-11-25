@@ -304,6 +304,78 @@ test("пустой разбор сессию не заканчивает", async
   assert.equal(trainer.readReview(openedSession.session.id), undefined);
 });
 
+test("повторный срыв разбора держит сессию, а записанный разбор отпускает тройку", async () => {
+  let reviews = 0;
+  const trainer = start({
+    async *complete(call) {
+      const text = call.messages[0]?.text ?? "";
+      if (text.includes("Разбери законченную сессию")) {
+        reviews += 1;
+        if (reviews < 3) {
+          throw new ModelFailure("model");
+        }
+        yield REVIEW;
+        return;
+      }
+      yield "Склад принимает паллеты.";
+    },
+  });
+  const prepared = prepare(trainer);
+  assert.ok(
+    trainer.writePreparation({
+      caseId: prepared.caseId,
+      role: "аналитик",
+      executorId: "владелец",
+      note: "НЕ-ПИСАТЬ-В-РАЗБОР",
+    }).ok,
+  );
+  const notes = trainer.readPreparation(prepared.caseId, "аналитик", "владелец");
+  const openedSession = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: prepared.dossierId,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  assert.ok(openedSession.ok);
+  const sessionId = openedSession.session.id;
+  const sameTrio = {
+    caseId: prepared.caseId,
+    dossierId: prepared.dossierId,
+    side: "заказчик" as const,
+    character: "Анна",
+    role: "аналитик" as const,
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  };
+
+  const first = await trainer.finishSession(sessionId);
+  assert.deepEqual(first, { ok: false, reason: "model" });
+  const second = await trainer.finishSession(sessionId);
+  assert.deepEqual(second, { ok: false, reason: "model" });
+  assert.equal(trainer.readSession(sessionId)?.status, "open");
+  assert.equal(trainer.readReview(sessionId), undefined);
+  assert.equal("closeSession" in trainer, false);
+  assert.equal("abandonSession" in trainer, false);
+  assert.deepEqual(trainer.readPreparation(prepared.caseId, "аналитик", "владелец"), notes);
+  assert.deepEqual(trainer.openSession(sameTrio), { ok: false, reason: "open" });
+  assert.equal(trainer.listOpenSessions().filter((session) => session.caseId === prepared.caseId).length, 1);
+
+  const finished = await trainer.finishSession(sessionId);
+  assert.ok(finished.ok);
+  assert.equal(finished.session.status, "finished");
+  assert.equal(finished.review.text, REVIEW);
+  assert.equal(trainer.readReview(sessionId)?.text, REVIEW);
+  assert.equal(trainer.listOpenSessions().some((session) => session.id === sessionId), false);
+
+  const next = trainer.openSession(sameTrio);
+  assert.ok(next.ok);
+  assert.notEqual(next.session.id, sessionId);
+  assert.equal(reviews, 3);
+});
+
 test("прежняя таблица сессий принимает законченную сессию", async () => {
   const directory = tempDirectory();
   const database = new DatabaseSync(join(directory, "store.sqlite"));
