@@ -4,3 +4,4 @@ data/
 node_modules/
 tmp/
 .cursor/case-inbox.jsonl
+.archify/architecture/architecture.*.json
