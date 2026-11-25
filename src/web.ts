@@ -600,6 +600,49 @@ function sessionScript(sessionId: string, needsOpening: boolean): string {
   </script>`;
 }
 
+/** Отказ закончить сессию. Текст ответа модели сюда не входит. */
+function sessionFailureText(reason: string | null, detail: string | null, baseAddress?: string): string | undefined {
+  if (reason === "timeout") {
+    return "Модель не ответила вовремя. Сессия осталась открытой, разбор не записан. Закончите сессию ещё раз.";
+  }
+  if (reason === "missing") {
+    return "Сессия не найдена.";
+  }
+  if (reason === "secret") {
+    return "Секрет ключа не читается. Откройте страницу ключей и запишите секрет заново. Сессия осталась открытой, разбор не записан.";
+  }
+  if (reason !== "model") {
+    return undefined;
+  }
+  if (detail === "unreachable") {
+    const address = baseAddress?.trim();
+    const where = address ? `с базовым адресом ${address}` : "с базовым адресом ключа";
+    return `Машина не соединилась ${where}: срок ожидания соединения вышел, ответа не было. Проверьте этот адрес на странице ключей и что с этой машины он открывается. Сессия осталась открытой, разбор не записан.`;
+  }
+  if (detail === "proxy") {
+    return "Прокси установки не открылся или не пропустил соединение. Проверьте адрес на странице ключей. Логин и пароль на страницу не выводятся. Сессия осталась открытой, разбор не записан.";
+  }
+  if (detail === "auth") {
+    return "Секрет ключа не принят. Откройте страницу ключей и запишите секрет заново. Сессия осталась открытой, разбор не записан.";
+  }
+  if (detail === "name") {
+    return "Имя модели или базовый адрес не найдены. Проверьте оба поля на странице ключей. Сессия осталась открытой, разбор не записан.";
+  }
+  if (detail === "busy") {
+    return "Адрес ключа ответил, что сейчас занят. Подождите и закончите сессию ещё раз. Сессия осталась открытой, разбор не записан.";
+  }
+  if (detail === "large") {
+    return "Текст сессии слишком большой для одного вызова. Сессия осталась открытой, разбор не записан.";
+  }
+  if (detail === "cut") {
+    return "Ответ оборвался на потолке длины вывода. Сессия осталась открытой, разбор не записан. Закончите сессию ещё раз.";
+  }
+  if (detail === "empty") {
+    return "Модель ответила, но текста разбора в ответе нет. Сессия осталась открытой, разбор не записан. Закончите сессию ещё раз.";
+  }
+  return "Вызов не дошёл до текста разбора. Проверьте базовый адрес, имя модели и секрет на странице ключей, затем закончите сессию ещё раз. Текст ответа на страницу не выводится. Сессия осталась открытой, разбор не записан.";
+}
+
 function renderSession(trainer: Trainer, session: SessionRecord, error?: string): string {
   const item = trainer.readCase(session.caseId);
   const lines = trainer.readTranscript(session.id) ?? [];
@@ -1365,16 +1408,8 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
       refuse(request, response, 404);
       return;
     }
-    const failure = url.searchParams.get("error");
-    const message =
-      failure === "timeout" || failure === "model" || failure === "missing" || failure === "secret"
-        ? {
-            timeout: "Модель не ответила вовремя.",
-            model: "Модель вернула ошибку.",
-            missing: "Сессия не найдена.",
-            secret: "Секрет ключа не читается.",
-          }[failure]
-        : undefined;
+    const key = trainer.listKeys().find((item) => item.id === open.keyId);
+    const message = sessionFailureText(url.searchParams.get("error"), url.searchParams.get("detail"), key?.baseAddress);
     sendHtml(response, renderSession(trainer, open, message));
     return;
   }
@@ -1597,11 +1632,12 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
       return;
     }
     const finished = await trainer.finishSession(current.id);
+    const detail = !finished.ok && finished.reason === "model" && finished.detail ? `&detail=${finished.detail}` : "";
     redirect(
       response,
       finished.ok || finished.reason === "finished"
         ? `/sessions/${encodeURIComponent(current.id)}`
-        : `/sessions/${encodeURIComponent(current.id)}?error=${finished.reason}`,
+        : `/sessions/${encodeURIComponent(current.id)}?error=${finished.reason}${detail}`,
     );
     return;
   }
