@@ -262,6 +262,27 @@ test("TXT в понятной кодировке читается, а нераз
   assert.equal(JSON.stringify(empty).includes(PHRASE), false);
 });
 
+test("MD читается как текст и встаёт в названный слой", async () => {
+  const { trainer, caseId } = start();
+  const taken = await acceptProjectFile(trainer, {
+    caseId,
+    name: "заметка.md",
+    bytes: Buffer.from(`# Заголовок\n\n${PHRASE}`, "utf8"),
+    layer: "служебный слой",
+  });
+  assert.equal(taken.ok, true);
+  assert.equal(taken.ready, true);
+  assert.equal(taken.filed, true);
+  if (taken.ok && taken.ready && taken.filed) {
+    assert.equal(taken.file.layer, "serviceLayer");
+    assert.equal(taken.file.extractedText.includes(PHRASE), true);
+  }
+
+  const broken = await readProjectFile("битый.md", Uint8Array.from([0xff, 0x00, 0x80]));
+  assert.equal(broken.ready, false);
+  assert.equal(JSON.stringify(broken).includes(PHRASE), false);
+});
+
 test("PDF без текстового слоя не прочитан и абзац не выдуман", async () => {
   const { trainer, caseId } = start();
   const before = trainer.readApprovedDossier(caseId);

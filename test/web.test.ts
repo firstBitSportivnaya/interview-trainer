@@ -9,7 +9,7 @@ import { request as httpRequest, type Server } from "node:http";
 
 import { ABSENT_FACT, DRAFT_LIMIT, openTrainer } from "../src/trainer.ts";
 import { ModelFailure } from "../src/model.ts";
-import { startWeb, TEXT_BODY_LIMIT } from "../src/web.ts";
+import { FILE_BODY_LIMIT, startWeb, TEXT_BODY_LIMIT } from "../src/web.ts";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -1835,6 +1835,44 @@ test("у веба первой версии нет отдельного вход
     assert.equal((await fetch(`${base}/login`)).status, 404);
     assert.equal((await fetch(`${base}/executor`)).status, 404);
     assert.equal((await fetch(`${base}/enter`)).status, 404);
+  } finally {
+    await close(server);
+  }
+});
+
+test("markdown и файл больше предела формы записываются в слой", async () => {
+  const directory = tempDirectory();
+  const trainer = start(directory);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    await fetch(`${base}/customers`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ customerName: "Север", title: "Внедрение склада" }),
+    });
+    const item = trainer.listCases()[0];
+    assert.ok(item);
+
+    const notes = Buffer.alloc(TEXT_BODY_LIMIT + 1024, 0x41);
+    const saved = await postFile(base, item.id, "заметка.md", notes, "serviceLayer");
+    const page = await saved.text();
+    assert.equal(saved.status, 200);
+    assert.equal(page.includes("заметка.md — Служебный слой"), true);
+    const filed = trainer.listSourceFiles(item.id).find((file) => file.name === "заметка.md");
+    assert.equal(filed?.layer, "serviceLayer");
+    assert.equal(filed?.extractedText.startsWith("A"), true);
+
+    const huge = Buffer.alloc(FILE_BODY_LIMIT + 1, 0x42);
+    const refused = await postFile(base, item.id, "огромный.md", huge, "serviceLayer");
+    const refusedPage = await refused.text();
+    assert.equal(refused.status, 200);
+    assert.equal(refusedPage.includes("Файл больше 64 МиБ. Страница его не принимает."), true);
+    assert.equal(trainer.listSourceFiles(item.id).some((file) => file.name === "огромный.md"), false);
+    assert.equal(trainer.listUnreadFiles(item.id).some((file) => file.name === "огромный.md"), false);
   } finally {
     await close(server);
   }
