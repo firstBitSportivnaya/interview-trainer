@@ -4,7 +4,7 @@ import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { join } from "node:path";
 
 import { LOCAL_EMBEDDING_MODEL, unitVector } from "./embeddings.ts";
-import { liveModel, ModelFailure, type ModelPort } from "./model.ts";
+import { DRAFT_TOKENS, liveModel, ModelFailure, REPLY_TOKENS, REVIEW_TOKENS, type ModelPort } from "./model.ts";
 import { isSealedSecret, openSecret, sealSecret } from "./os-secret.ts";
 
 /** Протокол ключа: родной Anthropic или совместимый с OpenAI. */
@@ -2109,6 +2109,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     messages: { role: "user"; text: string }[],
     spoken: { text: string; failed: boolean },
     signal?: AbortSignal,
+    outputTokens: number = REPLY_TOKENS,
   ): AsyncIterable<SpeechEvent> {
     const loaded = loadKey(session.keyId);
     if (!loaded) {
@@ -2143,6 +2144,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
           modelName: key.modelName,
           secret: key.secret,
           messages,
+          maxTokens: outputTokens,
         },
         controller.signal,
       )) {
@@ -2989,6 +2991,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
             modelName: loaded.key.modelName,
             secret: loaded.key.secret,
             messages: [{ role: "user", text: dossierDraftPrompt(layers) }],
+            maxTokens: DRAFT_TOKENS,
           },
           controller.signal,
         )) {
@@ -3255,6 +3258,8 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
             },
           ],
           spoken,
+          undefined,
+          REVIEW_TOKENS,
         )) {
           if (event.kind === "failure") {
             failure = event.reason;
