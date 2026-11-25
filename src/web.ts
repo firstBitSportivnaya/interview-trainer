@@ -159,6 +159,8 @@ const FORM_CHAR_BYTES = 9;
 const FORM_OVERHEAD = 512;
 /** Тело утверждения вмещает любой черновик, который ядро согласилось показать. */
 export const TEXT_BODY_LIMIT = DRAFT_LIMIT * FORM_CHAR_BYTES + FORM_OVERHEAD;
+/** Файл клиента не кодируется как форма. Предел черновика к нему не применяется. */
+export const FILE_BODY_LIMIT = 64 * 1024 * 1024;
 
 /** Экранирует текст владельца, чтобы вставленный слой не стал разметкой. */
 function escapeHtml(value: string): string {
@@ -1098,6 +1100,9 @@ function knownSessionError(reason: string | null): string | undefined {
 }
 
 function knownFileError(reason: string | null): string | undefined {
+  if (reason === "size") {
+    return `Файл больше ${FILE_BODY_LIMIT / (1024 * 1024)} МиБ. Страница его не принимает.`;
+  }
   if (reason === "layer" || reason === "incomplete" || reason === "missing" || reason === "forbidden") {
     return FILE_ERROR[reason];
   }
@@ -1347,11 +1352,15 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
     return;
   }
 
-  const limit = url.pathname === "/keys" ? KEY_BODY_LIMIT : TEXT_BODY_LIMIT;
+  const limit = target?.action === "file" ? FILE_BODY_LIMIT : url.pathname === "/keys" ? KEY_BODY_LIMIT : TEXT_BODY_LIMIT;
   let raw: Buffer;
   try {
     raw = await readRawBody(request, limit);
   } catch {
+    if (target?.action === "file") {
+      redirect(response, `${casePath(target.id)}?fileError=size`);
+      return;
+    }
     response.writeHead(413);
     response.end();
     return;
