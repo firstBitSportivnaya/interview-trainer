@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { deflateRawSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -17,6 +18,51 @@ function tempDirectory(): string {
   const directory = mkdtempSync(join(tmpdir(), "trainer-web-"));
   directories.push(directory);
   return directory;
+}
+
+function docx(text: string): Buffer {
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body><w:p><w:r><w:t>${text.replaceAll("&", "&amp;").replaceAll("<", "&lt;")}</w:t></w:r></w:p></w:body>
+</w:document>`;
+  const name = "word/document.xml";
+  const raw = Buffer.from(xml, "utf8");
+  const compressed = deflateRawSync(raw);
+  const nameBuf = Buffer.from(name, "utf8");
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt16LE(8, 8);
+  local.writeUInt32LE(compressed.length, 18);
+  local.writeUInt32LE(raw.length, 22);
+  local.writeUInt16LE(nameBuf.length, 26);
+  const localFull = Buffer.concat([local, nameBuf, compressed]);
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(20, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt16LE(8, 10);
+  central.writeUInt32LE(compressed.length, 20);
+  central.writeUInt32LE(raw.length, 24);
+  central.writeUInt16LE(nameBuf.length, 28);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(1, 8);
+  eocd.writeUInt16LE(1, 10);
+  eocd.writeUInt32LE(46 + nameBuf.length, 12);
+  eocd.writeUInt32LE(localFull.length, 16);
+  return Buffer.concat([localFull, central, nameBuf, eocd]);
+}
+
+function postFile(base: string, caseId: string, name: string, bytes: Buffer, layer: string): Promise<Response> {
+  const form = new FormData();
+  form.set("layer", layer);
+  form.set("file", new Blob([new Uint8Array(bytes)]), name);
+  return fetch(`${base}/cases/${caseId}/file`, {
+    method: "POST",
+    headers: { origin: base },
+    body: form,
+  });
 }
 
 function start(directory: string) {
@@ -173,6 +219,9 @@ test("ошибка записи не останавливает веб", async (
       return { resume: "", portfolio: "", cases: "" };
     },
     addSourceFile() {
+      return { ok: false, reason: "missing" };
+    },
+    noteUnreadFile() {
       return { ok: false, reason: "missing" };
     },
     listSourceFiles() {
@@ -827,42 +876,38 @@ test("веб записывает файл в названный слой и н�
     const approved = trainer.readApprovedDossier(item.id);
     assert.ok(approved);
 
-    const refused = await fetch(`${base}/cases/${item.id}/file`, {
-      method: "POST",
-      headers,
-      body: new URLSearchParams({
-        name: "служебный-слой.xlsx",
-        layer: "",
-        extractedText: "НЕ-УГАДЫВАТЬ",
-      }),
-    });
+    const hidden = "НЕ-УГАДЫВАТЬ";
+    const refused = await postFile(base, item.id, "служебный.docx", docx(hidden), "");
     const refusedPage = await refused.text();
     assert.equal(refused.status, 200);
     assert.equal(refusedPage.includes("Выберите слой. Тренажёр слой не назначает сам."), true);
     assert.equal(refusedPage.includes("Файлов проекта пока нет."), true);
-    assert.equal(refusedPage.includes("НЕ-УГАДЫВАТЬ"), false);
-    assert.deepEqual(trainer.listSourceFiles(item.id), []);
+    assert.equal(refusedPage.includes(hidden), false);
+    assert.equal(JSON.stringify(trainer.listSourceFiles(item.id)).includes(hidden), false);
+    assert.deepEqual(trainer.readApprovedDossier(item.id), approved);
+
+    const junk = "это не документ";
+    const unread = await postFile(base, item.id, "скан.docx", Buffer.from(junk, "utf8"), "material");
+    const unreadPage = await unread.text();
+    assert.equal(unread.status, 200);
+    assert.equal(unreadPage.includes("скан.docx — не прочитан"), true);
+    assert.equal(unreadPage.includes(junk), false);
+    assert.equal(JSON.stringify(trainer.listSourceFiles(item.id)).includes(junk), false);
     assert.deepEqual(trainer.readApprovedDossier(item.id), approved);
 
     const raw = "СЫРОЙ-ТЕКСТ-ФАЙЛА";
-    const saved = await fetch(`${base}/cases/${item.id}/file`, {
-      method: "POST",
-      headers,
-      body: new URLSearchParams({
-        name: "протокол.xlsx",
-        layer: "serviceLayer",
-        extractedText: raw,
-      }),
-    });
+    const saved = await postFile(base, item.id, "протокол.docx", docx(raw), "serviceLayer");
     const page = await saved.text();
     assert.equal(saved.status, 200);
-    assert.equal(page.includes("протокол.xlsx — Служебный слой"), true);
+    assert.equal(page.includes("протокол.docx — Служебный слой"), true);
     const approvedHtml = page.split("<h2>Утверждённое досье</h2>")[1] ?? "";
     assert.equal(approvedHtml.includes(raw), false);
     assert.equal(approvedHtml.includes("УТВЕРЖДЁННЫЙ-МАТЕРИАЛ"), true);
     assert.deepEqual(trainer.readApprovedDossier(item.id), approved);
-    assert.equal(trainer.listSourceFiles(item.id)[0]?.layer, "serviceLayer");
-    assert.equal(trainer.listSourceFiles(item.id)[0]?.extractedText, raw);
+    const filed = trainer.listSourceFiles(item.id).find((file) => file.name === "протокол.docx");
+    assert.equal(filed?.layer, "serviceLayer");
+    assert.equal(filed?.extractedText.includes(raw), true);
+    assert.equal(JSON.stringify(trainer.listSourceFiles(item.id)).includes(hidden), false);
   } finally {
     await close(server);
   }
