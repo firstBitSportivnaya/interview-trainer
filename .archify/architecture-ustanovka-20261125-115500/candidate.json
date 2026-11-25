@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Установка тренажёра",
+    "locale": "ru",
+    "output": ".archify/architecture-ustanovka-20261125-115500/ustanovka.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/firstBitSportivnaya/interview-trainer.git",
+      "provider": "github",
+      "revision": "b721e898a6491257dcd6eb0730cf56e9f27decdb"
+    }
+  },
+  "layout": { "mode": "auto" },
+  "components": [
+    {
+      "id": "owner",
+      "type": "external",
+      "label": "Владелец",
+      "sublabel": "браузер на своей машине",
+      "sources": [
+        { "path": "src/main.ts", "line": 8, "end_line": 14, "label": "каталог владельца" },
+        { "path": "src/web.ts", "line": 1272, "end_line": 1291, "label": "дверь машины" }
+      ]
+    },
+    {
+      "id": "web",
+      "type": "frontend",
+      "label": "Веб",
+      "sublabel": "127.0.0.1",
+      "sources": [
+        { "path": "src/main.ts", "line": 14, "end_line": 14, "label": "запуск" },
+        { "path": "src/web.ts", "line": 1214, "end_line": 1255, "label": "сессия и реплика" },
+        { "path": "src/web.ts", "line": 1277, "end_line": 1291, "label": "только эта машина" }
+      ]
+    },
+    {
+      "id": "core",
+      "type": "backend",
+      "label": "Ядро",
+      "sublabel": "сессия и ход",
+      "sources": [
+        { "path": "src/trainer.ts", "line": 10, "end_line": 11, "label": "два протокола" },
+        { "path": "src/trainer.ts", "line": 1864, "end_line": 1874, "label": "ядро владельца" },
+        { "path": "src/trainer.ts", "line": 2139, "end_line": 2147, "label": "речь по ключу" }
+      ]
+    },
+    {
+      "id": "catalog",
+      "type": "database",
+      "label": "Каталог",
+      "sublabel": "store.sqlite",
+      "sources": [
+        { "path": "src/trainer.ts", "line": 372, "end_line": 372, "label": "имя файла" },
+        { "path": "src/trainer.ts", "line": 418, "end_line": 489, "label": "досье и сессии" },
+        { "path": "src/trainer.ts", "line": 1878, "end_line": 1879, "label": "открытие" }
+      ]
+    },
+    {
+      "id": "secret",
+      "type": "security",
+      "label": "Секрет ключа",
+      "sublabel": "средства ОС",
+      "sources": [
+        { "path": "src/trainer.ts", "line": 602, "end_line": 608, "label": "раскрыть секрет" },
+        { "path": "src/os-secret.ts", "line": 180, "end_line": 194, "label": "свёрток ОС" }
+      ]
+    },
+    {
+      "id": "fragments",
+      "type": "backend",
+      "label": "Индекс фрагмента",
+      "sublabel": "multilingual-e5-small",
+      "sources": [
+        { "path": "src/main.ts", "line": 11, "end_line": 12, "label": "веса на установке" },
+        { "path": "src/embeddings.ts", "line": 76, "end_line": 88, "label": "локальный порт" },
+        { "path": "src/embeddings.ts", "line": 118, "end_line": 122, "label": "без внешней сети" }
+      ]
+    },
+    {
+      "id": "speech",
+      "type": "external",
+      "label": "Речь по ключу",
+      "sublabel": "Anthropic или OpenAI",
+      "sources": [
+        { "path": "src/model.ts", "line": 67, "end_line": 96, "label": "два адреса" },
+        { "path": "src/model.ts", "line": 116, "end_line": 133, "label": "вызов наружу" }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Установка владельца",
+      "wraps": ["web", "core", "catalog", "secret", "fragments"]
+    }
+  ],
+  "connections": [
+    { "id": "owner-web", "from": "owner", "to": "web", "label": "страница", "variant": "emphasis" },
+    { "id": "web-core", "from": "web", "to": "core", "label": "сессия и реплика", "variant": "emphasis" },
+    { "id": "core-catalog", "from": "core", "to": "catalog", "label": "досье и сессия" },
+    { "id": "core-secret", "from": "core", "to": "secret", "label": "раскрыть секрет", "variant": "security" },
+    { "id": "core-fragments", "from": "core", "to": "fragments", "label": "если веса на диске" },
+    { "id": "core-speech", "from": "core", "to": "speech", "label": "речь по ключу", "variant": "emphasis" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "На установке",
+      "items": [
+        "Веб слушает только 127.0.0.1",
+        "Каталог — data/store.sqlite",
+        "Индекс фрагмента читает веса с диска и наружу не ходит"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Ключ",
+      "items": [
+        "Протокола два: родной Anthropic и совместимый с OpenAI",
+        "Секрет в каталоге свёрнут средствами ОС",
+        "С установки уходит только вызов речи"
+      ]
+    }
+  ]
+}
