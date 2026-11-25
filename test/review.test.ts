@@ -299,7 +299,36 @@ test("пустой разбор сессию не заканчивает", async
   });
   assert.ok(openedSession.ok);
   const failed = await trainer.finishSession(openedSession.session.id);
-  assert.deepEqual(failed, { ok: false, reason: "model" });
+  assert.deepEqual(failed, { ok: false, reason: "model", detail: "empty" });
+  assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
+  assert.equal(trainer.readReview(openedSession.session.id), undefined);
+  assert.equal(JSON.stringify(failed).includes("Склад принимает паллеты."), false);
+});
+
+test("отказ разбора называет класс сбоя и не отдаёт текст поставщика", async () => {
+  const trainer = start({
+    async *complete(call) {
+      const text = call.messages[0]?.text ?? "";
+      if (text.includes("Разбери законченную сессию")) {
+        throw new ModelFailure("model", "proxy");
+      }
+      yield "речь";
+    },
+  });
+  const prepared = prepare(trainer);
+  const openedSession = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: prepared.dossierId,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  assert.ok(openedSession.ok);
+  const failed = await trainer.finishSession(openedSession.session.id);
+  assert.deepEqual(failed, { ok: false, reason: "model", detail: "proxy" });
+  assert.equal(JSON.stringify(failed).includes("sk-ant"), false);
   assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
   assert.equal(trainer.readReview(openedSession.session.id), undefined);
 });

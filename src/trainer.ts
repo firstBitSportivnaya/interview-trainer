@@ -186,10 +186,14 @@ export type ReviewRecord = {
   text: string;
 };
 
+/** Класс отказа разбора. Текст ответа сюда не входит. empty — ответа-разбора не было. */
+export type FinishModelDetail = ModelFailureDetail | "empty";
+
 /** Отказ закончить сессию: её нет, она уже закончена или ключ не ответил. */
 export type FinishSessionResult =
   | { ok: true; session: SessionRecord; review: ReviewRecord }
-  | { ok: false; reason: "missing" | "finished" | "timeout" | "model" | "secret" };
+  | { ok: false; reason: "missing" | "finished" | "timeout" | "secret" }
+  | { ok: false; reason: "model"; detail?: FinishModelDetail };
 
 /**
  * Исполнитель первой версии.
@@ -214,7 +218,12 @@ export type SessionDraft = {
 /** Речь модели или отказ, который владельцу виден отдельно от речи. */
 export type SpeechEvent =
   | { kind: "speech"; text: string }
-  | { kind: "failure"; reason: "timeout" | "model" | "missing" | "secret"; message: string };
+  | {
+      kind: "failure";
+      reason: "timeout" | "model" | "missing" | "secret";
+      message: string;
+      detail?: ModelFailureDetail;
+    };
 
 /** Кто говорит в стенограмме. */
 export type TranscriptSpeaker = "персонаж" | "исполнитель";
@@ -2209,7 +2218,13 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         return;
       }
       const reason = error instanceof ModelFailure ? error.reason : "model";
-      yield { kind: "failure", reason, message: FAILURE_MESSAGE[reason] };
+      const detail = error instanceof ModelFailure ? error.detail : undefined;
+      yield {
+        kind: "failure",
+        reason,
+        message: FAILURE_MESSAGE[reason],
+        ...(detail ? { detail } : {}),
+      };
     } finally {
       signal?.removeEventListener("abort", onAbort);
       controller.abort();
@@ -3350,6 +3365,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       try {
         const spoken = { text: "", failed: false };
         let failure: "timeout" | "model" | "missing" | "secret" | undefined;
+        let detail: ModelFailureDetail | undefined;
         for await (const event of streamKey(
           session,
           [
@@ -3373,18 +3389,22 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         )) {
           if (event.kind === "failure") {
             failure = event.reason;
+            detail = event.detail;
           }
+        }
+        if (failure === "model") {
+          return detail ? { ok: false, reason: "model", detail } : { ok: false, reason: "model" };
         }
         if (failure) {
           return { ok: false, reason: failure };
         }
         const text = spoken.text.trim();
         if (spoken.failed || !text) {
-          return { ok: false, reason: "model" };
+          return { ok: false, reason: "model", detail: "empty" };
         }
         const split = splitReview(text);
         if (!split.prose) {
-          return { ok: false, reason: "model" };
+          return { ok: false, reason: "model", detail: "empty" };
         }
         const current = loadSession(session.id);
         if (!current || current.status !== "open") {

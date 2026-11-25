@@ -1372,13 +1372,80 @@ test("сбой разбора на вебе оставляет стеногра�
     });
     const page = await failed.text();
     assert.equal(failed.status, 200);
-    assert.equal(page.includes("Модель вернула ошибку."), true);
+    assert.equal(page.includes("Модель вернула ошибку."), false);
+    assert.equal(page.includes("Сессия осталась открытой, разбор не записан."), true);
+    assert.equal(page.includes("Текст ответа на страницу не выводится."), true);
+    assert.equal(page.includes("sk-ant-api03-secret-WXYZ"), false);
     assert.equal(page.includes("У нас маржа двенадцать."), true);
     assert.equal(page.includes("<h2>Разбор</h2>"), false);
     assert.equal(page.includes("Закончить сессию"), true);
     assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
     assert.equal(trainer.readReview(openedSession.session.id), undefined);
     assert.deepEqual(trainer.readPreparation(saved.caseRecord.id, "аналитик", "владелец"), notes);
+  } finally {
+    await close(server);
+  }
+});
+
+test("обрыв при завершении сессии называет базовый адрес и не показывает секрет", async () => {
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, {
+    async *complete(call) {
+      const text = call.messages[0]?.text ?? "";
+      if (text.includes("Разбери законченную сессию")) {
+        throw new ModelFailure("model", "unreachable");
+      }
+      yield "Склад принимает паллеты.";
+    },
+  });
+  opened.push(trainer);
+  assert.deepEqual(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-WXYZ",
+    }),
+    { ok: true },
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+  assert.ok(saved.ok);
+  const approved = trainer.approveDossier({
+    caseId: saved.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: "",
+    crib: "",
+  });
+  assert.ok(approved.ok);
+  const openedSession = trainer.openSession({
+    caseId: saved.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.ok(openedSession.ok);
+  const server = await startWeb(trainer);
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const page = await (
+      await fetch(`${base}/sessions/${openedSession.session.id}/finish`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: base },
+        body: "",
+      })
+    ).text();
+    assert.equal(page.includes("https://api.anthropic.com"), true);
+    assert.equal(page.includes("не соединилась"), true);
+    assert.equal(page.includes("Сессия осталась открытой, разбор не записан."), true);
+    assert.equal(page.includes("sk-ant-api03-secret-WXYZ"), false);
+    assert.equal(page.includes("Закончить сессию"), true);
+    assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
   } finally {
     await close(server);
   }
@@ -1475,7 +1542,8 @@ test("страница не закрывает сессию без разбор�
     });
     const firstPage = await first.text();
     assert.equal(first.status, 200);
-    assert.equal(firstPage.includes("Модель вернула ошибку."), true);
+    assert.equal(firstPage.includes("Модель вернула ошибку."), false);
+    assert.equal(firstPage.includes("Сессия осталась открытой, разбор не записан."), true);
     assert.equal(firstPage.includes("Закончить сессию"), true);
     assert.equal(firstPage.includes("<h2>Разбор</h2>"), false);
     assert.equal(firstPage.includes("Закрыть без разбора"), false);
