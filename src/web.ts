@@ -1,5 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
+import { acceptProjectFile } from "./project-file.ts";
+
 import {
   customerVoices,
   DRAFT_LIMIT,
@@ -9,6 +11,7 @@ import {
   type CaseRecord,
   type CustomerRecord,
   type AddSourceFileResult,
+  type NoteUnreadFileResult,
   type DossierLayerName,
   type DossierLayers,
   type DossierRecord,
@@ -52,6 +55,7 @@ type Trainer = {
     layer: string;
     extractedText: string;
   }): AddSourceFileResult;
+  noteUnreadFile(draft: { caseId: string; name: string; executorId?: string }): NoteUnreadFileResult;
   listSourceFiles(caseId: string): SourceFileRecord[];
   draftDossier(draft: { caseId: string; keyId: string } & DossierLayers): Promise<DraftDossierResult>;
   approveDossier(draft: { caseId: string } & DossierLayers): ApproveDossierResult;
@@ -125,7 +129,7 @@ const DRAFT_ERROR: Record<Exclude<DraftDossierResult, { ok: true }>["reason"], s
 const FILE_ERROR: Record<Exclude<AddSourceFileResult, { ok: true }>["reason"], string> = {
   layer: "Выберите слой. Тренажёр слой не назначает сам.",
   forbidden: "Слой файла называет владелец.",
-  incomplete: "Укажите имя файла и извлечённый текст.",
+  incomplete: "Выберите файл.",
   missing: "Проект не найден.",
 };
 
@@ -627,18 +631,15 @@ function renderSourceFiles(trainer: Trainer, item: CaseRecord, error?: string): 
     ${notice(error)}
     ${unreadItems}
     ${items}
-    <form method="post" action="${escapeHtml(casePath(item.id, "/file"))}">
-      <label>Имя файла
-        <input name="name" required>
+    <form method="post" action="${escapeHtml(casePath(item.id, "/file"))}" enctype="multipart/form-data">
+      <label>Файл
+        <input name="file" type="file" required>
       </label>
       <label>Слой
-        <select name="layer" required>
+        <select name="layer">
           <option value="">Выберите слой</option>
           ${options}
         </select>
-      </label>
-      <label>Извлечённый текст
-        <textarea name="extractedText" required></textarea>
       </label>
       <button type="submit">Добавить файл</button>
     </form>
@@ -732,8 +733,8 @@ function renderDraft(item: CaseRecord, draft: DossierLayers): string {
   );
 }
 
-/** Читает тело формы и не держит в памяти больше заданного предела. */
-async function readBody(request: IncomingMessage, limit: number): Promise<string> {
+/** Читает тело запроса и не держит в памяти больше заданного предела. */
+async function readRawBody(request: IncomingMessage, limit: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
@@ -744,7 +745,98 @@ async function readBody(request: IncomingMessage, limit: number): Promise<string
     }
     chunks.push(buffer);
   }
-  return Buffer.concat(chunks).toString("utf8");
+  return Buffer.concat(chunks);
+}
+
+type UploadedForm = {
+  fields: Map<string, string>;
+  filename?: string;
+  bytes: Buffer;
+};
+
+/** Разбирает одну форму с файлом. Чужой разборщик не подключается. */
+function parseMultipart(body: Buffer, contentType: string): UploadedForm | undefined {
+  const boundary = /boundary="?([^";]+)"?/i.exec(contentType)?.[1];
+  if (!boundary) return undefined;
+  const delimiter = Buffer.from(`--${boundary}`);
+  const fields = new Map<string, string>();
+  let filename: string | undefined;
+  let bytes = Buffer.alloc(0);
+  let start = body.indexOf(delimiter);
+  while (start >= 0) {
+    let cursor = start + delimiter.length;
+    if (body.subarray(cursor, cursor + 2).toString("utf8") === "--") break;
+    if (body.subarray(cursor, cursor + 2).toString("utf8") === "\r\n") cursor += 2;
+    const headerEnd = body.indexOf("\r\n\r\n", cursor);
+    if (headerEnd < 0) return undefined;
+    const headers = body.subarray(cursor, headerEnd).toString("utf8");
+    const dataStart = headerEnd + 4;
+    const next = body.indexOf(delimiter, dataStart);
+    if (next < 0) return undefined;
+    const dataEnd = body.subarray(next - 2, next).toString("utf8") === "\r\n" ? next - 2 : next;
+    const data = body.subarray(dataStart, dataEnd);
+    const name = /name="([^"]*)"/.exec(headers)?.[1] ?? "";
+    const fileName = partFilename(headers);
+    if (fileName !== undefined) {
+      filename = fileName;
+      bytes = Buffer.from(data);
+    } else if (name) {
+      fields.set(name, data.toString("utf8"));
+    }
+    start = next;
+  }
+  return { fields, filename, bytes };
+}
+
+function partFilename(headers: string): string | undefined {
+  const encoded = /filename\*=UTF-8''([^;\r\n]+)/i.exec(headers)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      return undefined;
+    }
+  }
+  const quoted = /filename="([^"]*)"/.exec(headers)?.[1];
+  if (quoted !== undefined) return quoted;
+  return undefined;
+}
+
+/** Кладёт файл страницы через чтение проекта. Слой берётся только из поля владельца. */
+async function receiveProjectFile(
+  trainer: Trainer,
+  response: ServerResponse,
+  caseId: string,
+  raw: Buffer,
+  contentType: string,
+): Promise<void> {
+  const item = trainer.readCase(caseId);
+  if (!item) {
+    response.writeHead(404);
+    response.end();
+    return;
+  }
+  const form = contentType.toLowerCase().includes("multipart/form-data") ? parseMultipart(raw, contentType) : undefined;
+  const name = form?.filename?.trim() ?? "";
+  if (!form || !name) {
+    redirect(response, `${casePath(item.id)}?fileError=incomplete`);
+    return;
+  }
+  const saved = await acceptProjectFile(trainer, {
+    caseId: item.id,
+    name,
+    bytes: Uint8Array.from(form.bytes),
+    layer: form.fields.get("layer") ?? "",
+  });
+  if (!saved.ok) {
+    redirect(response, `${casePath(item.id)}?fileError=${saved.reason}`);
+    return;
+  }
+  if (saved.ready && !saved.filed) {
+    redirect(response, `${casePath(item.id)}?fileError=layer`);
+    return;
+  }
+  redirect(response, casePath(item.id));
 }
 
 function sendHtml(response: ServerResponse, html: string, status = 200): void {
@@ -1035,15 +1127,21 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
   }
 
   const limit = url.pathname === "/keys" ? KEY_BODY_LIMIT : TEXT_BODY_LIMIT;
-  let body = "";
+  let raw: Buffer;
   try {
-    body = await readBody(request, limit);
+    raw = await readRawBody(request, limit);
   } catch {
     response.writeHead(413);
     response.end();
     return;
   }
-  const fields = new URLSearchParams(body);
+
+  if (target?.action === "file") {
+    await receiveProjectFile(trainer, response, target.id, raw, request.headers["content-type"] ?? "");
+    return;
+  }
+
+  const fields = new URLSearchParams(raw.toString("utf8"));
 
   if (url.pathname === "/keys") {
     const saved = trainer.saveKey({
@@ -1083,22 +1181,6 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
       characters: characterLines(fields.get("characters") ?? ""),
     });
     redirect(response, saved.ok ? casePath(saved.caseRecord.id) : `/cases?error=${saved.reason}`);
-    return;
-  }
-
-  if (target?.action === "file") {
-    const item = trainer.readCase(target.id);
-    if (!item) {
-      refuse(request, response, 404);
-      return;
-    }
-    const saved = trainer.addSourceFile({
-      caseId: item.id,
-      name: fields.get("name") ?? "",
-      layer: fields.get("layer") ?? "",
-      extractedText: fields.get("extractedText") ?? "",
-    });
-    redirect(response, saved.ok ? casePath(item.id) : `${casePath(item.id)}?fileError=${saved.reason}`);
     return;
   }
 
