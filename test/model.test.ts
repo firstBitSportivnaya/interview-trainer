@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 
-import { liveModel, ModelFailure, type ModelCall } from "../src/model.ts";
+import { DRAFT_TOKENS, liveModel, ModelFailure, REPLY_TOKENS, REVIEW_TOKENS, type ModelCall } from "../src/model.ts";
 import type { Protocol } from "../src/trainer.ts";
 
 async function readBody(request: IncomingMessage): Promise<string> {
@@ -144,6 +144,7 @@ test("адаптер, совместимый с OpenAI, отдаёт речь п
     assert.equal(headers["x-api-key"], undefined);
     assert.deepEqual(body, {
       model: "deepseek-chat",
+      max_tokens: REPLY_TOKENS,
       stream: true,
       messages: [
         { role: "user", content: "Какой срок поставки?" },
@@ -381,6 +382,186 @@ test("таймаут адаптера не становится речью", { t
       );
       assert.deepEqual(chunks, []);
     }
+  } finally {
+    await close(server);
+  }
+});
+
+function pause(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+test("куски чаще паузы не срывают ответ длиннее этой паузы", { timeout: 5000 }, async () => {
+  const server = await listen(async (request, response) => {
+    await readBody(request);
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('data: {"choices":[{"delta":{"content":"Срок "}}]}\n\n');
+    await pause(150);
+    response.write('data: {"choices":[{"delta":{"content":"— июнь."}}]}\n\n');
+    await pause(150);
+    response.end("data: [DONE]\n\n");
+  });
+
+  try {
+    const chunks: string[] = [];
+    for await (const text of liveModel({ timeoutMs: 200 }).complete(
+      callFor("openai-compatible", origin(server)),
+      new AbortController().signal,
+    )) {
+      chunks.push(text);
+    }
+    assert.deepEqual(chunks, ["Срок ", "— июнь."]);
+  } finally {
+    await close(server);
+  }
+});
+
+test("тишина между кусками дольше паузы — сбой, обрезок не речь", { timeout: 5000 }, async () => {
+  const server = await listen(async (request, response) => {
+    await readBody(request);
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('data: {"choices":[{"delta":{"content":"Срок поставки — "}}]}\n\n');
+    await pause(400);
+    if (!response.writableEnded) response.end("data: [DONE]\n\n");
+  });
+
+  try {
+    const chunks: string[] = [];
+    await assert.rejects(
+      async () => {
+        for await (const text of liveModel({ timeoutMs: 80 }).complete(
+          callFor("openai-compatible", origin(server)),
+          new AbortController().signal,
+        )) {
+          chunks.push(text);
+        }
+      },
+      (error: unknown) => {
+        assert.ok(error instanceof ModelFailure);
+        assert.equal(error.reason, "timeout");
+        assert.equal(error.message.includes("Срок поставки"), false);
+        return true;
+      },
+    );
+    assert.equal(chunks.join("").includes("июнь"), false);
+  } finally {
+    await close(server);
+  }
+});
+
+test("обрыв по длине не становится речью ни в одном протоколе", async () => {
+  const phrase = "Срок поставки — ";
+  const server = await listen(async (request, response) => {
+    await readBody(request);
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    if (request.url === "/v1/messages") {
+      response.end(
+        [
+          `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":${JSON.stringify(phrase)}}}`,
+          "",
+          'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}',
+          "",
+          'data: {"type":"message_stop"}',
+          "",
+          "",
+        ].join("\n"),
+      );
+      return;
+    }
+    response.end(
+      [
+        `data: {"choices":[{"delta":{"content":${JSON.stringify(phrase)}}}]}`,
+        "",
+        'data: {"choices":[{"delta":{},"finish_reason":"length"}]}',
+        "",
+        "data: [DONE]",
+        "",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  try {
+    for (const protocol of ["anthropic", "openai-compatible"] as const) {
+      const chunks: string[] = [];
+      await assert.rejects(
+        async () => {
+          for await (const text of liveModel().complete(callFor(protocol, origin(server)), new AbortController().signal)) {
+            chunks.push(text);
+          }
+        },
+        (error: unknown) => {
+          assert.ok(error instanceof ModelFailure);
+          assert.equal(error.reason, "model");
+          assert.equal(error.message.includes(phrase), false);
+          return true;
+        },
+      );
+      assert.equal(chunks.every((chunk) => chunk === phrase), true);
+      assert.notEqual(chunks.join(""), "");
+    }
+  } finally {
+    await close(server);
+  }
+});
+
+test("конец реплики end_turn остаётся речью", async () => {
+  const server = await listen(async (request, response) => {
+    await readBody(request);
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(
+      [
+        'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Срок — июнь."}}',
+        "",
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+        "",
+        'data: {"type":"message_stop"}',
+        "",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  try {
+    const chunks: string[] = [];
+    for await (const text of liveModel().complete(callFor("anthropic", origin(server)), new AbortController().signal)) {
+      chunks.push(text);
+    }
+    assert.deepEqual(chunks, ["Срок — июнь."]);
+  } finally {
+    await close(server);
+  }
+});
+
+test("потолки реплики, черновика и разбора разные, черновик вмещает 64 КиБ", async () => {
+  const bodies: Array<{ max_tokens?: number }> = [];
+  const server = await listen(async (request, response) => {
+    bodies.push(JSON.parse(await readBody(request)) as { max_tokens?: number });
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    if (request.url === "/v1/messages") {
+      response.end('data: {"type":"message_stop"}\n\n');
+      return;
+    }
+    response.end('data: {"choices":[{"delta":{"content":"ок"}}]}\n\ndata: [DONE]\n\n');
+  });
+
+  try {
+    for (const protocol of ["anthropic", "openai-compatible"] as const) {
+      for (const maxTokens of [undefined, DRAFT_TOKENS, REVIEW_TOKENS] as const) {
+        const call = callFor(protocol, origin(server));
+        if (maxTokens !== undefined) call.maxTokens = maxTokens;
+        for await (const text of liveModel().complete(call, new AbortController().signal)) {
+          assert.equal(typeof text, "string");
+        }
+      }
+    }
+    assert.deepEqual(
+      bodies.map((body) => body.max_tokens),
+      [REPLY_TOKENS, DRAFT_TOKENS, REVIEW_TOKENS, REPLY_TOKENS, DRAFT_TOKENS, REVIEW_TOKENS],
+    );
+    assert.ok(DRAFT_TOKENS >= 64 * 1024);
+    assert.notEqual(DRAFT_TOKENS, REPLY_TOKENS);
+    assert.notEqual(REVIEW_TOKENS, REPLY_TOKENS);
   } finally {
     await close(server);
   }

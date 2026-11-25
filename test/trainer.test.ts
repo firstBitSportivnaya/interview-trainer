@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
-import { ModelFailure, type ModelCall, type ModelPort } from "../src/model.ts";
+import { DRAFT_TOKENS, ModelFailure, REPLY_TOKENS, REVIEW_TOKENS, type ModelCall, type ModelPort } from "../src/model.ts";
 import { customerVoices, DRAFT_LIMIT, openTrainer, type OpenSessionResult, type SpeechEvent } from "../src/trainer.ts";
 
 const directories: string[] = [];
@@ -1512,6 +1512,66 @@ test("договорённая реплика персонажа целиком 
     { speaker: "исполнитель", kind: "реплика", text: "Какой срок поставки?" },
     { speaker: "персонаж", kind: "ответ", text: "Срок поставки — июнь." },
   ]);
+});
+
+test("обрыв по длине не заканчивает сессию, не меняет ход и не становится черновиком", async () => {
+  const limits: number[] = [];
+  const trainer = start(tempDirectory(), {
+    async *complete(call) {
+      limits.push(call.maxTokens ?? -1);
+      const line = call.messages[0]?.text ?? "";
+      if (line.startsWith("Собери черновик")) {
+        yield JSON.stringify({ material: "ОБРЕЗОК-ЧЕРНОВИКА", serviceLayer: "", crib: "" });
+        throw new ModelFailure("model");
+      }
+      if (line.startsWith("Разбери законченную сессию")) {
+        yield "Прозвучало служебное: маржа подрядчика.";
+        throw new ModelFailure("model");
+      }
+      yield "Срок поставки — ";
+      throw new ModelFailure("timeout");
+    },
+  });
+  const prepared = prepare(trainer);
+  assert.ok(
+    trainer.writePreparation({
+      caseId: prepared.caseId,
+      role: "аналитик",
+      executorId: "владелец",
+      note: "НЕ-МЕНЯТЬ-ХОД",
+    }).ok,
+  );
+  const notes = trainer.readPreparation(prepared.caseId, "аналитик", "владелец");
+  const openedSession = openAnalyst(trainer, prepared);
+  assert.ok(openedSession.ok);
+
+  const events = await take(trainer.reply(openedSession.session.id, "Какой срок поставки?"));
+  assert.equal(events.some((event) => event.kind === "failure" && event.reason === "timeout"), true);
+  assert.equal(
+    trainer.readTranscript(openedSession.session.id)?.some((line) => line.text.includes("Срок поставки — ")),
+    false,
+  );
+
+  const drafted = await trainer.draftDossier({
+    caseId: prepared.caseId,
+    keyId: prepared.keyId,
+    material: "паллеты",
+    serviceLayer: "",
+    crib: "",
+  });
+  assert.deepEqual(drafted, { ok: false, reason: "model" });
+  assert.equal(JSON.stringify(drafted).includes("ОБРЕЗОК-ЧЕРНОВИКА"), false);
+  assert.equal(trainer.readApprovedDossier(prepared.caseId)?.material, "Склад принимает паллеты.");
+
+  const failed = await trainer.finishSession(openedSession.session.id);
+  assert.deepEqual(failed, { ok: false, reason: "model" });
+  assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
+  assert.equal(trainer.readReview(openedSession.session.id), undefined);
+  assert.deepEqual(trainer.readPreparation(prepared.caseId, "аналитик", "владелец"), notes);
+  assert.deepEqual(limits, [REPLY_TOKENS, DRAFT_TOKENS, REVIEW_TOKENS]);
+  assert.ok(DRAFT_TOKENS >= DRAFT_LIMIT);
+  assert.notEqual(DRAFT_TOKENS, REPLY_TOKENS);
+  assert.notEqual(REVIEW_TOKENS, REPLY_TOKENS);
 });
 
 /** Собирает черновик из текста запроса: каждый слой остаётся между своими заголовками. */
