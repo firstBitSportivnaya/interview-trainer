@@ -51,7 +51,7 @@ const LAYER_LABEL: Record<DossierLayerName, string> = {
   crib: "шпаргалка проекта",
 };
 
-/** Читает DOCX, PPTX, XLSX, TXT, PDF или картинку. Чужой формат и пустой текст неготовы. */
+/** Читает DOCX, PPTX, XLSX, TXT, MD, PDF или картинку. Чужой формат и пустой текст неготовы. */
 export async function readProjectFile(
   name: string,
   bytes: Uint8Array,
@@ -67,6 +67,7 @@ export async function readProjectFile(
       case ".xlsx":
         return readOfficeText(bytes, readXlsx);
       case ".txt":
+      case ".md":
         return readTxt(bytes);
       case ".pdf":
         return await readPdf(bytes, recognize);
@@ -549,7 +550,7 @@ function decodeXmlBytes(bytes: Uint8Array): string {
 }
 
 /** Предел распакованного текста одного файла. Картинки и прочие части не читаются. */
-const TEXT_LIMIT = 8 * 1024 * 1024;
+const TEXT_LIMIT = 64 * 1024 * 1024;
 
 function neededOfficePart(name: string): boolean {
   return (

@@ -18,12 +18,18 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 /** Незавершённый кадр длиннее этого отбрасывается. Предел — 64 КиБ. */
 const FRAME_LIMIT = 64 * 1024;
 
+/**
+ * Класс сбоя без текста поставщика.
+ * В речь и в досье попадает только этот класс, не тело ответа.
+ */
+export type ModelFailureDetail = "unreachable" | "proxy" | "auth" | "name" | "busy" | "large" | "rejected" | "cut";
+
 /** Сбой вызова. Текст поставщика сюда не кладётся, чтобы он не стал речью. */
 export class ModelFailure extends Error {
   readonly reason: "timeout" | "model";
-  readonly detail?: "proxy";
+  readonly detail?: ModelFailureDetail;
 
-  constructor(reason: "timeout" | "model", detail?: "proxy") {
+  constructor(reason: "timeout" | "model", detail?: ModelFailureDetail) {
     super(reason);
     this.name = "ModelFailure";
     this.reason = reason;
@@ -179,6 +185,7 @@ async function* streamReply(
       if (failure) {
         if (failure.detail) throw failure;
         if (proxyUrl && failure.reason === "model") throw new ModelFailure("model", "proxy");
+        if (failure.reason === "model" && unreachable(error)) throw new ModelFailure("model", "unreachable");
         throw failure;
       }
       return;
@@ -187,8 +194,8 @@ async function* streamReply(
     idle.activity();
     const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
     if (!response.ok || !response.body || !contentType.includes("text/event-stream")) {
-      await response.body?.cancel().catch(() => undefined);
-      throw new ModelFailure("model");
+      const detail = await failureDetail(response);
+      throw new ModelFailure("model", detail);
     }
 
     let stopped = false;
@@ -197,7 +204,7 @@ async function* streamReply(
         const piece = readPiece(data);
         if (piece.truncated) {
           if (piece.text) yield piece.text;
-          throw new ModelFailure("model");
+          throw new ModelFailure("model", "cut");
         }
         if (piece.done) return;
         if (piece.text) yield piece.text;
@@ -212,6 +219,67 @@ async function* streamReply(
   } finally {
     idle.stop();
   }
+}
+
+/** Код сетевого сбоя. Тело ответа сюда не входит: соединения ещё не было. */
+function unreachable(error: unknown): boolean {
+  const code = errorCode(error);
+  return (
+    code === "UND_ERR_CONNECT_TIMEOUT" ||
+    code === "UND_ERR_SOCKET" ||
+    code === "ENOTFOUND" ||
+    code === "ECONNREFUSED" ||
+    code === "ECONNRESET" ||
+    code === "ETIMEDOUT" ||
+    code === "EAI_AGAIN" ||
+    code === "EHOSTUNREACH" ||
+    code === "ENETUNREACH"
+  );
+}
+
+function errorCode(error: unknown): string {
+  if (!error || typeof error !== "object") return "";
+  if ("code" in error && typeof error.code === "string") return error.code;
+  const cause = "cause" in error ? error.cause : undefined;
+  if (cause && typeof cause === "object" && "code" in cause && typeof cause.code === "string") return cause.code;
+  return "";
+}
+
+/** Класс отказа по статусу и типу ошибки. Текст сообщения в класс не входит. */
+async function failureDetail(response: Response): Promise<ModelFailureDetail> {
+  let type = "";
+  let message = "";
+  if (response.body) {
+    try {
+      const raw = (await response.text()).slice(0, 4000);
+      const parsed = JSON.parse(raw) as { error?: { type?: unknown; message?: unknown } };
+      const error = parsed.error;
+      if (error && typeof error === "object") {
+        if (typeof error.type === "string") type = error.type;
+        if (typeof error.message === "string") message = error.message;
+      }
+    } catch {
+      type = "";
+    }
+  }
+  const status = response.status;
+  if (status === 401 || status === 403 || type === "authentication_error" || type === "permission_error") {
+    return "auth";
+  }
+  if (status === 404 || type === "not_found_error") return "name";
+  if (
+    status === 429 ||
+    status === 503 ||
+    status === 529 ||
+    type === "rate_limit_error" ||
+    type === "overloaded_error"
+  ) {
+    return "busy";
+  }
+  if (status === 413 || type === "request_too_large" || /prompt is too long|too many tokens/i.test(message)) {
+    return "large";
+  }
+  return "rejected";
 }
 
 function readJson(data: string): unknown {
@@ -429,15 +497,6 @@ function responseFrom(socket: Socket, head: ProxyHead): Response {
     },
   });
   return new Response(stream, { status: head.status, headers: head.headers });
-}
-
-
-function errorCode(error: unknown): string {
-  if (!error || typeof error !== "object") return "";
-  if ("code" in error && typeof error.code === "string") return error.code;
-  const cause = "cause" in error ? error.cause : undefined;
-  if (cause && typeof cause === "object" && "code" in cause && typeof cause.code === "string") return cause.code;
-  return "";
 }
 
 

@@ -651,3 +651,56 @@ test("вызов с прокси идёт через прокси, без про
     },
   );
 });
+
+test("отказ вызова различает секрет, объём и обрыв соединения", async () => {
+  const server = await listen(async (request, response) => {
+    const body = JSON.parse(await readBody(request)) as { model?: string };
+    if (body.model === "too-big") {
+      response.writeHead(400, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          error: { type: "invalid_request_error", message: "prompt is too long: 999999 tokens > 200000" },
+        }),
+      );
+      return;
+    }
+    response.writeHead(401, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: { type: "authentication_error", message: "СЕКРЕТ-НЕ-ПОКАЗЫВАТЬ" } }));
+  });
+
+  const take = async (call: ModelCall) => {
+    for await (const text of liveModel().complete(call, new AbortController().signal)) {
+      assert.equal(text, "");
+    }
+  };
+
+  try {
+    const base = origin(server);
+    await assert.rejects(take(callFor("anthropic", base)), (error: unknown) => {
+      assert.ok(error instanceof ModelFailure);
+      assert.equal(error.reason, "model");
+      assert.equal(error.detail, "auth");
+      assert.equal(String(error).includes("СЕКРЕТ"), false);
+      return true;
+    });
+    const large = { ...callFor("anthropic", base), modelName: "too-big" };
+    await assert.rejects(take(large), (error: unknown) => {
+      assert.ok(error instanceof ModelFailure);
+      assert.equal(error.detail, "large");
+      assert.equal(String(error).includes("999999"), false);
+      return true;
+    });
+  } finally {
+    await close(server);
+  }
+
+  const probe = await listen(() => undefined);
+  const closed = origin(probe);
+  await close(probe);
+  await assert.rejects(take(callFor("anthropic", closed)), (error: unknown) => {
+    assert.ok(error instanceof ModelFailure);
+    assert.equal(error.reason, "model");
+    assert.equal(error.detail, "unreachable");
+    return true;
+  });
+});

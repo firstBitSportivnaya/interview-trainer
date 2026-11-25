@@ -9,7 +9,7 @@ import { request as httpRequest, type Server } from "node:http";
 
 import { ABSENT_FACT, DRAFT_LIMIT, openTrainer } from "../src/trainer.ts";
 import { ModelFailure } from "../src/model.ts";
-import { startWeb, TEXT_BODY_LIMIT } from "../src/web.ts";
+import { FILE_BODY_LIMIT, startWeb, TEXT_BODY_LIMIT } from "../src/web.ts";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -917,6 +917,120 @@ test("веб записывает файл в названный слой и н�
     assert.equal(filed?.layer, "serviceLayer");
     assert.equal(filed?.extractedText.includes(raw), true);
     assert.equal(JSON.stringify(trainer.listSourceFiles(item.id)).includes(hidden), false);
+  } finally {
+    await close(server);
+  }
+});
+
+test("сборка черновика показывает слой и причину отказа", async () => {
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, {
+    async *complete() {
+      yield "не json";
+    },
+  });
+  opened.push(trainer);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    await fetch(`${base}/keys`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({
+        protocol: "anthropic",
+        baseAddress: "https://api.anthropic.com",
+        modelName: "claude-sonnet",
+        secret: "sk-ant-api03-secret-WXYZ",
+      }),
+    });
+    const keyId = trainer.listKeys()[0]?.id;
+    assert.ok(keyId);
+    await fetch(`${base}/customers`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ customerName: "Север", title: "Внедрение склада" }),
+    });
+    const item = trainer.listCases()[0];
+    assert.ok(item);
+    assert.ok(
+      trainer.addSourceFile({
+        caseId: item.id,
+        name: "служебный.txt",
+        layer: "serviceLayer",
+        extractedText: "СЛУЖЕБНЫЙ-ФАЙЛ",
+      }).ok,
+    );
+    const page = await (await fetch(`${base}/cases/${item.id}`)).text();
+    assert.equal(page.includes("<h3>Служебный слой</h3>"), true);
+    assert.equal(page.includes("служебный.txt — Служебный слой, 14 знаков"), true);
+    assert.equal(page.includes("В этом слое файлов нет."), true);
+    assert.equal(page.includes('id="draft-steps"'), true);
+    assert.equal(page.includes("служебный.txt"), true);
+    assert.equal(page.includes("Файлы 14 знаков."), true);
+
+    const stream = await fetch(`${base}/cases/${item.id}/draft`, {
+      method: "POST",
+      headers: { ...headers, accept: "text/event-stream" },
+      body: new URLSearchParams({ material: "", serviceLayer: "", crib: "", keyId }),
+    });
+    const body = await stream.text();
+    assert.equal(stream.status, 200);
+    assert.equal(body.includes("Служебный слой: служебный.txt"), true);
+    assert.equal(body.includes("Жду ответ модели."), true);
+    assert.equal(body.includes("Ответ модели:"), true);
+    assert.equal(body.includes("не является JSON с тремя строками"), true);
+    assert.equal(body.includes("не json"), false);
+    assert.equal(trainer.readApprovedDossier(item.id), undefined);
+  } finally {
+    await close(server);
+  }
+});
+
+test("обрыв соединения называет базовый адрес и не показывает текст поставщика", async () => {
+  const trainer = openTrainer(tempDirectory(), {
+    async *complete() {
+      throw new ModelFailure("model", "unreachable");
+    },
+  });
+  opened.push(trainer);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    await fetch(`${base}/keys`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({
+        protocol: "anthropic",
+        baseAddress: "https://api.anthropic.com",
+        modelName: "claude-sonnet",
+        secret: "sk-ant-api03-secret-WXYZ",
+      }),
+    });
+    const keyId = trainer.listKeys()[0]?.id;
+    assert.ok(keyId);
+    await fetch(`${base}/customers`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ customerName: "Север", title: "Внедрение склада" }),
+    });
+    const item = trainer.listCases()[0];
+    assert.ok(item);
+    const stream = await fetch(`${base}/cases/${item.id}/draft`, {
+      method: "POST",
+      headers: { ...headers, accept: "text/event-stream" },
+      body: new URLSearchParams({ material: "Паллеты на складе.", serviceLayer: "", crib: "", keyId }),
+    });
+    const body = await stream.text();
+    assert.equal(body.includes("https://api.anthropic.com"), true);
+    assert.equal(body.includes("не соединилась"), true);
+    assert.equal(body.includes("sk-ant"), false);
+    assert.equal(body.includes("Паллеты на складе."), false);
   } finally {
     await close(server);
   }
@@ -1849,9 +1963,48 @@ test("у веба первой версии нет отдельного вход
   }
 });
 
+test("markdown и файл больше предела формы записываются в слой", async () => {
+  const directory = tempDirectory();
+  const trainer = start(directory);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    await fetch(`${base}/customers`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ customerName: "Север", title: "Внедрение склада" }),
+    });
+    const item = trainer.listCases()[0];
+    assert.ok(item);
+
+    const notes = Buffer.alloc(TEXT_BODY_LIMIT + 1024, 0x41);
+    const saved = await postFile(base, item.id, "заметка.md", notes, "serviceLayer");
+    const page = await saved.text();
+    assert.equal(saved.status, 200);
+    assert.equal(page.includes("заметка.md — Служебный слой"), true);
+    const filed = trainer.listSourceFiles(item.id).find((file) => file.name === "заметка.md");
+    assert.equal(filed?.layer, "serviceLayer");
+    assert.equal(filed?.extractedText.startsWith("A"), true);
+
+    const huge = Buffer.alloc(FILE_BODY_LIMIT + 1, 0x42);
+    const refused = await postFile(base, item.id, "огромный.md", huge, "serviceLayer");
+    const refusedPage = await refused.text();
+    assert.equal(refused.status, 200);
+    assert.equal(refusedPage.includes("Файл больше 64 МиБ. Страница его не принимает."), true);
+    assert.equal(trainer.listSourceFiles(item.id).some((file) => file.name === "огромный.md"), false);
+    assert.equal(trainer.listUnreadFiles(item.id).some((file) => file.name === "огромный.md"), false);
+  } finally {
+    await close(server);
+  }
+});
+
 test("страница записывает прокси и не показывает пароль", async () => {
   const trainer = start(tempDirectory());
   const server = await startWeb(trainer);
+
   try {
     const address = server.address() as AddressInfo;
     const base = `http://127.0.0.1:${address.port}`;

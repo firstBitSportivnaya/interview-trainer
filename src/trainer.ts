@@ -4,7 +4,15 @@ import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { join } from "node:path";
 
 import { LOCAL_EMBEDDING_MODEL, unitVector } from "./embeddings.ts";
-import { DRAFT_TOKENS, liveModel, ModelFailure, REPLY_TOKENS, REVIEW_TOKENS, type ModelPort } from "./model.ts";
+import {
+  DRAFT_TOKENS,
+  liveModel,
+  ModelFailure,
+  REPLY_TOKENS,
+  REVIEW_TOKENS,
+  type ModelFailureDetail,
+  type ModelPort,
+} from "./model.ts";
 import { isSealedSecret, openSecret, sealSecret } from "./os-secret.ts";
 
 /** Протокол ключа: родной Anthropic или совместимый с OpenAI. */
@@ -137,7 +145,8 @@ export type AddSourceFileResult =
 /** Отказ собрать черновик. Текст модели в отказ не входит. */
 export type DraftDossierResult =
   | { ok: true; draft: DossierLayers }
-  | { ok: false; reason: "incomplete" | "missing" | "timeout" | "model" | "secret" };
+  | { ok: false; reason: "incomplete" | "missing" | "timeout" | "secret" | "limit" | "shape" }
+  | { ok: false; reason: "model"; detail?: ModelFailureDetail };
 
 /** Утверждённое досье проекта. Сессия хранит его идентификатор. */
 export type DossierRecord = {
@@ -3047,7 +3056,10 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
      * Текст файла входит только в слой, который назвал владелец.
      * Черновик не записывается и сессию не открывает: в диалог он попадёт только после правки и утверждения.
      */
-    async draftDossier(draft: { caseId: string; keyId: string } & DossierLayers): Promise<DraftDossierResult> {
+    async draftDossier(
+      draft: { caseId: string; keyId: string } & DossierLayers,
+      onText?: (received: number) => void,
+    ): Promise<DraftDossierResult> {
       const caseId = draft.caseId.trim();
       const keyId = draft.keyId.trim();
       const layers = composeLayers(
@@ -3088,20 +3100,26 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
           controller.signal,
         )) {
           text += chunk;
+          onText?.(text.length);
           if (text.length > DRAFT_LIMIT) {
-            return { ok: false, reason: "model" };
+            return { ok: false, reason: "limit" };
           }
         }
       } catch (error) {
-        const reason = error instanceof ModelFailure ? error.reason : "model";
-        return { ok: false, reason };
+        if (error instanceof ModelFailure && error.reason === "timeout") {
+          return { ok: false, reason: "timeout" };
+        }
+        if (error instanceof ModelFailure && error.detail) {
+          return { ok: false, reason: "model", detail: error.detail };
+        }
+        return { ok: false, reason: "model" };
       } finally {
         controller.abort();
       }
 
       const parsed = parseDraft(text);
       if (!parsed) {
-        return { ok: false, reason: "model" };
+        return { ok: false, reason: "shape" };
       }
       return { ok: true, draft: parsed };
     },
