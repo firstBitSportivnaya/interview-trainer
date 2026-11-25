@@ -30,6 +30,7 @@ import {
   type RevokeAssignmentResult,
   type SaveCaseResult,
   type SaveKeyResult,
+  type SaveProxyResult,
   type SessionRecord,
   type SetPortfolioSentResult,
   type SourceFileRecord,
@@ -42,6 +43,9 @@ import {
 type Trainer = {
   saveKey(draft: KeyDraft): SaveKeyResult;
   listKeys(): KeySummary[];
+  saveProxy(draft: { proxyUrl: string }): SaveProxyResult;
+  clearProxy(): { ok: true } | { ok: false; reason: "forbidden" };
+  proxyPreview(): string | undefined;
   saveCase(draft: { customerName: string; title: string; characters?: string[] }): SaveCaseResult;
   addCase(draft: { customerId: string; title: string; characters?: string[] }): SaveCaseResult;
   listCustomers(): CustomerRecord[];
@@ -100,6 +104,11 @@ const KEY_ERROR: Record<Exclude<SaveKeyResult, { ok: true }>["reason"], string> 
   incomplete: "Заполните протокол, базовый адрес, имя модели и секрет.",
   protocol: "Выберите протокол Anthropic или совместимый с OpenAI.",
   forbidden: "Ключ записывает владелец.",
+};
+
+const PROXY_ERROR: Record<Exclude<SaveProxyResult, { ok: true }>["reason"], string> = {
+  address: "Укажите адрес прокси: схема http или https и хост.",
+  forbidden: "Прокси записывает владелец.",
 };
 
 const CASE_ERROR: Record<Exclude<SaveCaseResult, { ok: true }>["reason"], string> = {
@@ -210,7 +219,7 @@ function casePath(id: string, suffix = ""): string {
 }
 
 /** Собирает страницу ключей. Секрет берётся только из уже скрытого списка. */
-function renderKeys(keys: KeySummary[], error?: string): string {
+function renderKeys(keys: KeySummary[], proxy: string | undefined, error?: string, proxyError?: string): string {
   const items =
     keys.length === 0
       ? "<p>Ключей пока нет.</p>"
@@ -244,6 +253,16 @@ function renderKeys(keys: KeySummary[], error?: string): string {
       <input name="secret" type="password" required autocomplete="off">
     </label>
     <button type="submit">Сохранить ключ</button>
+  </form>
+  <h2>Прокси</h2>
+  <p>${proxy ? `Записан ${escapeHtml(proxy)}. Логин и пароль на странице не показываются.` : "Прямое соединение, прокси не записан."}</p>
+  ${notice(proxyError)}
+  <form method="post" action="/proxy">
+    <label>Адрес
+      <input name="proxyUrl" type="password" autocomplete="off">
+    </label>
+    <button type="submit" name="act" value="save">Записать прокси</button>
+    <button type="submit" name="act" value="clear">Убрать прокси</button>
   </form>
   <h2>Сохранённые</h2>
   ${items}`,
@@ -849,6 +868,13 @@ function redirect(response: ServerResponse, location: string): void {
   response.end();
 }
 
+function knownProxyError(reason: string | null): string | undefined {
+  if (reason === "address" || reason === "forbidden") {
+    return PROXY_ERROR[reason];
+  }
+  return undefined;
+}
+
 function knownKeyError(reason: string | null): string | undefined {
   if (reason === "incomplete" || reason === "protocol" || reason === "forbidden") {
     return KEY_ERROR[reason];
@@ -1056,7 +1082,15 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
   const session = sessionTarget(url.pathname);
 
   if (request.method === "GET" && url.pathname === "/") {
-    sendHtml(response, renderKeys(trainer.listKeys(), knownKeyError(url.searchParams.get("error"))));
+    sendHtml(
+      response,
+      renderKeys(
+        trainer.listKeys(),
+        trainer.proxyPreview(),
+        knownKeyError(url.searchParams.get("error")),
+        knownProxyError(url.searchParams.get("proxyError")),
+      ),
+    );
     return;
   }
 
@@ -1142,6 +1176,18 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
   }
 
   const fields = new URLSearchParams(raw.toString("utf8"));
+
+  if (url.pathname === "/proxy") {
+    const act = fields.get("act");
+    if (act === "clear") {
+      const cleared = trainer.clearProxy();
+      redirect(response, cleared.ok ? "/" : `/?proxyError=${cleared.reason}`);
+      return;
+    }
+    const saved = trainer.saveProxy({ proxyUrl: fields.get("proxyUrl") ?? "" });
+    redirect(response, saved.ok ? "/" : `/?proxyError=${saved.reason}`);
+    return;
+  }
 
   if (url.pathname === "/keys") {
     const saved = trainer.saveKey({

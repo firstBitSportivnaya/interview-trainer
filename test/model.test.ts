@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 
@@ -565,4 +565,89 @@ test("потолки реплики, черновика и разбора раз
   } finally {
     await close(server);
   }
+});
+
+test("вызов с прокси идёт через прокси, без прокси — напрямую", async () => {
+  let originHits = 0;
+  const originServer = await listen((request, response) => {
+    originHits += 1;
+    assert.equal(request.url, "/v1/messages");
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end('data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"июнь"}}\n\ndata: {"type":"message_stop"}\n\n');
+  });
+  let proxyHits = 0;
+  const proxy = await listen(async (request, response) => {
+    proxyHits += 1;
+    const target = new URL(request.url ?? "");
+    const body = await readBody(request);
+    const upstream = httpRequest(
+      {
+        hostname: target.hostname,
+        port: target.port,
+        path: `${target.pathname}${target.search}`,
+        method: request.method,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": request.headers["x-api-key"] ?? "",
+          "anthropic-version": request.headers["anthropic-version"] ?? "",
+        },
+      },
+      (upstreamResponse) => {
+        response.writeHead(upstreamResponse.statusCode ?? 502, {
+          "content-type": upstreamResponse.headers["content-type"] ?? "text/plain",
+        });
+        upstreamResponse.pipe(response);
+      },
+    );
+    upstream.on("error", () => {
+      if (!response.headersSent) response.writeHead(502);
+      response.end();
+    });
+    upstream.end(body);
+  });
+
+  try {
+    const base = origin(originServer);
+    const direct = callFor("anthropic", base);
+    let text = "";
+    for await (const chunk of liveModel().complete(direct, new AbortController().signal)) text += chunk;
+    assert.equal(text, "июнь");
+    assert.equal(proxyHits, 0);
+    assert.equal(originHits, 1);
+
+    const viaProxy = {
+      ...callFor("anthropic", base),
+      proxyUrl: `http://owner:secret-proxy@127.0.0.1:${(proxy.address() as AddressInfo).port}`,
+    };
+    text = "";
+    for await (const chunk of liveModel().complete(viaProxy, new AbortController().signal)) text += chunk;
+    assert.equal(text, "июнь");
+    assert.equal(text.includes("secret-proxy"), false);
+    assert.equal(proxyHits, 1);
+    assert.equal(originHits, 2);
+  } finally {
+    await close(proxy);
+    await close(originServer);
+  }
+
+  const refused = await listen(() => undefined);
+  const refusedOrigin = origin(refused);
+  await close(refused);
+  const refusedCall = {
+    ...callFor("anthropic", "http://127.0.0.1:9"),
+    proxyUrl: `http://owner:secret-proxy@${new URL(refusedOrigin).host}`,
+  };
+  await assert.rejects(
+    (async () => {
+      for await (const chunk of liveModel().complete(refusedCall, new AbortController().signal)) {
+        assert.equal(chunk, "");
+      }
+    })(),
+    (error: unknown) => {
+      assert.ok(error instanceof ModelFailure);
+      assert.equal(error.detail, "proxy");
+      assert.equal(String(error).includes("secret-proxy"), false);
+      return true;
+    },
+  );
 });

@@ -1753,3 +1753,28 @@ test("сессия получает утверждённый текст, а не
   assert.equal(replyPrompt.includes(raw), false);
   assert.equal(replyPrompt.includes(late), false);
 });
+
+test("прокси установки прячет пароль и неадрес не записывает", () => {
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory);
+  opened.push(trainer);
+  assert.equal(trainer.proxyPreview(), undefined);
+  assert.deepEqual(trainer.saveProxy({ proxyUrl: "не адрес" }), { ok: false, reason: "address" });
+  assert.deepEqual(trainer.saveProxy({ proxyUrl: "ftp://127.0.0.1:9" }), { ok: false, reason: "address" });
+  assert.equal(trainer.proxyPreview(), undefined);
+  assert.deepEqual(trainer.saveProxy({ proxyUrl: "http://owner:secret-proxy@127.0.0.1:9" }), { ok: true });
+  assert.equal(trainer.proxyPreview(), "http://127.0.0.1:9");
+  const database = new DatabaseSync(join(directory, "store.sqlite"), { readOnly: true });
+  const row = database.prepare("SELECT value FROM store_flags WHERE name = 'proxy'").get() as { value: string };
+  database.close();
+  assert.equal(row.value.startsWith("sealed:"), true);
+  assert.equal(row.value.includes("secret-proxy"), false);
+  assert.deepEqual(trainer.saveProxy({ proxyUrl: "http://127.0.0.1:8", executorId: "чужой" }), {
+    ok: false,
+    reason: "forbidden",
+  });
+  assert.equal(trainer.proxyPreview(), "http://127.0.0.1:9");
+  assert.deepEqual(trainer.clearProxy({ executorId: "чужой" }), { ok: false, reason: "forbidden" });
+  assert.deepEqual(trainer.clearProxy(), { ok: true });
+  assert.equal(trainer.proxyPreview(), undefined);
+});

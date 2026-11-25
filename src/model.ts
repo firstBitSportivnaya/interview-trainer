@@ -1,3 +1,6 @@
+import { connect as connectTcp, type Socket } from "node:net";
+import { connect as connectTls } from "node:tls";
+
 import type { Protocol } from "./trainer.ts";
 
 /** Потолок короткой реплики. Протокол требует предел. */
@@ -18,11 +21,13 @@ const FRAME_LIMIT = 64 * 1024;
 /** Сбой вызова. Текст поставщика сюда не кладётся, чтобы он не стал речью. */
 export class ModelFailure extends Error {
   readonly reason: "timeout" | "model";
+  readonly detail?: "proxy";
 
-  constructor(reason: "timeout" | "model") {
+  constructor(reason: "timeout" | "model", detail?: "proxy") {
     super(reason);
     this.name = "ModelFailure";
     this.reason = reason;
+    this.detail = detail;
   }
 }
 
@@ -41,6 +46,8 @@ export type ModelCall = {
   messages: readonly ModelMessage[];
   /** Потолок вывода этого вызова. Нет поля — потолок короткой реплики. */
   maxTokens?: number;
+  /** HTTP-прокси этого вызова. Нет поля — прямое соединение с базовым адресом. */
+  proxyUrl?: string;
 };
 
 /**
@@ -95,6 +102,7 @@ export function liveModel(options: LiveModelOptions = {}): ModelPort {
           anthropicPiece,
           timeoutMs,
           signal,
+          call.proxyUrl,
         );
       }
       return streamReply(
@@ -104,6 +112,7 @@ export function liveModel(options: LiveModelOptions = {}): ModelPort {
         openaiPiece,
         timeoutMs,
         signal,
+        call.proxyUrl,
       );
     },
   };
@@ -149,21 +158,29 @@ async function* streamReply(
   readPiece: (data: string) => StreamPiece,
   timeoutMs: number,
   caller: AbortSignal,
+  proxyUrl?: string,
 ): AsyncGenerator<string> {
   const idle = idleAbort(timeoutMs);
   const signal = AbortSignal.any([caller, idle.signal]);
   try {
     let response: Response;
     try {
-      response = await fetch(url, {
-        method: "POST",
-        headers: { ...headers, "content-type": "application/json" },
-        body: JSON.stringify(body),
-        signal,
-      });
+      const payload = JSON.stringify(body);
+      response = proxyUrl
+        ? await proxyFetch(url, headers, payload, signal, proxyUrl)
+        : await fetch(url, {
+            method: "POST",
+            headers: { ...headers, "content-type": "application/json" },
+            body: payload,
+            signal,
+          });
     } catch (error) {
       const failure = failureFor(error, caller, idle.signal);
-      if (failure) throw failure;
+      if (failure) {
+        if (failure.detail) throw failure;
+        if (proxyUrl && failure.reason === "model") throw new ModelFailure("model", "proxy");
+        throw failure;
+      }
       return;
     }
 
@@ -290,3 +307,137 @@ function eventData(raw: string): string | undefined {
   if (lines.length === 0) return undefined;
   return lines.join("\n");
 }
+
+type ProxyHead = { status: number; headers: Headers; rest: Buffer };
+
+/** Вызов через HTTP-прокси. Пароль в ошибку не попадает. */
+function proxyFetch(
+  url: string,
+  headers: Record<string, string>,
+  body: string,
+  signal: AbortSignal,
+  proxyUrl: string,
+): Promise<Response> {
+  const target = new URL(url);
+  const proxy = new URL(proxyUrl);
+  const port = proxy.port === "" ? (proxy.protocol === "https:" ? 443 : 80) : Number(proxy.port);
+  return new Promise((resolve, reject) => {
+    const fail = (error: unknown) => {
+      const code = errorCode(error);
+      const wrapped = new TypeError("proxy");
+      if (code) (wrapped as { cause?: unknown }).cause = { code };
+      reject(wrapped);
+    };
+    if (signal.aborted) {
+      fail(Object.assign(new Error("aborted"), { code: "ABORT_ERR" }));
+      return;
+    }
+    const socket =
+      proxy.protocol === "https:"
+        ? connectTls({ host: proxy.hostname, port, servername: proxy.hostname })
+        : connectTcp({ host: proxy.hostname, port });
+    const onAbort = () => socket.destroy();
+    signal.addEventListener("abort", onAbort, { once: true });
+    socket.once("error", fail);
+    const requestHeaders = {
+      ...headers,
+      "content-type": "application/json",
+      host: target.host,
+      "content-length": String(Buffer.byteLength(body)),
+    };
+    if (target.protocol === "https:") {
+      const host = `${target.hostname}:${target.port || 443}`;
+      const tunnel = readHead(socket);
+      socket.write(`CONNECT ${host} HTTP/1.1\r\nHost: ${host}\r\n${proxyAuthorization(proxy)}\r\n`);
+      tunnel
+        .then((head) => {
+          if (head.status !== 200) {
+            socket.destroy();
+            reject(new ModelFailure("model", "proxy"));
+            return;
+          }
+          if (head.rest.length > 0) socket.unshift(head.rest);
+          const secure = connectTls({ socket, servername: target.hostname });
+          secure.once("error", fail);
+          secure.once("secureConnect", () => {
+            const responseHead = readHead(secure);
+            writeHttp(secure, target, requestHeaders, body, false);
+            responseHead.then((parsed) => resolve(responseFrom(secure, parsed))).catch(fail);
+          });
+        })
+        .catch(fail);
+      return;
+    }
+    const headPromise = readHead(socket);
+    writeHttp(socket, target, requestHeaders, body, true);
+    headPromise.then((head) => resolve(responseFrom(socket, head))).catch(fail);
+  });
+}
+
+function proxyAuthorization(proxy: URL): string {
+  if (!proxy.username && !proxy.password) return "";
+  const user = decodeURIComponent(proxy.username);
+  const password = decodeURIComponent(proxy.password);
+  const token = Buffer.from(`${user}:${password}`).toString("base64");
+  return `Proxy-Authorization: Basic ${token}\r\n`;
+}
+
+function writeHttp(socket: Socket, target: URL, headers: Record<string, string>, body: string, absolute: boolean): void {
+  const path = absolute ? target.href : `${target.pathname}${target.search}`;
+  const lines = [`POST ${path} HTTP/1.1`];
+  for (const [name, value] of Object.entries(headers)) {
+    lines.push(`${name}: ${value}`);
+  }
+  socket.write(`${lines.join("\r\n")}\r\n\r\n${body}`);
+}
+
+function readHead(socket: Socket): Promise<ProxyHead> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const onData = (chunk: Buffer) => {
+      chunks.push(chunk);
+      const buffered = Buffer.concat(chunks);
+      const split = buffered.indexOf("\r\n\r\n");
+      if (split < 0) return;
+      socket.off("data", onData);
+      const raw = buffered.subarray(0, split).toString("latin1");
+      const [start, ...headerLines] = raw.split("\r\n");
+      const status = Number(start?.split(" ")[1] ?? 0);
+      const headers = new Headers();
+      for (const line of headerLines) {
+        const colon = line.indexOf(":");
+        if (colon > 0) headers.append(line.slice(0, colon).trim(), line.slice(colon + 1).trim());
+      }
+      resolve({ status, headers, rest: buffered.subarray(split + 4) });
+    };
+    socket.on("data", onData);
+    socket.once("error", reject);
+    socket.once("end", () => reject(new TypeError("proxy")));
+  });
+}
+
+function responseFrom(socket: Socket, head: ProxyHead): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      if (head.rest.length > 0) controller.enqueue(head.rest);
+      socket.on("data", (chunk: Buffer) => controller.enqueue(chunk));
+      socket.on("end", () => controller.close());
+      socket.on("error", (error) => controller.error(error));
+    },
+    cancel() {
+      socket.destroy();
+    },
+  });
+  return new Response(stream, { status: head.status, headers: head.headers });
+}
+
+
+function errorCode(error: unknown): string {
+  if (!error || typeof error !== "object") return "";
+  if ("code" in error && typeof error.code === "string") return error.code;
+  const cause = "cause" in error ? error.cause : undefined;
+  if (cause && typeof cause === "object" && "code" in cause && typeof cause.code === "string") return cause.code;
+  return "";
+}
+
+
