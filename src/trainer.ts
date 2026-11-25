@@ -3371,7 +3371,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       appendTranscript(session.id, "исполнитель", "реплика", text);
       const spoken = { text: "", failed: false };
       yield* streamKey(session, [{ role: "user", text: task.text }], spoken, signal);
-      if (spoken.text && !signal?.aborted) {
+      if (!spoken.failed && spoken.text && !signal?.aborted) {
         appendTranscript(session.id, "персонаж", "ответ", spoken.text);
       }
     },

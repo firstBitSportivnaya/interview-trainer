@@ -1445,10 +1445,73 @@ test("таймаут и ошибка модели не становятся ре
     { kind: "failure", reason: "model", message: "Модель вернула ошибку." },
   ]);
   assert.equal(JSON.stringify(failed).includes("внутренний сбой поставщика"), false);
+  const transcript = trainer.readTranscript(openedSession.session.id);
+  assert.ok(transcript);
+  assert.equal(
+    transcript.some((line) => line.speaker === "персонаж" || line.text.includes("Срок")),
+    false,
+  );
   assert.deepEqual(await take(trainer.reply("нет-такой-сессии", "вопрос")), [
     { kind: "failure", reason: "missing", message: "Сессия не найдена." },
   ]);
   assert.deepEqual(calls, ["таймаут", "сбой"]);
+  assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
+});
+
+test("оборванная фраза персонажа не попадает в стенограмму", async () => {
+  const trainer = start(tempDirectory(), {
+    async *complete() {
+      yield "Срок поставки — ";
+      throw new ModelFailure("timeout");
+    },
+  });
+  const prepared = prepare(trainer);
+  const openedSession = openAnalyst(trainer, prepared);
+  assert.ok(openedSession.ok);
+
+  assert.deepEqual(await take(trainer.reply(openedSession.session.id, "Какой срок поставки?")), [
+    { kind: "speech", text: "Срок поставки — " },
+    { kind: "failure", reason: "timeout", message: "Модель не ответила вовремя." },
+  ]);
+  assert.deepEqual(trainer.readTranscript(openedSession.session.id), [
+    { speaker: "исполнитель", kind: "реплика", text: "Какой срок поставки?" },
+  ]);
+  assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
+});
+
+test("оборванный первый вопрос оставляет стенограмму пустой", async () => {
+  const trainer = start(tempDirectory(), {
+    async *complete() {
+      yield "Срок поставки — ";
+      throw new ModelFailure("timeout");
+    },
+  });
+  const prepared = prepare(trainer);
+  const openedSession = openAnalyst(trainer, prepared);
+  assert.ok(openedSession.ok);
+
+  const events = await take(trainer.openingQuestion(openedSession.session.id));
+  assert.equal(events.some((event) => event.kind === "failure"), true);
+  assert.deepEqual(trainer.readTranscript(openedSession.session.id), []);
+  assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
+});
+
+test("договорённая реплика персонажа целиком лежит в стенограмме", async () => {
+  const trainer = start(tempDirectory(), {
+    async *complete() {
+      yield "Срок ";
+      yield "поставки — июнь.";
+    },
+  });
+  const prepared = prepare(trainer);
+  const openedSession = openAnalyst(trainer, prepared);
+  assert.ok(openedSession.ok);
+
+  await take(trainer.reply(openedSession.session.id, "Какой срок поставки?"));
+  assert.deepEqual(trainer.readTranscript(openedSession.session.id), [
+    { speaker: "исполнитель", kind: "реплика", text: "Какой срок поставки?" },
+    { speaker: "персонаж", kind: "ответ", text: "Срок поставки — июнь." },
+  ]);
 });
 
 /** Собирает черновик из текста запроса: каждый слой остаётся между своими заголовками. */
