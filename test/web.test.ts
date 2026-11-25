@@ -913,6 +913,120 @@ test("веб записывает файл в названный слой и н�
   }
 });
 
+test("сборка черновика показывает слой и причину отказа", async () => {
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, {
+    async *complete() {
+      yield "не json";
+    },
+  });
+  opened.push(trainer);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    await fetch(`${base}/keys`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({
+        protocol: "anthropic",
+        baseAddress: "https://api.anthropic.com",
+        modelName: "claude-sonnet",
+        secret: "sk-ant-api03-secret-WXYZ",
+      }),
+    });
+    const keyId = trainer.listKeys()[0]?.id;
+    assert.ok(keyId);
+    await fetch(`${base}/customers`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ customerName: "Север", title: "Внедрение склада" }),
+    });
+    const item = trainer.listCases()[0];
+    assert.ok(item);
+    assert.ok(
+      trainer.addSourceFile({
+        caseId: item.id,
+        name: "служебный.txt",
+        layer: "serviceLayer",
+        extractedText: "СЛУЖЕБНЫЙ-ФАЙЛ",
+      }).ok,
+    );
+    const page = await (await fetch(`${base}/cases/${item.id}`)).text();
+    assert.equal(page.includes("<h3>Служебный слой</h3>"), true);
+    assert.equal(page.includes("служебный.txt — Служебный слой, 14 знаков"), true);
+    assert.equal(page.includes("В этом слое файлов нет."), true);
+    assert.equal(page.includes('id="draft-steps"'), true);
+    assert.equal(page.includes("служебный.txt"), true);
+    assert.equal(page.includes("Файлы 14 знаков."), true);
+
+    const stream = await fetch(`${base}/cases/${item.id}/draft`, {
+      method: "POST",
+      headers: { ...headers, accept: "text/event-stream" },
+      body: new URLSearchParams({ material: "", serviceLayer: "", crib: "", keyId }),
+    });
+    const body = await stream.text();
+    assert.equal(stream.status, 200);
+    assert.equal(body.includes("Служебный слой: служебный.txt"), true);
+    assert.equal(body.includes("Жду ответ модели."), true);
+    assert.equal(body.includes("Ответ модели:"), true);
+    assert.equal(body.includes("не является JSON с тремя строками"), true);
+    assert.equal(body.includes("не json"), false);
+    assert.equal(trainer.readApprovedDossier(item.id), undefined);
+  } finally {
+    await close(server);
+  }
+});
+
+test("обрыв соединения называет базовый адрес и не показывает текст поставщика", async () => {
+  const trainer = openTrainer(tempDirectory(), {
+    async *complete() {
+      throw new ModelFailure("model", "unreachable");
+    },
+  });
+  opened.push(trainer);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    await fetch(`${base}/keys`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({
+        protocol: "anthropic",
+        baseAddress: "https://api.anthropic.com",
+        modelName: "claude-sonnet",
+        secret: "sk-ant-api03-secret-WXYZ",
+      }),
+    });
+    const keyId = trainer.listKeys()[0]?.id;
+    assert.ok(keyId);
+    await fetch(`${base}/customers`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ customerName: "Север", title: "Внедрение склада" }),
+    });
+    const item = trainer.listCases()[0];
+    assert.ok(item);
+    const stream = await fetch(`${base}/cases/${item.id}/draft`, {
+      method: "POST",
+      headers: { ...headers, accept: "text/event-stream" },
+      body: new URLSearchParams({ material: "Паллеты на складе.", serviceLayer: "", crib: "", keyId }),
+    });
+    const body = await stream.text();
+    assert.equal(body.includes("https://api.anthropic.com"), true);
+    assert.equal(body.includes("не соединилась"), true);
+    assert.equal(body.includes("sk-ant"), false);
+    assert.equal(body.includes("Паллеты на складе."), false);
+  } finally {
+    await close(server);
+  }
+});
+
 test("страница проекта ставит и снимает отметку «портфолио уже отправлено»", async () => {
   const directory = tempDirectory();
   const trainer = start(directory);
