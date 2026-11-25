@@ -31,6 +31,8 @@ export type SaveKeyResult =
   | { ok: true }
   | { ok: false; reason: "incomplete" | "protocol" | "forbidden" };
 
+/** Отказ записать прокси установки: адрес не http(s) или записывает не владелец. */
+export type SaveProxyResult = { ok: true } | { ok: false; reason: "address" | "forbidden" };
 
 /** Ключ, который можно показать. Хвост секрета виден, только если секрет длиннее четырёх знаков. */
 export type KeySummary = {
@@ -607,6 +609,36 @@ function secretPreview(secret: string): string {
     return "••••";
   }
   return `••••${secret.slice(-4)}`;
+}
+
+const PROXY_FLAG = "proxy";
+
+/** Адрес прокси: http или https и хост. Логин в строке допустим, в предпросмотр не входит. */
+function proxyStored(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    const url = new URL(trimmed);
+    if ((url.protocol !== "http:" && url.protocol !== "https:") || url.hostname === "") {
+      return undefined;
+    }
+    return trimmed;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Схема, хост и порт. Имя пользователя и пароль отбрасываются. */
+function visibleProxy(value: string): string | undefined {
+  const stored = proxyStored(value);
+  if (!stored) {
+    return undefined;
+  }
+  const url = new URL(stored);
+  const port = url.port ? `:${url.port}` : "";
+  return `${url.protocol}//${url.hostname}${port}`;
 }
 
 /** Секрет из колонки. Открытый текст прошлого хранилища читается как есть, чужой свёрток — нет. */
@@ -2155,6 +2187,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
           secret: key.secret,
           messages,
           maxTokens: outputTokens,
+          proxyUrl: readProxy(),
         },
         controller.signal,
       )) {
@@ -2639,6 +2672,25 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     };
   }
 
+  function storedProxy(): string | undefined {
+    const row = database.prepare("SELECT value FROM store_flags WHERE name = ?").get(PROXY_FLAG) as
+      | { value: string }
+      | undefined;
+    return typeof row?.value === "string" && row.value ? row.value : undefined;
+  }
+
+  function readProxy(): string | undefined {
+    const stored = storedProxy();
+    if (!stored) {
+      return undefined;
+    }
+    const open = revealSecret(stored);
+    if (!open) {
+      return undefined;
+    }
+    return proxyStored(open);
+  }
+
   let closed = false;
   /** Сессии, у которых первый вопрос уже пошёл к модели и ещё не записан. */
   const openingReservations = new Set<string>();
@@ -2676,6 +2728,44 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         .prepare("INSERT INTO keys (id, protocol, base_address, model_name, secret) VALUES (?, ?, ?, ?, ?)")
         .run(id, protocol, baseAddress, modelName, sealSecret(secret));
       return { ok: true };
+    },
+
+    /**
+     * Записывает один HTTP-прокси установки.
+     * Через него идут вызовы всех ключей. Логин и пароль в предпросмотр не входят.
+     */
+    saveProxy(draft: { proxyUrl: string; executorId?: string }): SaveProxyResult {
+      if (foreignExecutor(draft.executorId)) {
+        return { ok: false, reason: "forbidden" };
+      }
+      const stored = proxyStored(draft.proxyUrl);
+      if (!stored) {
+        return { ok: false, reason: "address" };
+      }
+      database.prepare("INSERT OR REPLACE INTO store_flags (name, value) VALUES (?, ?)").run(PROXY_FLAG, sealSecret(stored));
+      return { ok: true };
+    },
+
+    /** Убирает прокси. Дальше вызов идёт напрямую на базовый адрес ключа. */
+    clearProxy(draft?: { executorId?: string }): { ok: true } | { ok: false; reason: "forbidden" } {
+      if (foreignExecutor(draft?.executorId)) {
+        return { ok: false, reason: "forbidden" };
+      }
+      database.prepare("DELETE FROM store_flags WHERE name = ?").run(PROXY_FLAG);
+      return { ok: true };
+    },
+
+    /** Схема, хост и порт записанного прокси. Секрета адреса здесь нет. */
+    proxyPreview(): string | undefined {
+      const stored = storedProxy();
+      if (!stored) {
+        return undefined;
+      }
+      const open = revealSecret(stored);
+      if (!open) {
+        return "не читается";
+      }
+      return visibleProxy(open);
     },
 
     /** Возвращает сохранённые ключи без секрета целиком. */
@@ -3005,6 +3095,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
             secret: loaded.key.secret,
             messages: [{ role: "user", text: dossierDraftPrompt(layers) }],
             maxTokens: DRAFT_TOKENS,
+            proxyUrl: readProxy(),
           },
           controller.signal,
         )) {

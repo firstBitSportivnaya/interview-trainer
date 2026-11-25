@@ -199,6 +199,15 @@ test("ошибка записи не останавливает веб", async (
     listKeys() {
       return [];
     },
+    saveProxy() {
+      return { ok: false, reason: "address" as const };
+    },
+    clearProxy() {
+      return { ok: true as const };
+    },
+    proxyPreview() {
+      return undefined;
+    },
     saveCase() {
       return { ok: false, reason: "incomplete" };
     },
@@ -1987,6 +1996,57 @@ test("markdown и файл больше предела формы записыв
     assert.equal(refusedPage.includes("Файл больше 64 МиБ. Страница его не принимает."), true);
     assert.equal(trainer.listSourceFiles(item.id).some((file) => file.name === "огромный.md"), false);
     assert.equal(trainer.listUnreadFiles(item.id).some((file) => file.name === "огромный.md"), false);
+  } finally {
+    await close(server);
+  }
+});
+
+test("страница записывает прокси и не показывает пароль", async () => {
+  const trainer = start(tempDirectory());
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    const empty = await (await fetch(base)).text();
+    assert.equal(empty.includes("Прямое соединение, прокси не записан."), true);
+
+    const foreign = await fetch(`${base}/proxy`, {
+      method: "POST",
+      headers: { ...headers, origin: "https://evil.example" },
+      body: new URLSearchParams({ proxyUrl: "http://owner:secret-proxy@127.0.0.1:9", act: "save" }),
+    });
+    assert.equal(foreign.status, 403);
+    assert.equal(trainer.proxyPreview(), undefined);
+
+    const bad = await fetch(`${base}/proxy`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ proxyUrl: "не адрес", act: "save" }),
+    });
+    const badPage = await bad.text();
+    assert.equal(badPage.includes("Укажите адрес прокси"), true);
+    assert.equal(trainer.proxyPreview(), undefined);
+
+    const saved = await fetch(`${base}/proxy`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ proxyUrl: "http://owner:secret-proxy@127.0.0.1:9", act: "save" }),
+    });
+    const page = await saved.text();
+    assert.equal(page.includes("http://127.0.0.1:9"), true);
+    assert.equal(page.includes("secret-proxy"), false);
+    assert.equal(page.includes("owner:"), false);
+
+    const cleared = await fetch(`${base}/proxy`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ act: "clear" }),
+    });
+    const afterClear = await cleared.text();
+    assert.equal(trainer.proxyPreview(), undefined);
+    assert.equal(afterClear.includes("Прямое соединение, прокси не записан."), true);
   } finally {
     await close(server);
   }
