@@ -604,7 +604,7 @@ test("черновик длиннее предела не становится �
     serviceLayer: "",
     crib: "",
   });
-  assert.deepEqual(drafted, { ok: false, reason: "model" });
+  assert.deepEqual(drafted, { ok: false, reason: "limit" });
   assert.equal(JSON.stringify(drafted).includes("Я"), false);
   assert.equal(trainer.readApprovedDossier(prepared.caseId)?.material, "Склад принимает паллеты.");
 });
@@ -646,7 +646,7 @@ test("сбой черновика не создаёт досье и не ста�
     serviceLayer: "",
     crib: "",
   });
-  assert.deepEqual(rejected, { ok: false, reason: "model" });
+  assert.deepEqual(rejected, { ok: false, reason: "shape" });
   assert.equal(JSON.stringify(rejected).includes("это не досье"), false);
   assert.equal(JSON.stringify(rejected).includes("секрет поставщика"), false);
   assert.equal(trainer.readApprovedDossier(prepared.caseId)?.material, "Склад принимает паллеты.");
@@ -1753,3 +1753,4 @@ test("сессия получает утверждённый текст, а не
   assert.equal(replyPrompt.includes(raw), false);
   assert.equal(replyPrompt.includes(late), false);
 });
+

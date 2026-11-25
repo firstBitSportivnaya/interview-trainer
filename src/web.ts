@@ -57,7 +57,10 @@ type Trainer = {
   }): AddSourceFileResult;
   noteUnreadFile(draft: { caseId: string; name: string; executorId?: string }): NoteUnreadFileResult;
   listSourceFiles(caseId: string): SourceFileRecord[];
-  draftDossier(draft: { caseId: string; keyId: string } & DossierLayers): Promise<DraftDossierResult>;
+  draftDossier(
+    draft: { caseId: string; keyId: string } & DossierLayers,
+    onText?: (received: number) => void,
+  ): Promise<DraftDossierResult>;
   approveDossier(draft: { caseId: string } & DossierLayers): ApproveDossierResult;
   readApprovedDossier(caseId: string): DossierRecord | undefined;
   openSession(draft: {
@@ -119,11 +122,16 @@ const SESSION_ERROR: Record<Exclude<OpenSessionResult, { ok: true }>["reason"] |
 };
 
 const DRAFT_ERROR: Record<Exclude<DraftDossierResult, { ok: true }>["reason"], string> = {
-  incomplete: "Вставьте текст хотя бы одного слоя и выберите ключ.",
-  missing: "Проект или ключ не найдены.",
-  timeout: "Модель не ответила вовремя.",
-  model: "Модель не собрала черновик.",
-  secret: "Секрет ключа не читается.",
+  incomplete: "Вставьте текст хотя бы одного слоя и выберите ключ. Пустые поля и файлы без текста черновик не собирают.",
+  missing: "Проект или ключ не найдены. Черновик не собирался.",
+  timeout:
+    "Модель не ответила вовремя: пауза между кусками ответа длиннее срока ожидания. Черновик не собран, досье не изменилось.",
+  model:
+    "Вызов не дошёл до текста черновика. Проверьте базовый адрес, имя модели и секрет на странице ключей, затем соберите черновик ещё раз. Текст ответа на страницу не выводится. Черновик не собран, досье не изменилось.",
+  secret: "Секрет ключа не читается. Черновик не собирался.",
+  limit: `Ответ модели длиннее ${DRAFT_LIMIT / 1024} КиБ. Черновик такой длины не записывается. Досье не изменилось.`,
+  shape:
+    "Ответ модели не является JSON с тремя строками: материал проекта, служебный слой и шпаргалка проекта. Текст ответа на страницу не выводится. Черновик не собран, досье не изменилось.",
 };
 
 const FILE_ERROR: Record<Exclude<AddSourceFileResult, { ok: true }>["reason"], string> = {
@@ -177,6 +185,16 @@ function page(title: string, body: string): string {
     nav a { margin-right: 1rem; }
     li { margin: 0.4rem 0; }
     pre, #live { white-space: pre-wrap; font: inherit; }
+    .layers { list-style: none; padding: 0; margin: 1rem 0; }
+    .layers li { display: grid; gap: 0.15rem; margin: 0; padding: 0.75rem 0; border-top: 1px solid #e7e5e4; overflow-wrap: anywhere; }
+    .layers .meta { color: #57534e; }
+    .steps { list-style: none; display: flex; gap: 0.5rem; padding: 0; margin: 0.4rem 0 0.8rem; }
+    .steps li { flex: 1; margin: 0; padding: 0.55rem 0.7rem; border: 1px solid #d6d3d1; border-radius: 0.45rem; background: #fafaf9; color: #78716c; }
+    .steps li.done { color: #44403c; border-color: #a8a29e; }
+    .steps li.current { color: #1c1917; border-color: #1c1917; background: #fff; }
+    .steps li.bad { color: #9f1239; border-color: #fda4af; background: #fff1f2; }
+    #draft-count { font-variant-numeric: tabular-nums; color: #44403c; }
+    .error-box { white-space: pre-wrap; margin: 0.8rem 0; padding: 0.8rem 1rem; border: 1px solid #fecdd3; border-radius: 0.45rem; background: #fff1f2; color: #9f1239; }
     code { letter-spacing: 0.04em; }
     section { margin: 1.5rem 0; }
     ol { padding-left: 1.2rem; }
@@ -609,17 +627,27 @@ function renderSourceFiles(trainer: Trainer, item: CaseRecord, error?: string): 
   // Имя в названном слое уже прочитано. Поздняя отметка без текста страницу не перебивает и текст слоя не стирает.
   const unread = trainer.listUnreadFiles(item.id).filter((file) => !readNames.has(file.name));
   const items =
-    files.length === 0
-      ? unread.length === 0
-        ? "<p>Файлов проекта пока нет.</p>"
-        : ""
-      : `<ul>${files
-          .map((file) => `<li>${escapeHtml(file.name)} — ${escapeHtml(LAYER_LABEL[file.layer])}</li>`)
-          .join("")}</ul>`;
+    files.length === 0 && unread.length === 0
+      ? "<p>Файлов проекта пока нет.</p>"
+      : (Object.entries(LAYER_LABEL) as [DossierLayerName, string][])
+          .map(([layer, label]) => {
+            const own = files.filter((file) => file.layer === layer);
+            const list =
+              own.length === 0
+                ? "<p>В этом слое файлов нет.</p>"
+                : `<ul>${own
+                    .map(
+                      (file) =>
+                        `<li>${escapeHtml(file.name)} — ${escapeHtml(label)}, ${file.extractedText.length} знаков</li>`,
+                    )
+                    .join("")}</ul>`;
+            return `<h3>${escapeHtml(label)}</h3>${list}`;
+          })
+          .join("");
   const unreadItems =
     unread.length === 0
       ? ""
-      : `<ul id="unread-files">${unread
+      : `<h3>Не прочитаны</h3><ul id="unread-files">${unread
           .map((file) => `<li>${escapeHtml(file.name)} — не прочитан</li>`)
           .join("")}</ul>`;
   const options = (Object.entries(LAYER_LABEL) as [DossierLayerName, string][])
@@ -670,6 +698,185 @@ function assignmentBlock(trainer: Trainer, item: CaseRecord, error?: string): st
   </section>`;
 }
 
+function draftLines(trainer: Trainer, caseId: string, paste?: DossierLayers): string {
+  const files = trainer.listSourceFiles(caseId);
+  return (Object.entries(LAYER_LABEL) as [DossierLayerName, string][])
+    .map(([layer, label]) => {
+      const own = files.filter((file) => file.layer === layer);
+      const pasted = (paste?.[layer] ?? "").trim().length;
+      const fromFiles = own.reduce((sum, file) => sum + file.extractedText.length, 0);
+      const names = own.length === 0 ? "файлов нет" : own.map((file) => file.name).join(", ");
+      return `${label}: ${names}. Вставленный текст ${pasted} знаков, файлы ${fromFiles} знаков.`;
+    })
+    .join("\n");
+}
+
+function draftInventory(trainer: Trainer, caseId: string, paste?: DossierLayers): string {
+  const files = trainer.listSourceFiles(caseId);
+  const items = (Object.entries(LAYER_LABEL) as [DossierLayerName, string][])
+    .map(([layer, label]) => {
+      const own = files.filter((file) => file.layer === layer);
+      const pasted = (paste?.[layer] ?? "").trim().length;
+      const fromFiles = own.reduce((sum, file) => sum + file.extractedText.length, 0);
+      const names = own.length === 0 ? "Файлов в этом слое нет." : own.map((file) => file.name).join(", ");
+      return `<li><strong>${escapeHtml(label)}</strong><span>${escapeHtml(names)}</span><span class="meta">Вставленный текст ${pasted} знаков. Файлы ${fromFiles} знаков.</span></li>`;
+    })
+    .join("");
+  return `<ul class="layers" id="draft-plan">${items}</ul>`;
+}
+
+function draftFailureText(result: Exclude<DraftDossierResult, { ok: true }>, baseAddress?: string): string {
+  if (result.reason !== "model" || !result.detail) return DRAFT_ERROR[result.reason];
+  if (result.detail === "unreachable") {
+    const address = baseAddress?.trim();
+    const where = address ? `с базовым адресом ${address}` : "с базовым адресом ключа";
+    return `Машина не соединилась ${where}: срок ожидания соединения вышел, ответа не было. Проверьте этот адрес на странице ключей и что с этой машины он открывается. Черновик не собран, досье не изменилось.`;
+  }
+  if (result.detail === "auth") {
+    return "Секрет ключа не принят. Откройте страницу ключей и запишите секрет заново. Черновик не собран, досье не изменилось.";
+  }
+  if (result.detail === "name") {
+    return "Имя модели или базовый адрес не найдены. Проверьте оба поля на странице ключей. Черновик не собран, досье не изменилось.";
+  }
+  if (result.detail === "busy") {
+    return "Адрес ключа ответил, что сейчас занят. Подождите и соберите черновик ещё раз. Досье не изменилось.";
+  }
+  if (result.detail === "large") {
+    return "Текст слоёв слишком большой для одного вызова. Уберите часть файлов или сократите вставленный текст и соберите черновик снова. Досье не изменилось.";
+  }
+  if (result.detail === "cut") {
+    return "Ответ оборвался на потолке длины вывода. Черновик не собран, досье не изменилось.";
+  }
+  return "Вызов не принят. Проверьте имя модели и базовый адрес на странице ключей. Если они верны, сократите текст слоёв и соберите черновик снова. Досье не изменилось.";
+}
+
+/** Ход сборки черновика. Текст модели в страницу не подставляется. */
+function draftScript(): string {
+  return `<script>
+    const draftForm = document.getElementById("draft");
+    const draftRun = document.getElementById("draft-run");
+    const draftStatus = document.getElementById("draft-status");
+    const draftCount = document.getElementById("draft-count");
+    const draftError = document.getElementById("draft-error");
+    const draftButton = draftForm.querySelector("button");
+    const steps = Array.from(document.querySelectorAll("#draft-steps li"));
+    function mark(name) {
+      let before = true;
+      for (const step of steps) {
+        step.classList.remove("current", "done", "bad");
+        if (step.dataset.step === name) {
+          step.classList.add("current");
+          before = false;
+        } else if (before) step.classList.add("done");
+      }
+    }
+    function showFailure(text) {
+      const current = steps.find((step) => step.classList.contains("current"));
+      if (current) current.classList.add("bad");
+      draftError.hidden = false;
+      draftError.textContent = text;
+      draftButton.disabled = false;
+    }
+    function takeEvents(buffer, onEvent) {
+      const parts = buffer.split("\\n\\n");
+      const rest = parts.pop() ?? "";
+      for (const part of parts) {
+        if (!part.trim()) continue;
+        let name = "message";
+        const data = [];
+        for (const line of part.split("\\n")) {
+          if (line.startsWith("event:")) name = line.slice(6).trim();
+          else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+        }
+        onEvent(name, data.join("\\n"));
+      }
+      return rest;
+    }
+    draftForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      draftButton.disabled = true;
+      draftRun.hidden = false;
+      draftError.hidden = true;
+      draftError.textContent = "";
+      draftCount.hidden = true;
+      draftCount.textContent = "";
+      mark("pack");
+      draftStatus.textContent = "Отправляю тексты слоёв.";
+      const body = new URLSearchParams(new FormData(draftForm));
+      fetch(draftForm.action, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", accept: "text/event-stream" },
+        body,
+      }).then(async (response) => {
+        if (!response.body) throw new Error("empty");
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let pending = "";
+        while (true) {
+          const step = await reader.read();
+          if (step.done) break;
+          pending += decoder.decode(step.value, { stream: true });
+          pending = takeEvents(pending, (name, data) => {
+            if (name === "status" && data.includes("Жду ответ")) {
+              mark("wait");
+              draftStatus.textContent = data;
+            } else if (name === "progress") {
+              mark("read");
+              draftStatus.textContent = "Ответ идёт.";
+              draftCount.hidden = false;
+              draftCount.textContent = data;
+            } else if (name === "failure") showFailure(data);
+            else if (name === "page") {
+              document.open();
+              document.write(data);
+              document.close();
+            }
+          });
+        }
+      }).catch(() => {
+        showFailure("Страница не дождалась ответа. Соединение оборвалось. Черновик не собран, досье не изменилось.");
+      });
+    });
+  </script>`;
+}
+
+function sse(response: ServerResponse, name: string, data: string): void {
+  const lines = data.split("\n").map((line) => `data: ${line}`).join("\n");
+  response.write(`event: ${name}\n${lines}\n\n`);
+}
+
+async function streamDraft(
+  response: ServerResponse,
+  trainer: Trainer,
+  item: CaseRecord,
+  paste: DossierLayers & { keyId: string },
+): Promise<void> {
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache",
+  });
+  sse(response, "status", draftLines(trainer, item.id, paste));
+  sse(response, "status", "Жду ответ модели.");
+  try {
+    const drafted = await trainer.draftDossier({ caseId: item.id, ...paste }, (received) => {
+      sse(response, "progress", `Ответ модели: ${received} знаков.`);
+    });
+    if (!drafted.ok) {
+      const baseAddress = trainer.listKeys().find((key) => key.id === paste.keyId)?.baseAddress;
+      sse(response, "failure", draftFailureText(drafted, baseAddress));
+      response.end();
+      return;
+    }
+    sse(response, "page", renderDraft(item, drafted.draft));
+    response.end();
+  } catch {
+    if (!response.writableEnded) {
+      sse(response, "failure", DRAFT_ERROR.model);
+      response.end();
+    }
+  }
+}
+
 function renderCase(
   trainer: Trainer,
   item: CaseRecord,
@@ -683,7 +890,7 @@ function renderCase(
   const draftForm =
     keys.length === 0
       ? "<p>Сначала сохраните ключ.</p>"
-      : `<form method="post" action="${escapeHtml(casePath(item.id, "/draft"))}">
+      : `<form id="draft" method="post" action="${escapeHtml(casePath(item.id, "/draft"))}">
           ${layerAreas(paste ?? { material: "", serviceLayer: "", crib: "" })}
           <label>Ключ
             <select name="keyId" required>
@@ -696,7 +903,8 @@ function renderCase(
             </select>
           </label>
           <button type="submit">Собрать черновик</button>
-        </form>`;
+        </form>
+        ${draftScript()}`;
 
   return page(
     item.title,
@@ -714,7 +922,18 @@ function renderCase(
     ${approvedBlock(trainer, item, sessionError)}
     <section>
       <h2>Черновик</h2>
-      <p>Вставьте тексты слоёв и выберите ключ. Черновик сессия не читает.</p>
+      <p>В модель уходит вставленный текст и текст файлов того же слоя. Черновик сессия не читает.</p>
+      ${draftInventory(trainer, item.id, paste)}
+      <div id="draft-run" hidden>
+        <ol id="draft-steps" class="steps">
+          <li data-step="pack">Слои</li>
+          <li data-step="wait">Ответ</li>
+          <li data-step="read">Текст</li>
+        </ol>
+        <p id="draft-status"></p>
+        <p id="draft-count" hidden></p>
+        <p id="draft-error" class="error-box" hidden></p>
+      </div>
       ${draftForm}
     </section>`,
   );
@@ -898,7 +1117,9 @@ function knownDraftError(reason: string | null): string | undefined {
     reason === "missing" ||
     reason === "timeout" ||
     reason === "model" ||
-    reason === "secret"
+    reason === "secret" ||
+    reason === "limit" ||
+    reason === "shape"
   ) {
     return DRAFT_ERROR[reason];
   }
@@ -1253,9 +1474,14 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
       return;
     }
     const paste = { ...layersFrom(fields), keyId: fields.get("keyId") ?? "" };
+    if (wantsStream(request.headers.accept)) {
+      await streamDraft(response, trainer, item, paste);
+      return;
+    }
     const drafted = await trainer.draftDossier({ caseId: item.id, ...paste });
     if (!drafted.ok) {
-      sendHtml(response, renderCase(trainer, item, DRAFT_ERROR[drafted.reason], paste));
+      const baseAddress = trainer.listKeys().find((key) => key.id === paste.keyId)?.baseAddress;
+      sendHtml(response, renderCase(trainer, item, draftFailureText(drafted, baseAddress), paste));
       return;
     }
     sendHtml(response, renderDraft(item, drafted.draft));
