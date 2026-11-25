@@ -4,7 +4,7 @@
   "meta": {
     "title": "Установка тренажёра",
     "locale": "ru",
-    "output": ".archify/architecture-ustanovka-20261125-115500/ustanovka.html",
+    "output": ".archify/architecture/architecture.html",
     "quality_profile": "showcase",
     "repository": {
       "url": "https://github.com/firstBitSportivnaya/interview-trainer.git",
