@@ -86,10 +86,13 @@ const SHELL_LABELS = ["Обзор", "Проекты", "Сессия", "Разб�
 function assertShell(html: string, current: (typeof SHELL_LABELS)[number]): void {
   const nav = html.match(/<nav aria-label="Разделы">([\s\S]*?)<\/nav>/)?.[1] ?? "";
   for (const label of SHELL_LABELS) {
-    assert.equal(nav.includes(`>${label}</a>`), true);
+    assert.match(nav, new RegExp(`<span aria-hidden="true">[^<]+</span>${label}</a>`));
   }
-  assert.equal(nav.includes(`aria-current="page">${current}</a>`), true);
-  assert.equal(html.includes(`Тренажёр / <strong>${current}</strong>`), true);
+  assert.match(nav, new RegExp(`aria-current="page"><span aria-hidden="true">[^<]+</span>${current}</a>`));
+  assert.match(
+    html,
+    new RegExp(`<nav class="crumb" aria-label="Крошка">Тренажёр / <strong>${current}</strong></nav>`),
+  );
   assert.equal(html.includes("Локальная установка владельца"), true);
   assert.equal(html.includes("ДЕМО-МАКЕТ"), false);
   assert.equal(html.includes("не сохранен"), false);
@@ -2240,7 +2243,7 @@ test("оболочка показывает шесть разделов и не 
 
     const keys = await (await fetch(`${base}/keys`)).text();
     assertShell(keys, "Ключи");
-    assert.equal(keys.includes('<a href="/">Обзор</a>'), true);
+    assert.match(keys, /<a href="\/"><span aria-hidden="true">[^<]+<\/span>Обзор<\/a>/);
     assert.match(keys, /<form method="post" action="\/keys">/);
     assert.match(keys, /<form method="post" action="\/proxy">/);
     assert.equal(keys.includes("sk-ant-api03-secret-WXYZ"), false);
@@ -2443,7 +2446,7 @@ test("обзор читает установку, а ключ и прокси о
 
     const empty = await (await fetch(base)).text();
     assertShell(empty, "Обзор");
-    assert.equal(empty.includes('<a href="/keys">Ключи</a>'), true);
+    assert.match(empty, /<a href="\/keys"><span aria-hidden="true">[^<]+<\/span>Ключи<\/a>/);
     assert.equal(empty.includes(steps), true);
     assert.equal(empty.includes("Проектов пока нет."), true);
     assert.match(empty, /<form method="post" action="\/customers">/);
@@ -3430,6 +3433,142 @@ test("сессия не открывается без досье, без клю�
     const wrongRolePage = await wrongRole.text();
     assert.equal(wrongRolePage.includes("Выберите роль исполнителя."), true);
     assert.equal(trainer.listOpenSessions().length, 0);
+  } finally {
+    await close(server);
+  }
+});
+
+test("скринридер называет оболочку, а диалоги проекта и файла открываются с клавиатуры", async () => {
+  const trainer = start(tempDirectory());
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+
+    const overview = await (await fetch(base)).text();
+    assertShell(overview, "Обзор");
+    assert.match(overview, /<h1>Обзор<\/h1>/);
+    assert.match(overview, /<nav class="crumb" aria-label="Крошка">Тренажёр \/ <strong>Обзор<\/strong><\/nav>/);
+    const overviewNav = overview.match(/<nav aria-label="Разделы">([\s\S]*?)<\/nav>/)?.[1] ?? "";
+    for (const label of SHELL_LABELS) {
+      assert.match(overviewNav, new RegExp(`<span aria-hidden="true">[^<]+</span>${label}</a>`));
+    }
+    assert.match(overview, /<button type="button" data-open="new-customer">Новый проект<\/button>/);
+    assert.match(
+      overview,
+      /<dialog id="new-customer" aria-labelledby="new-customer-title">[\s\S]*<h2 id="new-customer-title">Новый проект<\/h2>[\s\S]*<button type="button" data-close>Закрыть<\/button>[\s\S]*<form method="post" action="\/customers">[\s\S]*<input name="customerName" required>[\s\S]*<input name="title" required>[\s\S]*<textarea name="characters"><\/textarea>[\s\S]*<button type="submit">Завести заказчика и проект<\/button>/,
+    );
+    assert.match(overview, /dialog\.showModal\(\)/);
+    assert.match(overview, /dialog\.close\(\)/);
+    assert.equal(overview.includes('method="dialog"'), false);
+    assert.equal(overview.includes("В примере форма не создаёт"), false);
+    assert.equal(/<dialog[^>]*\sopen[\s>]/.test(overview), false);
+    assert.match(overview, /button:focus-visible,\s*input:focus-visible[\s\S]*?outline: 3px solid #b7aeff/);
+    const narrow = overview.match(/@media \(max-width: 720px\) \{([\s\S]*?)\n    \}/)?.[1] ?? "";
+    assert.equal(narrow.includes("white-space: nowrap"), false);
+    assert.equal(narrow.includes("overflow: auto"), false);
+    assert.match(narrow, /nav \{ display: flex; flex-wrap: wrap;/);
+    assert.match(narrow, /overflow-x: clip/);
+    assert.equal(narrow.includes("#ask"), false);
+    assert.equal(narrow.includes("textarea"), false);
+    assert.equal(narrow.includes("dialog"), false);
+
+    const cases = await (await fetch(`${base}/cases`)).text();
+    assert.match(cases, /<h1>Проекты<\/h1>/);
+    assert.match(cases, /<nav class="crumb" aria-label="Крошка">Тренажёр \/ <strong>Проекты<\/strong><\/nav>/);
+    assert.equal(cases.includes('<form method="post" action="/cases">'), false);
+    assert.equal(cases.includes('tabindex="-1"'), false);
+
+    const sessions = await (await fetch(`${base}/sessions`)).text();
+    assert.match(sessions, /<h1>Сессия<\/h1>/);
+    const reviews = await (await fetch(`${base}/reviews`)).text();
+    assert.match(reviews, /<h1>Разбор<\/h1>/);
+    const profile = await (await fetch(`${base}/profile`)).text();
+    assert.match(profile, /<h1>Профиль<\/h1>/);
+    assert.match(profile, /<button type="submit">Сохранить профиль<\/button>/);
+    assert.equal(profile.includes("disabled"), false);
+    const keys = await (await fetch(`${base}/keys`)).text();
+    assert.match(keys, /<h1>Ключи<\/h1>/);
+    assert.match(keys, /<button type="submit">Сохранить ключ<\/button>/);
+    assert.equal(keys.includes('id="new-customer"'), false);
+    assert.equal(keys.includes('id="project-file"'), false);
+
+    const created = await fetch(`${base}/customers`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ customerName: "Север", title: "Склад", characters: "Анна" }),
+    });
+    assert.equal(created.status, 303);
+    const project = trainer.listCases()[0];
+    assert.ok(project);
+    const projectPage = await (await fetch(`${base}/cases/${project.id}`)).text();
+    assert.match(projectPage, /<h1>Север — Склад<\/h1>/);
+    assert.equal(projectPage.includes('role="tab"'), false);
+    assert.match(projectPage, /<button type="button" data-open="project-file">Добавить файл<\/button>/);
+    assert.match(
+      projectPage,
+      new RegExp(
+        `<dialog id="project-file" aria-labelledby="project-file-title">[\\s\\S]*<form method="post" action="/cases/${project.id}/file" enctype="multipart/form-data">[\\s\\S]*<input name="file" type="file" required>[\\s\\S]*<select name="layer">[\\s\\S]*</form>`,
+      ),
+    );
+    assert.equal(projectPage.includes('method="dialog"'), false);
+
+    const listed = await (await fetch(`${base}/cases`)).text();
+    assert.match(listed, /<button type="button" data-open="new-case">Ещё один проект<\/button>/);
+    assert.match(
+      listed,
+      new RegExp(
+        `<dialog id="new-case" aria-labelledby="new-case-title">[\\s\\S]*<form method="post" action="/cases">[\\s\\S]*<option value="${project.customerId}">Север</option>`,
+      ),
+    );
+
+    assert.equal(
+      trainer.saveKey({
+        protocol: "anthropic",
+        baseAddress: "https://api.anthropic.com",
+        modelName: "claude-sonnet",
+        secret: "sk-ant-api03-secret-WXYZ",
+      }).ok,
+      true,
+    );
+    const keyId = trainer.listKeys()[0]?.id;
+    assert.ok(keyId);
+    const approved = trainer.approveDossier({
+      caseId: project.id,
+      material: "Склад принимает паллеты.",
+      serviceLayer: "",
+      crib: "",
+    });
+    assert.ok(approved.ok);
+    if (!approved.ok) {
+      return;
+    }
+    const layered = await (await fetch(`${base}/cases/${project.id}`)).text();
+    assert.match(layered, /<button type="submit" name="layer" value="material" aria-pressed="true">Материал проекта<\/button>/);
+    assert.match(layered, /<button type="submit" name="layer" value="serviceLayer"/);
+    assert.match(layered, /<button type="submit" name="layer" value="crib"/);
+    assert.equal(layered.includes('role="tab"'), false);
+    const opened = trainer.openSession({
+      caseId: project.id,
+      dossierId: approved.dossier.id,
+      side: "заказчик",
+      character: "Анна",
+      role: "аналитик",
+      executorId: "владелец",
+      keyId,
+    });
+    assert.ok(opened.ok);
+    if (!opened.ok) {
+      return;
+    }
+    const sessionPage = await (await fetch(`${base}/sessions/${opened.session.id}`)).text();
+    assert.match(sessionPage, /<h1>Север — Склад<\/h1>/);
+    assert.match(sessionPage, /<form id="ask" method="post" action="\/sessions\/[^"]+\/ask">[\s\S]*<textarea name="line" required>/);
+    assert.match(sessionPage, /<div id="live" aria-live="polite"><\/div>/);
+    assert.equal(sessionPage.includes('tabindex="-1"'), false);
   } finally {
     await close(server);
   }
