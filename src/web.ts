@@ -182,14 +182,14 @@ function escapeHtml(value: string): string {
 
 type ShellSection = "overview" | "projects" | "session" | "review" | "profile" | "keys";
 
-/** Разделы оболочки. «Обзор» и «Ключи» делят `/`, пока обзор не сменит первую страницу. */
+/** Разделы оболочки. Обзор — первая страница, ключи — своя. */
 const SHELL_SECTIONS: Array<{ id: ShellSection; label: string; href: string }> = [
   { id: "overview", label: "Обзор", href: "/" },
   { id: "projects", label: "Проекты", href: "/cases" },
   { id: "session", label: "Сессия", href: "/sessions" },
   { id: "review", label: "Разбор", href: "/reviews" },
   { id: "profile", label: "Профиль", href: "/profile" },
-  { id: "keys", label: "Ключи", href: "/" },
+  { id: "keys", label: "Ключи", href: "/keys" },
 ];
 
 const SHELL_ICONS = ["◫", "▤", "◉", "▧", "♙", "⌘"] as const;
@@ -369,7 +369,7 @@ function renderKeys(keys: KeySummary[], proxy: string | undefined, error?: strin
     <button type="submit">Сохранить ключ</button>
   </form>
   <h2>Прокси</h2>
-  <p>${proxy ? `Записан ${escapeHtml(proxy)}. Логин и пароль на странице не показываются.` : "Прямое соединение, прокси не записан."}</p>
+  <p>${proxy ? "Прокси записан. Адрес, логин и пароль на странице не показываются." : "Прямое соединение, прокси не записан."}</p>
   ${notice(proxyError)}
   <form method="post" action="/proxy">
     <label>Адрес
@@ -437,6 +437,75 @@ function renderReviewIndex(trainer: Trainer): string {
   return page("Разбор", `<h1>Разбор</h1>${items}`, "review");
 }
 
+/** Постоянный текст обзора. В ход подготовки и в досье не пишется. */
+const OVERVIEW_STEPS = "Создайте проект. Утвердите досье. Откройте сессию.";
+
+/** Первый проект заводится тем же `POST /customers`, что и со страницы проектов. */
+function firstProjectForm(): string {
+  return `<form method="post" action="/customers">
+        <label>Заказчик
+          <input name="customerName" required>
+        </label>
+        <label>Название первого проекта
+          <input name="title" required>
+        </label>
+        <label>Персонажи заказчика, по одному в строке
+          <textarea name="characters"></textarea>
+        </label>
+        <button type="submit">Завести заказчика и проект</button>
+      </form>`;
+}
+
+/** Карточка читает проект, досье, голоса заказчика и сессии. Отдельной записи у неё нет. */
+function projectCard(trainer: Trainer, item: CaseRecord): string {
+  const approved = trainer.readApprovedDossier(item.id) !== undefined;
+  const voices = customerVoices(item.characters).join(", ");
+  const sessions = trainer.listSessions().filter((session) => session.caseId === item.id).length;
+  return `<article>
+    <h3>${escapeHtml(item.title)}</h3>
+    <p>Заказчик: ${escapeHtml(item.customerName)}</p>
+    <p>${approved ? "Досье утверждено" : "Досье не утверждено"}</p>
+    <p>Персонаж: ${escapeHtml(voices)}</p>
+    <p>Сессий: ${sessions}</p>
+    <a href="${escapeHtml(casePath(item.id))}">Открыть проект</a>
+  </article>`;
+}
+
+/** Последняя открытая сессия установки. Списка сессий эта ссылка не заменяет. */
+function latestSessionBlock(trainer: Trainer): string {
+  const latest = trainer.listSessions().at(-1);
+  if (!latest) {
+    return "<p>Сессий пока нет.</p>";
+  }
+  const item = trainer.readCase(latest.caseId);
+  const title = item ? `${item.customerName} — ${item.title}` : "Сессия";
+  return `<p><a href="/sessions/${encodeURIComponent(latest.id)}">${escapeHtml(title)}: ${escapeHtml(latest.character)}, ${escapeHtml(latest.role)}</a></p>`;
+}
+
+/** Обзор установки: проекты, три шага и путь к последней открытой сессии. */
+function renderOverview(trainer: Trainer): string {
+  const cases = trainer.listCases();
+  const projects =
+    cases.length === 0
+      ? `<p>Проектов пока нет.</p>${firstProjectForm()}`
+      : cases.map((item) => projectCard(trainer, item)).join("");
+  return page(
+    "Обзор",
+    `<h1>Обзор</h1>
+    <p>Тренажёр открыт только на этом компьютере и не спрашивает пароль.</p>
+    <p>${OVERVIEW_STEPS}</p>
+    <section>
+      <h2>Проекты</h2>
+      ${projects}
+    </section>
+    <section>
+      <h2>Последняя сессия</h2>
+      ${latestSessionBlock(trainer)}
+    </section>`,
+    "overview",
+  );
+}
+
 function renderCases(trainer: Trainer, error?: string): string {
   const customers = trainer.listCustomers();
   const cases = trainer.listCases();
@@ -477,18 +546,7 @@ function renderCases(trainer: Trainer, error?: string): string {
     ${renderProfile(trainer.readProfile())}
     <section>
       <h2>Новый заказчик</h2>
-      <form method="post" action="/customers">
-        <label>Заказчик
-          <input name="customerName" required>
-        </label>
-        <label>Название первого проекта
-          <input name="title" required>
-        </label>
-        <label>Персонажи заказчика, по одному в строке
-          <textarea name="characters"></textarea>
-        </label>
-        <button type="submit">Завести заказчика и проект</button>
-      </form>
+      ${firstProjectForm()}
     </section>
     <section>
       <h2>Ещё один проект</h2>
@@ -1487,6 +1545,11 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
   const session = sessionTarget(url.pathname);
 
   if (request.method === "GET" && url.pathname === "/") {
+    sendHtml(response, renderOverview(trainer));
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/keys") {
     sendHtml(
       response,
       renderKeys(
@@ -1597,11 +1660,11 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
     const act = fields.get("act");
     if (act === "clear") {
       const cleared = trainer.clearProxy();
-      redirect(response, cleared.ok ? "/" : `/?proxyError=${cleared.reason}`);
+      redirect(response, cleared.ok ? "/keys" : `/keys?proxyError=${cleared.reason}`);
       return;
     }
     const saved = trainer.saveProxy({ proxyUrl: fields.get("proxyUrl") ?? "" });
-    redirect(response, saved.ok ? "/" : `/?proxyError=${saved.reason}`);
+    redirect(response, saved.ok ? "/keys" : `/keys?proxyError=${saved.reason}`);
     return;
   }
 
@@ -1612,7 +1675,7 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
       modelName: fields.get("modelName") ?? "",
       secret: fields.get("secret") ?? "",
     });
-    redirect(response, saved.ok ? "/" : `/?error=${saved.reason}`);
+    redirect(response, saved.ok ? "/keys" : `/keys?error=${saved.reason}`);
     return;
   }
 
