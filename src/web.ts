@@ -205,15 +205,16 @@ const SHELL_ICONS = ["◫", "▤", "◉", "▧", "♙", "⌘"] as const;
 /** Оболочка установки: вид макета, шесть разделов, крошка и подпись локальной установки. */
 function page(title: string, body: string, section: ShellSection): string {
   const current = SHELL_SECTIONS.find((item) => item.id === section) ?? SHELL_SECTIONS[0];
-  const link = (item: (typeof SHELL_SECTIONS)[number]): string => {
+  const link = (item: (typeof SHELL_SECTIONS)[number], index: number): string => {
     const mark = item.id === section ? ` aria-current="page"` : "";
-    return `<a href="${item.href}"${mark}>${item.label}</a>`;
+    return `<a href="${item.href}"${mark}><span aria-hidden="true">${SHELL_ICONS[index]}</span>${item.label}</a>`;
   };
-  const workspace = SHELL_SECTIONS.slice(0, 4).map(link).join("");
-  const settings = SHELL_SECTIONS.slice(4).map(link).join("");
-  const icons = SHELL_ICONS.map(
-    (icon, index) => `nav a:nth-of-type(${index + 1})::before { content: "${icon}"; }`,
-  ).join("\n    ");
+  const workspace = SHELL_SECTIONS.slice(0, 4)
+    .map((item, index) => link(item, index))
+    .join("");
+  const settings = SHELL_SECTIONS.slice(4)
+    .map((item, index) => link(item, index + 4))
+    .join("");
   return `<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -242,8 +243,9 @@ function page(title: string, body: string, section: ShellSection): string {
     nav a { display: flex; align-items: center; gap: 12px; text-decoration: none; border-radius: 10px; color: #777d90; padding: 11px 12px; font-weight: 600; }
     nav a:hover { background: #f7f7fb; }
     nav a[aria-current="page"] { color: var(--purple); background: var(--soft); }
-    nav a::before { font-size: 18px; width: 20px; text-align: center; }
-    ${icons}
+    nav a span[aria-hidden="true"] { font-size: 18px; width: 20px; text-align: center; }
+    dialog { width: min(32rem, calc(100% - 2rem)); max-height: calc(100% - 2rem); border: 1px solid var(--line); border-radius: 16px; padding: 24px; color: var(--ink); }
+    dialog::backdrop { background: #191c2c66; }
     .sidebar-bottom { margin-top: auto; border-top: 1px solid var(--line); padding: 19px 9px 0; display: flex; align-items: center; gap: 10px; }
     .avatar { width: 35px; height: 35px; background: #e8e5ff; color: #6150ce; border-radius: 12px; display: grid; place-items: center; font-weight: 800; }
     .sidebar-bottom small { display: block; color: var(--muted); font-weight: 500; }
@@ -268,7 +270,7 @@ function page(title: string, body: string, section: ShellSection): string {
     button[type="submit"][aria-pressed="true"] { background: var(--soft); color: var(--purple); border-color: var(--purple); }
     .error { color: #9f1239; }
     li { margin: 0.4rem 0; }
-    pre, #live { white-space: pre-wrap; font: inherit; }
+    pre, #live { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; max-width: 100%; }
     .layers { list-style: none; padding: 0; margin: 1rem 0; }
     .layers li { display: grid; gap: 0.15rem; margin: 0; padding: 0.75rem 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
     .layers .meta { color: var(--muted); }
@@ -288,15 +290,16 @@ function page(title: string, body: string, section: ShellSection): string {
       main { padding: 28px 24px 50px; }
     }
     @media (max-width: 720px) {
-      .shell { display: block; }
+      .shell { display: block; max-width: 100%; overflow-x: clip; }
       aside { position: static; height: auto; overflow: visible; padding: 12px 14px; gap: 10px; }
       .brand small, .sidebar-bottom, .nav-title { display: none; }
-      nav { display: flex; overflow: auto; gap: 4px; }
-      nav a { width: auto; white-space: nowrap; padding: 8px 10px; font-size: 12px; }
+      nav { display: flex; flex-wrap: wrap; overflow: visible; max-width: 100%; gap: 4px; }
+      nav a { width: auto; white-space: normal; padding: 8px 10px; font-size: 12px; }
       header { min-height: 54px; padding: 0 16px; }
       main { padding: 24px 16px 40px; }
       h1 { font-size: 25px; }
       .session-columns { display: block; }
+      .steps { flex-wrap: wrap; }
     }
   </style>
 </head>
@@ -309,7 +312,7 @@ function page(title: string, body: string, section: ShellSection): string {
     </aside>
     <div class="workspace">
       <header>
-        <p class="crumb">Тренажёр / <strong>${current.label}</strong></p>
+        <nav class="crumb" aria-label="Крошка">Тренажёр / <strong>${current.label}</strong></nav>
         <p class="local"><span class="dot" aria-hidden="true"></span>Локальная установка владельца</p>
       </header>
       <main>
@@ -319,6 +322,20 @@ function page(title: string, body: string, section: ShellSection): string {
       </main>
     </div>
   </div>
+  <script>
+    for (const opener of document.querySelectorAll("[data-open]")) {
+      opener.addEventListener("click", () => {
+        const dialog = document.getElementById(opener.getAttribute("data-open") ?? "");
+        if (dialog instanceof HTMLDialogElement) dialog.showModal();
+      });
+    }
+    for (const closer of document.querySelectorAll("[data-close]")) {
+      closer.addEventListener("click", () => {
+        const dialog = closer.closest("dialog");
+        if (dialog instanceof HTMLDialogElement) dialog.close();
+      });
+    }
+  </script>
 </body>
 </html>`;
 }
@@ -451,9 +468,22 @@ function renderReviewIndex(trainer: Trainer): string {
 /** Постоянный текст обзора. В ход подготовки и в досье не пишется. */
 const OVERVIEW_STEPS = "Создайте проект. Утвердите досье. Откройте сессию.";
 
+/** Окно оболочки. Запись остаётся у формы внутри, отдельного маршрута у окна нет. */
+function shellDialog(id: string, title: string, body: string): string {
+  return `<dialog id="${id}" aria-labelledby="${id}-title">
+    <h2 id="${id}-title">${escapeHtml(title)}</h2>
+    <button type="button" data-close>Закрыть</button>
+    ${body}
+  </dialog>`;
+}
+
 /** Первый проект заводится тем же `POST /customers`, что и со страницы проектов. */
 function firstProjectForm(): string {
-  return `<form method="post" action="/customers">
+  return `<button type="button" data-open="new-customer">Новый проект</button>
+    ${shellDialog(
+      "new-customer",
+      "Новый проект",
+      `<form method="post" action="/customers">
         <label>Заказчик
           <input name="customerName" required>
         </label>
@@ -464,7 +494,8 @@ function firstProjectForm(): string {
           <textarea name="characters"></textarea>
         </label>
         <button type="submit">Завести заказчика и проект</button>
-      </form>`;
+      </form>`,
+    )}`;
 }
 
 /** Карточка читает проект, досье, голоса заказчика и сессии. Отдельной записи у неё нет. */
@@ -532,7 +563,11 @@ function renderCases(trainer: Trainer, error?: string): string {
   const addCase =
     customers.length === 0
       ? "<p>Сначала заведите заказчика.</p>"
-      : `<form method="post" action="/cases">
+      : `<button type="button" data-open="new-case">Ещё один проект</button>
+        ${shellDialog(
+          "new-case",
+          "Ещё один проект",
+          `<form method="post" action="/cases">
           <label>Заказчик
             <select name="customerId" required>
               ${customers
@@ -547,7 +582,8 @@ function renderCases(trainer: Trainer, error?: string): string {
             <textarea name="characters"></textarea>
           </label>
           <button type="submit">Добавить проект</button>
-        </form>`;
+        </form>`,
+        )}`;
 
   return page(
     "Проекты",
@@ -894,7 +930,7 @@ function renderSession(trainer: Trainer, session: SessionRecord, error?: string,
   const title = item ? `${item.customerName} — ${item.title}` : "Сессия";
   const talk = open
     ? `<div id="opening"></div>
-    <div id="live"></div>
+    <div id="live" aria-live="polite"></div>
     <form id="ask" method="post" action="/sessions/${encodeURIComponent(session.id)}/ask">
       <label>Вопрос
         <textarea name="line" required>${escapeHtml(unansweredLine(lines))}</textarea>
@@ -969,7 +1005,11 @@ function renderSourceFiles(trainer: Trainer, item: CaseRecord, error?: string): 
     ${notice(error)}
     ${unreadItems}
     ${items}
-    <form method="post" action="${escapeHtml(casePath(item.id, "/file"))}" enctype="multipart/form-data">
+    <button type="button" data-open="project-file">Добавить файл</button>
+    ${shellDialog(
+      "project-file",
+      "Добавить файл",
+      `<form method="post" action="${escapeHtml(casePath(item.id, "/file"))}" enctype="multipart/form-data">
       <label>Файл
         <input name="file" type="file" required>
       </label>
@@ -980,7 +1020,8 @@ function renderSourceFiles(trainer: Trainer, item: CaseRecord, error?: string): 
         </select>
       </label>
       <button type="submit">Добавить файл</button>
-    </form>
+    </form>`,
+    )}
   </section>`;
 }
 
