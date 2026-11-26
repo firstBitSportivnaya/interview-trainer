@@ -95,7 +95,9 @@ function assertShell(html: string, current: (typeof SHELL_LABELS)[number]): void
   assert.equal(html.includes("не сохранено"), false);
   assert.equal(html.includes("Пример интерфейса"), false);
   assert.equal(html.includes("data-view"), false);
-  assert.match(html, /button:focus-visible,\s*input:focus-visible[\s\S]*?outline: 3px solid #1c1917/);
+  assert.equal(html.includes("#6555e8"), true);
+  assert.equal(html.includes("собеседований"), true);
+  assert.match(html, /button:focus-visible,\s*input:focus-visible[\s\S]*?outline: 3px solid #b7aeff/);
   assert.equal(html.includes("outline:0"), false);
   assert.equal(html.includes("outline: none"), false);
   assert.match(html, /@media \(max-width: 720px\) \{[\s\S]*nav \{ display: flex;/);
