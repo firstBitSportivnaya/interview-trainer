@@ -180,40 +180,134 @@ function escapeHtml(value: string): string {
     .replaceAll('"', "&quot;");
 }
 
-function page(title: string, body: string): string {
+type ShellSection = "overview" | "projects" | "session" | "review" | "profile" | "keys";
+
+/** Разделы оболочки. «Обзор» и «Ключи» делят `/`, пока обзор не сменит первую страницу. */
+const SHELL_SECTIONS: Array<{ id: ShellSection; label: string; href: string }> = [
+  { id: "overview", label: "Обзор", href: "/" },
+  { id: "projects", label: "Проекты", href: "/cases" },
+  { id: "session", label: "Сессия", href: "/sessions" },
+  { id: "review", label: "Разбор", href: "/reviews" },
+  { id: "profile", label: "Профиль", href: "/profile" },
+  { id: "keys", label: "Ключи", href: "/" },
+];
+
+const SHELL_ICONS = ["◫", "▤", "◉", "▧", "♙", "⌘"] as const;
+
+/** Оболочка установки: вид макета, шесть разделов, крошка и подпись локальной установки. */
+function page(title: string, body: string, section: ShellSection): string {
+  const current = SHELL_SECTIONS.find((item) => item.id === section) ?? SHELL_SECTIONS[0];
+  const link = (item: (typeof SHELL_SECTIONS)[number]): string => {
+    const mark = item.id === section ? ` aria-current="page"` : "";
+    return `<a href="${item.href}"${mark}>${item.label}</a>`;
+  };
+  const workspace = SHELL_SECTIONS.slice(0, 4).map(link).join("");
+  const settings = SHELL_SECTIONS.slice(4).map(link).join("");
+  const icons = SHELL_ICONS.map(
+    (icon, index) => `nav a:nth-of-type(${index + 1})::before { content: "${icon}"; }`,
+  ).join("\n    ");
   return `<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(title)}</title>
   <style>
-    body { font: 16px/1.45 system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; color: #1c1917; }
-    label { display: block; margin: 0.8rem 0; }
-    input, select, textarea { display: block; width: 100%; box-sizing: border-box; margin-top: 0.25rem; padding: 0.4rem; }
-    textarea { min-height: 6rem; }
-    button { margin-top: 0.5rem; padding: 0.45rem 0.8rem; }
+    :root { --bg: #f5f6fa; --ink: #191c2c; --muted: #73798c; --line: #e8eaf1; --purple: #6555e8; --purple-dark: #5140d4; --soft: #f1efff; --shadow: 0 6px 25px #28284a08; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 Inter, system-ui, -apple-system, "Segoe UI", sans-serif; }
+    button, input, select, textarea { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible,
+    textarea:focus-visible,
+    a:focus-visible { outline: 3px solid #b7aeff; outline-offset: 2px; }
+    .shell { min-height: 100vh; display: grid; grid-template-columns: 242px minmax(0, 1fr); }
+    aside { position: sticky; top: 0; height: 100vh; overflow: auto; background: #fff; border-right: 1px solid var(--line); padding: 27px 16px 20px; display: flex; flex-direction: column; gap: 32px; }
+    .brand { display: flex; align-items: center; gap: 11px; margin: 0; padding: 0 9px; font-size: 15px; font-weight: 800; line-height: 1.25; }
+    .logo { height: 37px; width: 37px; display: grid; place-items: center; background: var(--purple); color: #fff; border-radius: 12px; font-size: 20px; }
+    .brand small { display: block; font-size: 11px; color: #9297a5; font-weight: 500; margin-top: 3px; }
+    .nav-title { color: #9da2b1; font-size: 10px; font-weight: 800; letter-spacing: 0.11em; text-transform: uppercase; padding: 0 12px; margin: 18px 0 10px; }
+    nav .nav-title:first-child { margin-top: 0; }
+    nav { display: grid; gap: 4px; }
+    nav a { display: flex; align-items: center; gap: 12px; text-decoration: none; border-radius: 10px; color: #777d90; padding: 11px 12px; font-weight: 600; }
+    nav a:hover { background: #f7f7fb; }
+    nav a[aria-current="page"] { color: var(--purple); background: var(--soft); }
+    nav a::before { font-size: 18px; width: 20px; text-align: center; }
+    ${icons}
+    .sidebar-bottom { margin-top: auto; border-top: 1px solid var(--line); padding: 19px 9px 0; display: flex; align-items: center; gap: 10px; }
+    .avatar { width: 35px; height: 35px; background: #e8e5ff; color: #6150ce; border-radius: 12px; display: grid; place-items: center; font-weight: 800; }
+    .sidebar-bottom small { display: block; color: var(--muted); font-weight: 500; }
+    .workspace { min-width: 0; }
+    header { min-height: 76px; background: #fff; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 0 44px; }
+    .crumb { margin: 0; color: #a0a4b2; }
+    .crumb strong { color: #565c70; font-weight: 600; }
+    .local { margin: 0; color: var(--muted); font-size: 12px; }
+    .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #37bd92; margin-right: 7px; }
+    main { max-width: 1450px; margin: auto; padding: 36px 44px 60px; }
+    .card { background: #fff; border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); padding: 24px; }
+    h1 { margin: 5px 0 3px; font-size: 29px; letter-spacing: -0.045em; line-height: 1.2; }
+    h2 { font-size: 16px; letter-spacing: -0.02em; }
+    main a { color: var(--purple); font-weight: 700; }
+    label { display: block; margin: 15px 0; color: #4e5467; font-weight: 700; font-size: 12px; }
+    input, select, textarea { display: block; width: 100%; margin-top: 7px; border: 1px solid #e4e5ef; background: #fff; border-radius: 10px; padding: 11px 12px; color: var(--ink); font-weight: 400; }
+    textarea { min-height: 100px; resize: vertical; }
+    button { margin-top: 0.5rem; border: 1px solid var(--line); border-radius: 10px; background: #fff; color: #4d5265; padding: 10px 15px; font-weight: 700; }
+    button:hover { border-color: #c8c3f4; }
+    button[type="submit"] { background: var(--purple); border-color: var(--purple); color: #fff; }
+    button[type="submit"]:hover { background: var(--purple-dark); }
     .error { color: #9f1239; }
-    nav a { margin-right: 1rem; }
     li { margin: 0.4rem 0; }
     pre, #live { white-space: pre-wrap; font: inherit; }
     .layers { list-style: none; padding: 0; margin: 1rem 0; }
-    .layers li { display: grid; gap: 0.15rem; margin: 0; padding: 0.75rem 0; border-top: 1px solid #e7e5e4; overflow-wrap: anywhere; }
-    .layers .meta { color: #57534e; }
+    .layers li { display: grid; gap: 0.15rem; margin: 0; padding: 0.75rem 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+    .layers .meta { color: var(--muted); }
     .steps { list-style: none; display: flex; gap: 0.5rem; padding: 0; margin: 0.4rem 0 0.8rem; }
-    .steps li { flex: 1; margin: 0; padding: 0.55rem 0.7rem; border: 1px solid #d6d3d1; border-radius: 0.45rem; background: #fafaf9; color: #78716c; }
+    .steps li { flex: 1; margin: 0; padding: 0.55rem 0.7rem; border: 1px solid var(--line); border-radius: 0.45rem; background: #fafaf9; color: #78716c; }
     .steps li.done { color: #44403c; border-color: #a8a29e; }
-    .steps li.current { color: #1c1917; border-color: #1c1917; background: #fff; }
+    .steps li.current { color: var(--ink); border-color: var(--purple); background: var(--soft); }
     .steps li.bad { color: #9f1239; border-color: #fda4af; background: #fff1f2; }
     #draft-count { font-variant-numeric: tabular-nums; color: #44403c; }
     .error-box { white-space: pre-wrap; margin: 0.8rem 0; padding: 0.8rem 1rem; border: 1px solid #fecdd3; border-radius: 0.45rem; background: #fff1f2; color: #9f1239; }
     code { letter-spacing: 0.04em; }
     section { margin: 1.5rem 0; }
     ol { padding-left: 1.2rem; }
+    @media (max-width: 1000px) {
+      header { padding: 0 24px; }
+      main { padding: 28px 24px 50px; }
+    }
+    @media (max-width: 720px) {
+      .shell { display: block; }
+      aside { position: static; height: auto; overflow: visible; padding: 12px 14px; gap: 10px; }
+      .brand small, .sidebar-bottom, .nav-title { display: none; }
+      nav { display: flex; overflow: auto; gap: 4px; }
+      nav a { width: auto; white-space: nowrap; padding: 8px 10px; font-size: 12px; }
+      header { min-height: 54px; padding: 0 16px; }
+      main { padding: 24px 16px 40px; }
+      h1 { font-size: 25px; }
+    }
   </style>
 </head>
 <body>
-  <nav><a href="/">Ключи</a><a href="/cases">Проекты</a></nav>
-  ${body}
+  <div class="shell">
+    <aside>
+      <p class="brand"><span class="logo" aria-hidden="true">✳</span><span>Тренажёр<small>собеседований</small></span></p>
+      <nav aria-label="Разделы"><span class="nav-title">Рабочее пространство</span>${workspace}<span class="nav-title">Настройки</span>${settings}</nav>
+      <div class="sidebar-bottom"><div class="avatar" aria-hidden="true">В</div><div><strong>Владелец</strong><small>Локальная установка</small></div></div>
+    </aside>
+    <div class="workspace">
+      <header>
+        <p class="crumb">Тренажёр / <strong>${current.label}</strong></p>
+        <p class="local"><span class="dot" aria-hidden="true"></span>Локальная установка владельца</p>
+      </header>
+      <main>
+        <div class="card">
+          ${body}
+        </div>
+      </main>
+    </div>
+  </div>
 </body>
 </html>`;
 }
@@ -286,13 +380,12 @@ function renderKeys(keys: KeySummary[], proxy: string | undefined, error?: strin
   </form>
   <h2>Сохранённые</h2>
   ${items}`,
+    "keys",
   );
 }
 
-function renderProfile(profile: OwnerProfile): string {
-  return `<section>
-    <h2>Профиль</h2>
-    <p>Резюме, портфолио и кейсы одни на владельца и общие для всех проектов.</p>
+function profileFields(profile: OwnerProfile): string {
+  return `<p>Резюме, портфолио и кейсы одни на владельца и общие для всех проектов.</p>
     <form method="post" action="/profile">
       <label>Резюме
         <textarea name="resume">${escapeHtml(profile.resume)}</textarea>
@@ -304,8 +397,44 @@ function renderProfile(profile: OwnerProfile): string {
         <textarea name="cases">${escapeHtml(profile.cases)}</textarea>
       </label>
       <button type="submit">Сохранить профиль</button>
-    </form>
+    </form>`;
+}
+
+function renderProfile(profile: OwnerProfile): string {
+  return `<section>
+    <h2>Профиль</h2>
+    ${profileFields(profile)}
   </section>`;
+}
+
+/** Страница профиля. Запись по-прежнему уходит на `/profile` и возвращает к проектам. */
+function renderProfilePage(trainer: Trainer): string {
+  return page("Профиль", `<h1>Профиль</h1>${profileFields(trainer.readProfile())}`, "profile");
+}
+
+/** Ссылки на сессии. Список сам не открывает последнюю. */
+function sessionLinks(trainer: Trainer, sessions: SessionRecord[]): string {
+  return `<ul>${sessions
+    .map((session) => {
+      const item = trainer.readCase(session.caseId);
+      const title = item ? `${item.customerName} — ${item.title}` : "Сессия";
+      return `<li><a href="/sessions/${encodeURIComponent(session.id)}">${escapeHtml(title)}: ${escapeHtml(session.character)}, ${escapeHtml(session.role)}</a></li>`;
+    })
+    .join("")}</ul>`;
+}
+
+/** Список сессий установки. Сам не открывает последнюю сессию. */
+function renderSessionIndex(trainer: Trainer): string {
+  const sessions = trainer.listSessions();
+  const items = sessions.length === 0 ? "<p>Сессий пока нет.</p>" : sessionLinks(trainer, sessions);
+  return page("Сессия", `<h1>Сессия</h1>${items}`, "session");
+}
+
+/** Список сессий, у которых уже есть разбор. Сам не открывает последнюю. */
+function renderReviewIndex(trainer: Trainer): string {
+  const sessions = trainer.listSessions().filter((session) => trainer.readReview(session.id));
+  const items = sessions.length === 0 ? "<p>Разбора пока нет.</p>" : sessionLinks(trainer, sessions);
+  return page("Разбор", `<h1>Разбор</h1>${items}`, "review");
 }
 
 function renderCases(trainer: Trainer, error?: string): string {
@@ -367,6 +496,7 @@ function renderCases(trainer: Trainer, error?: string): string {
     </section>
     <h2>Все проекты</h2>
     ${items}`,
+    "projects",
   );
 }
 
@@ -681,6 +811,7 @@ function renderSession(trainer: Trainer, session: SessionRecord, error?: string)
     ${reviewText}
     ${item ? `<p><a href="${escapeHtml(casePath(item.id))}">К проекту</a></p>` : ""}
     ${open ? sessionScript(session.id, needsOpening) : ""}`,
+    "session",
   );
 }
 
@@ -1003,6 +1134,7 @@ function renderCase(
       </div>
       ${draftForm}
     </section>`,
+    "projects",
   );
 }
 
@@ -1016,6 +1148,7 @@ function renderDraft(item: CaseRecord, draft: DossierLayers): string {
       ${layerAreas(draft)}
       <button type="submit">Утвердить досье</button>
     </form>`,
+    "projects",
   );
 }
 
@@ -1368,6 +1501,21 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
 
   if (request.method === "GET" && url.pathname === "/cases") {
     sendHtml(response, renderCases(trainer, knownCaseError(url.searchParams.get("error"))));
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/sessions") {
+    sendHtml(response, renderSessionIndex(trainer));
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/reviews") {
+    sendHtml(response, renderReviewIndex(trainer));
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/profile") {
+    sendHtml(response, renderProfilePage(trainer));
     return;
   }
 

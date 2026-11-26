@@ -80,6 +80,29 @@ after(() => {
   }
 });
 
+const SHELL_LABELS = ["Обзор", "Проекты", "Сессия", "Разбор", "Профиль", "Ключи"] as const;
+
+function assertShell(html: string, current: (typeof SHELL_LABELS)[number]): void {
+  const nav = html.match(/<nav aria-label="Разделы">([\s\S]*?)<\/nav>/)?.[1] ?? "";
+  for (const label of SHELL_LABELS) {
+    assert.equal(nav.includes(`>${label}</a>`), true);
+  }
+  assert.equal(nav.includes(`aria-current="page">${current}</a>`), true);
+  assert.equal(html.includes(`Тренажёр / <strong>${current}</strong>`), true);
+  assert.equal(html.includes("Локальная установка владельца"), true);
+  assert.equal(html.includes("ДЕМО-МАКЕТ"), false);
+  assert.equal(html.includes("не сохранен"), false);
+  assert.equal(html.includes("не сохранено"), false);
+  assert.equal(html.includes("Пример интерфейса"), false);
+  assert.equal(html.includes("data-view"), false);
+  assert.equal(html.includes("#6555e8"), true);
+  assert.equal(html.includes("собеседований"), true);
+  assert.match(html, /button:focus-visible,\s*input:focus-visible[\s\S]*?outline: 3px solid #b7aeff/);
+  assert.equal(html.includes("outline:0"), false);
+  assert.equal(html.includes("outline: none"), false);
+  assert.match(html, /@media \(max-width: 720px\) \{[\s\S]*nav \{ display: flex;/);
+}
+
 function statusWithHost(url: string, host: string, method: string, body?: string): Promise<number> {
   const target = new URL(url);
   return new Promise((resolve, reject) => {
@@ -2115,6 +2138,147 @@ test("страница записывает прокси и не показыв�
     const afterClear = await cleared.text();
     assert.equal(trainer.proxyPreview(), undefined);
     assert.equal(afterClear.includes("Прямое соединение, прокси не записан."), true);
+  } finally {
+    await close(server);
+  }
+});
+
+test("оболочка показывает шесть разделов и не подменяет адреса форм", async () => {
+  const trainer = start(tempDirectory());
+  assert.equal(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-WXYZ",
+    }).ok,
+    true,
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+  assert.equal(saved.ok, true);
+  if (!saved.ok) {
+    return;
+  }
+  const approved = trainer.approveDossier({
+    caseId: saved.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: "",
+    crib: "",
+  });
+  assert.equal(approved.ok, true);
+  if (!approved.ok) {
+    return;
+  }
+  const first = trainer.openSession({
+    caseId: saved.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId,
+  });
+  const second = trainer.openSession({
+    caseId: saved.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "Анна",
+    role: "разработчик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  if (!first.ok || !second.ok) {
+    return;
+  }
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+
+    const keys = await (await fetch(base)).text();
+    assertShell(keys, "Ключи");
+    assert.equal(keys.includes('<a href="/">Обзор</a>'), true);
+    assert.match(keys, /<form method="post" action="\/keys">/);
+    assert.match(keys, /<form method="post" action="\/proxy">/);
+    assert.equal(keys.includes("sk-ant-api03-secret-WXYZ"), false);
+
+    const projects = await (await fetch(`${base}/cases`)).text();
+    assertShell(projects, "Проекты");
+    assert.match(projects, /<form method="post" action="\/cases">/);
+    assert.match(projects, /<form method="post" action="\/customers">/);
+    assert.match(projects, /<form method="post" action="\/profile">/);
+
+    const project = await (await fetch(`${base}/cases/${saved.caseRecord.id}`)).text();
+    assertShell(project, "Проекты");
+    assert.match(project, new RegExp(`<form method="post" action="/cases/${saved.caseRecord.id}/session">`));
+
+    const sessionUrl = `${base}/sessions/${first.session.id}`;
+    const session = await (await fetch(sessionUrl)).text();
+    const sessionAgain = await (await fetch(sessionUrl)).text();
+    assertShell(session, "Сессия");
+    assert.equal(sessionAgain.includes("Тренажёр / <strong>Сессия</strong>"), true);
+    assert.match(session, new RegExp(`<form id="ask" method="post" action="/sessions/${first.session.id}/ask">`));
+    assert.match(session, new RegExp(`<form method="post" action="/sessions/${first.session.id}/finish">`));
+
+    const list = await fetch(`${base}/sessions`);
+    assert.equal(list.status, 200);
+    assert.equal(new URL(list.url).pathname, "/sessions");
+    const listHtml = await list.text();
+    assertShell(listHtml, "Сессия");
+    assert.equal(listHtml.includes(`/sessions/${first.session.id}`), true);
+    assert.equal(listHtml.includes(`/sessions/${second.session.id}`), true);
+    const listAgain = await fetch(`${base}/sessions`);
+    assert.equal(new URL(listAgain.url).pathname, "/sessions");
+
+    const reviews = await fetch(`${base}/reviews`);
+    assert.equal(reviews.status, 200);
+    assert.equal(new URL(reviews.url).pathname, "/reviews");
+    const reviewHtml = await reviews.text();
+    assertShell(reviewHtml, "Разбор");
+    assert.equal(reviewHtml.includes("Разбора пока нет."), true);
+    assert.equal(reviewHtml.includes(`/sessions/${first.session.id}`), false);
+
+    const postedKey = await fetch(`${base}/keys`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({
+        protocol: "openai-compatible",
+        baseAddress: "https://api.deepseek.com",
+        modelName: "deepseek-chat",
+        secret: "sk-deepseek-secret-9876",
+      }),
+    });
+    assert.equal(postedKey.status, 303);
+    assert.equal(postedKey.headers.get("location"), "/");
+    assert.equal(trainer.listKeys().length, 2);
+    assert.equal(JSON.stringify(trainer.listKeys()).includes("sk-deepseek-secret-9876"), false);
+
+    const postedProfile = await fetch(`${base}/profile`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ resume: "Резюме <script>", portfolio: "Портфолио", cases: "Кейс" }),
+    });
+    assert.equal(postedProfile.status, 303);
+    assert.equal(postedProfile.headers.get("location"), "/cases");
+    assert.deepEqual(trainer.readProfile(), { resume: "Резюме <script>", portfolio: "Портфолио", cases: "Кейс" });
+    const profile = await (await fetch(`${base}/profile`)).text();
+    assertShell(profile, "Профиль");
+    assert.match(profile, /<form method="post" action="\/profile">/);
+    assert.equal(profile.includes("Резюме &lt;script&gt;"), true);
+    assert.equal(profile.includes("Резюме <script>"), false);
+
+    assert.equal(await statusWithHost(`${base}/sessions`, `evil.example:${address.port}`, "GET"), 403);
+    assert.equal(await statusWithHost(`${base}/profile`, `evil.example:${address.port}`, "POST", "resume=чужой"), 403);
+    assert.equal(trainer.listSessions().length, 2);
+    assert.deepEqual(trainer.readProfile(), { resume: "Резюме <script>", portfolio: "Портфолио", cases: "Кейс" });
   } finally {
     await close(server);
   }
