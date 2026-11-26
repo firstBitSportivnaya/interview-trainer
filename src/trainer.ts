@@ -3503,7 +3503,12 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
         return;
       }
-      appendTranscript(session.id, "исполнитель", "реплика", text);
+      const pending = readTranscriptRows(session.id).at(-1);
+      const sameUnanswered =
+        pending?.speaker === "исполнитель" && pending.kind === "реплика" && pending.text === text;
+      if (!sameUnanswered) {
+        appendTranscript(session.id, "исполнитель", "реплика", text);
+      }
       const spoken = { text: "", failed: false };
       yield* streamKey(session, [{ role: "user", text: task.text }], spoken, signal);
       if (!spoken.failed && spoken.text && !signal?.aborted) {

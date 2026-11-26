@@ -101,7 +101,7 @@ type SessionAction = "opening" | "ask" | "finish";
 
 const PROTOCOL_LABEL: Record<KeySummary["protocol"], string> = {
   anthropic: "Anthropic",
-  "openai-compatible": "совместимый с OpenAI",
+  "openai-compatible": "Совместимый с OpenAI",
 };
 
 const KEY_ERROR: Record<Exclude<SaveKeyResult, { ok: true }>["reason"], string> = {
@@ -231,7 +231,7 @@ function page(title: string, body: string, section: ShellSection): string {
     input:focus-visible,
     select:focus-visible,
     textarea:focus-visible,
-    a:focus-visible { outline: 3px solid #b7aeff; outline-offset: 2px; }
+    a:focus-visible { outline: 3px solid var(--purple); outline-offset: 2px; }
     .shell { min-height: 100vh; display: grid; grid-template-columns: 242px minmax(0, 1fr); }
     aside { position: sticky; top: 0; height: 100vh; overflow: auto; background: #fff; border-right: 1px solid var(--line); padding: 27px 16px 20px; display: flex; flex-direction: column; gap: 32px; }
     .brand { display: flex; align-items: center; gap: 11px; margin: 0; padding: 0 9px; font-size: 15px; font-weight: 800; line-height: 1.25; }
@@ -239,7 +239,8 @@ function page(title: string, body: string, section: ShellSection): string {
     .brand small { display: block; font-size: 11px; color: #9297a5; font-weight: 500; margin-top: 3px; }
     .nav-title { color: #9da2b1; font-size: 10px; font-weight: 800; letter-spacing: 0.11em; text-transform: uppercase; padding: 0 12px; margin: 18px 0 10px; }
     nav .nav-title:first-child { margin-top: 0; }
-    nav { display: grid; gap: 4px; }
+    aside nav { display: grid; gap: 4px; }
+    .crumb { display: block; }
     nav a { display: flex; align-items: center; gap: 12px; text-decoration: none; border-radius: 10px; color: #777d90; padding: 11px 12px; font-weight: 600; }
     nav a:hover { background: #f7f7fb; }
     nav a[aria-current="page"] { color: var(--purple); background: var(--soft); }
@@ -260,14 +261,60 @@ function page(title: string, body: string, section: ShellSection): string {
     h1 { margin: 5px 0 3px; font-size: 29px; letter-spacing: -0.045em; line-height: 1.2; }
     h2 { font-size: 16px; letter-spacing: -0.02em; }
     main a { color: var(--purple); font-weight: 700; }
+    .heading { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; margin-bottom: 22px; }
+    .heading h1 { margin: 5px 0 3px; }
+    .eyebrow { margin: 0; color: var(--purple); font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }
+    .lede { margin: 0; color: var(--muted); }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .actions a, .actions button { margin-top: 0; text-decoration: none; }
+    .actions a { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 10px; background: #fff; color: #4d5265; padding: 10px 15px; font-weight: 700; }
     label { display: block; margin: 15px 0; color: #4e5467; font-weight: 700; font-size: 12px; }
     input, select, textarea { display: block; width: 100%; margin-top: 7px; border: 1px solid #e4e5ef; background: #fff; border-radius: 10px; padding: 11px 12px; color: var(--ink); font-weight: 400; }
     textarea { min-height: 100px; resize: vertical; }
     button { margin-top: 0.5rem; border: 1px solid var(--line); border-radius: 10px; background: #fff; color: #4d5265; padding: 10px 15px; font-weight: 700; }
-    button:hover { border-color: #c8c3f4; }
-    button[type="submit"] { background: var(--purple); border-color: var(--purple); color: #fff; }
-    button[type="submit"]:hover { background: var(--purple-dark); }
-    button[type="submit"][aria-pressed="true"] { background: var(--soft); color: var(--purple); border-color: var(--purple); }
+    button:hover, .actions a:hover { border-color: #c8c3f4; }
+    button.primary, a.primary { display: inline-flex; align-items: center; background: var(--purple); border: 1px solid var(--purple); border-radius: 10px; color: #fff; padding: 10px 15px; text-decoration: none; font-weight: 700; }
+    button.primary:hover, a.primary:hover { background: var(--purple-dark); color: #fff; }
+    .sheet { max-width: 760px; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+    .columns { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(16rem, 0.8fr); gap: 28px; align-items: start; }
+    .stack { display: grid; gap: 28px; }
+    .stack > * { margin: 0; }
+    .hero { background: var(--soft); border-radius: 16px; padding: 28px; margin: 0 0 28px; }
+    .hero h2 { margin: 6px 0; font-size: 22px; }
+    .status { display: inline-block; border-radius: 999px; padding: 2px 10px; background: #e7f7f1; color: #198b69; font-size: 12px; font-weight: 700; }
+    .status.warn { background: #fff6e8; color: #9a6b12; }
+    .project { display: block; padding: 16px 0 4px; border-top: 1px solid var(--line); }
+    .project-top { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+    .project-top > div { flex: 1; min-width: 10rem; }
+    .project-top .status { margin-left: auto; }
+    .meta-row { display: flex; flex-wrap: wrap; gap: 8px 32px; }
+    .project-top .mark, .session-row .mark { width: 36px; height: 36px; flex: none; display: grid; place-items: center; border-radius: 10px; background: var(--soft); color: var(--purple); }
+    .meta-label { display: block; color: var(--muted); font-size: 12px; font-weight: 700; }
+    .meta-val { font-weight: 700; }
+    .session-row { display: flex; gap: 12px; align-items: center; padding: 10px 0; border-top: 1px solid var(--line); }
+    .how-start { display: grid; gap: 0; }
+    .how-start li { display: flex; gap: 12px; align-items: center; margin: 0; padding: 12px 0; border: none; border-top: 1px solid var(--line); background: transparent; color: var(--ink); }
+    .step-num { color: var(--purple); font-weight: 800; font-variant-numeric: tabular-nums; }
+    form[aria-label="Слои досье"] { display: flex; flex-wrap: wrap; gap: 6px; }
+    form[aria-label="Слои досье"] button { background: transparent; border-color: transparent; color: var(--muted); }
+    form[aria-label="Слои досье"] button[aria-pressed="true"] { background: var(--soft); color: var(--purple); }
+    .layer-panel { margin-top: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: #fafafb; }
+    .chat-layout { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(16rem, 0.8fr); gap: 28px; align-items: start; }
+    ol#transcript { list-style: none; padding: 0; margin: 0; }
+    .message { display: flex; gap: 10px; max-width: 80%; margin: 12px 0; }
+    .message.mine { margin-left: auto; flex-direction: row-reverse; }
+    .message .avatar { width: 32px; height: 32px; flex: none; display: grid; place-items: center; border-radius: 10px; background: var(--soft); color: var(--purple); font-weight: 800; }
+    .bubble { background: #f4f5f8; border-radius: 14px; padding: 10px 14px; }
+    .message.mine .bubble { background: var(--soft); }
+    .who { display: block; font-size: 12px; font-weight: 700; color: var(--muted); }
+    .chat-form form { display: flex; gap: 8px; align-items: flex-end; border: 1px solid var(--line); border-radius: 14px; padding: 8px; }
+    .chat-form label { flex: 1; margin: 0; }
+    .chat-form textarea { border: none; margin-top: 0; min-height: 72px; }
+    .chat-form button { flex: none; }
+    .modal-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+    .modal-head h2 { margin: 0; }
+    button.close { border: none; background: transparent; font-size: 20px; line-height: 1; padding: 4px 8px; }
     .error { color: #9f1239; }
     li { margin: 0.4rem 0; }
     pre, #live { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; max-width: 100%; }
@@ -279,26 +326,30 @@ function page(title: string, body: string, section: ShellSection): string {
     .steps li.done { color: #44403c; border-color: #a8a29e; }
     .steps li.current { color: var(--ink); border-color: var(--purple); background: var(--soft); }
     .steps li.bad { color: #9f1239; border-color: #fda4af; background: #fff1f2; }
+    ol.steps.how-start { display: grid; }
+    ol.steps.how-start li { flex: none; display: flex; gap: 12px; align-items: center; border: none; border-top: 1px solid var(--line); border-radius: 0; background: transparent; color: var(--ink); }
     #draft-count { font-variant-numeric: tabular-nums; color: #44403c; }
     .error-box { white-space: pre-wrap; margin: 0.8rem 0; padding: 0.8rem 1rem; border: 1px solid #fecdd3; border-radius: 0.45rem; background: #fff1f2; color: #9f1239; }
     code { letter-spacing: 0.04em; }
     section { margin: 1.5rem 0; }
     ol { padding-left: 1.2rem; }
-    .session-columns { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(16rem, 0.9fr); gap: 28px; align-items: start; }
     @media (max-width: 1000px) {
       header { padding: 0 24px; }
       main { padding: 28px 24px 50px; }
+      .columns, .chat-layout { grid-template-columns: 1fr; }
+      .context { order: -1; }
     }
     @media (max-width: 720px) {
       .shell { display: block; max-width: 100%; overflow-x: clip; }
       aside { position: static; height: auto; overflow: visible; padding: 12px 14px; gap: 10px; }
       .brand small, .sidebar-bottom, .nav-title { display: none; }
-      nav { display: flex; flex-wrap: wrap; overflow: visible; max-width: 100%; gap: 4px; }
+      aside nav { display: flex; flex-wrap: wrap; overflow: visible; max-width: 100%; gap: 4px; }
       nav a { width: auto; white-space: normal; padding: 8px 10px; font-size: 12px; }
       header { min-height: 54px; padding: 0 16px; }
       main { padding: 24px 16px 40px; }
       h1 { font-size: 25px; }
-      .session-columns { display: block; }
+      .heading { align-items: flex-start; flex-direction: column; }
+      .form-grid { grid-template-columns: 1fr; }
       .steps { flex-wrap: wrap; }
     }
   </style>
@@ -316,9 +367,7 @@ function page(title: string, body: string, section: ShellSection): string {
         <p class="local"><span class="dot" aria-hidden="true"></span>Локальная установка владельца</p>
       </header>
       <main>
-        <div class="card">
-          ${body}
-        </div>
+        ${body}
       </main>
     </div>
   </div>
@@ -342,6 +391,17 @@ function page(title: string, body: string, section: ShellSection): string {
 
 function notice(error?: string): string {
   return error ? `<p class="error">${escapeHtml(error)}</p>` : "";
+}
+
+/** Шапка страницы. Общая карточка на всё тело не надевается: карточка остаётся у блока. */
+function pageHeading(
+  title: string,
+  options?: { eyebrow?: string; subtitle?: string; actions?: string },
+): string {
+  const eyebrow = options?.eyebrow ? `<p class="eyebrow">${escapeHtml(options.eyebrow)}</p>` : "";
+  const subtitle = options?.subtitle ? `<p class="lede">${escapeHtml(options.subtitle)}</p>` : "";
+  const actions = options?.actions ? `<div class="actions">${options.actions}</div>` : "";
+  return `<div class="heading"><div>${eyebrow}<h1>${escapeHtml(title)}</h1>${subtitle}</div>${actions}</div>`;
 }
 
 function characterLines(value: string): string[] {
@@ -374,10 +434,14 @@ function renderKeys(keys: KeySummary[], proxy: string | undefined, error?: strin
 
   return page(
     "Ключи",
-    `<h1>Ключи</h1>
-  <p>Тренажёр открыт только на этом компьютере и не спрашивает пароль.</p>
+    `${pageHeading("Ключи", {
+      eyebrow: "Ключи",
+      subtitle: "Тренажёр открыт только на этом компьютере и не спрашивает пароль.",
+    })}
   ${notice(error)}
+  <div class="card sheet">
   <form method="post" action="/keys">
+    <div class="form-grid">
     <label>Протокол
       <select name="protocol" required>
         ${Object.entries(PROTOCOL_LABEL)
@@ -394,7 +458,8 @@ function renderKeys(keys: KeySummary[], proxy: string | undefined, error?: strin
     <label>Секрет
       <input name="secret" type="password" required autocomplete="off">
     </label>
-    <button type="submit">Сохранить ключ</button>
+    </div>
+    <button type="submit" class="primary">Сохранить ключ</button>
   </form>
   <h2>Прокси</h2>
   <p>${proxy ? "Прокси записан. Адрес, логин и пароль на странице не показываются." : "Прямое соединение, прокси не записан."}</p>
@@ -403,18 +468,18 @@ function renderKeys(keys: KeySummary[], proxy: string | undefined, error?: strin
     <label>Адрес
       <input name="proxyUrl" type="password" autocomplete="off">
     </label>
-    <button type="submit" name="act" value="save">Записать прокси</button>
+    <button type="submit" class="primary" name="act" value="save">Записать прокси</button>
     <button type="submit" name="act" value="clear">Убрать прокси</button>
   </form>
   <h2>Сохранённые</h2>
-  ${items}`,
+  ${items}
+  </div>`,
     "keys",
   );
 }
 
 function profileFields(profile: OwnerProfile): string {
-  return `<p>Резюме, портфолио и кейсы одни на владельца и общие для всех проектов.</p>
-    <form method="post" action="/profile">
+  return `<form method="post" action="/profile">
       <label>Резюме
         <textarea name="resume">${escapeHtml(profile.resume)}</textarea>
       </label>
@@ -424,20 +489,18 @@ function profileFields(profile: OwnerProfile): string {
       <label>Кейсы
         <textarea name="cases">${escapeHtml(profile.cases)}</textarea>
       </label>
-      <button type="submit">Сохранить профиль</button>
+      <button type="submit" class="primary">Сохранить профиль</button>
     </form>`;
-}
-
-function renderProfile(profile: OwnerProfile): string {
-  return `<section>
-    <h2>Профиль</h2>
-    ${profileFields(profile)}
-  </section>`;
 }
 
 /** Страница профиля. Запись уходит на `/profile` и возвращает на эту же страницу. */
 function renderProfilePage(trainer: Trainer): string {
-  return page("Профиль", `<h1>Профиль</h1>${profileFields(trainer.readProfile())}`, "profile");
+  return page(
+    "Профиль",
+    `${pageHeading("Профиль", { eyebrow: "Профиль", subtitle: "Резюме, портфолио и кейсы одни на владельца и общие для всех проектов." })}
+    <div class="card sheet">${profileFields(trainer.readProfile())}</div>`,
+    "profile",
+  );
 }
 
 /** Ссылки на сессии. Список сам не открывает последнюю. */
@@ -455,31 +518,149 @@ function sessionLinks(trainer: Trainer, sessions: SessionRecord[]): string {
 function renderSessionIndex(trainer: Trainer): string {
   const sessions = trainer.listSessions();
   const items = sessions.length === 0 ? "<p>Сессий пока нет.</p>" : sessionLinks(trainer, sessions);
-  return page("Сессия", `<h1>Сессия</h1>${items}`, "session");
+  return page(
+    "Сессия",
+    `${pageHeading("Сессия", { eyebrow: "Сессия" })}<div class="card">${items}</div>`,
+    "session",
+  );
 }
 
 /** Список сессий, у которых уже есть разбор. Сам не открывает последнюю. */
 function renderReviewIndex(trainer: Trainer): string {
   const sessions = trainer.listSessions().filter((session) => trainer.readReview(session.id));
   const items = sessions.length === 0 ? "<p>Разбора пока нет.</p>" : sessionLinks(trainer, sessions);
-  return page("Разбор", `<h1>Разбор</h1>${items}`, "review");
+  return page(
+    "Разбор",
+    `${pageHeading("Разбор", { eyebrow: "Разбор" })}<div class="card">${items}</div>`,
+    "review",
+  );
 }
 
-/** Постоянный текст обзора. В ход подготовки и в досье не пишется. */
-const OVERVIEW_STEPS = "Создайте проект. Утвердите досье. Откройте сессию.";
+/** Постоянные шаги обзора. В ход подготовки и в досье не пишутся. */
+const OVERVIEW_STEPS = ["Создайте проект.", "Утвердите досье.", "Откройте сессию."] as const;
+
+/** Карточка читает проект, досье, голоса заказчика и сессии. Отдельной записи у неё нет. */
+function projectCard(trainer: Trainer, item: CaseRecord): string {
+  const approved = trainer.readApprovedDossier(item.id) !== undefined;
+  const voices = customerVoices(item.characters).join(", ");
+  const sessions = trainer.listSessions().filter((session) => session.caseId === item.id).length;
+  const status = approved
+    ? `<span class="status">Досье утверждено</span>`
+    : `<span class="status warn">Досье не утверждено</span>`;
+  return `<article class="project">
+    <div class="project-top">
+      <span class="mark" aria-hidden="true">▤</span>
+      <div>
+        <h3>${escapeHtml(item.title)}</h3>
+        <p>Заказчик: ${escapeHtml(item.customerName)}</p>
+      </div>
+      ${status}
+    </div>
+    <div class="meta-row">
+      <p><span class="meta-label">Персонаж</span><span class="meta-val">${escapeHtml(voices)}</span></p>
+      <p><span class="meta-label">Сессии</span><span class="meta-val">${sessions}</span></p>
+    </div>
+    <a href="${escapeHtml(casePath(item.id))}">Открыть проект →</a>
+  </article>`;
+}
+
+/** Последняя сессия установки в порядке открытия, любого статуса. Списка сессий эта ссылка не заменяет. */
+function latestSessionBlock(trainer: Trainer): string {
+  const latest = trainer.listSessions().at(-1);
+  if (!latest) {
+    return "<p>Сессий пока нет.</p>";
+  }
+  const item = trainer.readCase(latest.caseId);
+  const title = item ? `${item.customerName} — ${item.title}` : "Сессия";
+  return `<div class="session-row"><span class="mark" aria-hidden="true">◉</span><a href="/sessions/${encodeURIComponent(latest.id)}">${escapeHtml(title)}: ${escapeHtml(latest.character)}, ${escapeHtml(latest.role)}</a></div>`;
+}
+
+/** Следующий шаг обзора: к сессии, к проекту или к первому проекту. Текст постоянный. */
+function overviewHero(trainer: Trainer): string {
+  const latest = trainer.listSessions().at(-1);
+  if (latest) {
+    const item = trainer.readCase(latest.caseId);
+    const title = item ? `${item.customerName} — ${item.title}` : "Сессия";
+    return `<section class="hero">
+      <p class="eyebrow">Следующий шаг</p>
+      <h2>Вернитесь к разговору</h2>
+      <p>${escapeHtml(`${title}: ${latest.character}, ${latest.role}`)}</p>
+      <a class="primary" href="/sessions/${encodeURIComponent(latest.id)}">Открыть сессию →</a>
+    </section>`;
+  }
+  const cases = trainer.listCases();
+  const ready = [...cases].reverse().find((item) => trainer.readApprovedDossier(item.id) !== undefined);
+  const target = ready ?? cases.at(-1);
+  if (target) {
+    const text = ready
+      ? "Досье утверждено. Откройте сессию на странице проекта."
+      : "Утвердите досье, чтобы открыть сессию.";
+    return `<section class="hero">
+      <p class="eyebrow">Следующий шаг</p>
+      <h2>${escapeHtml(target.title)}</h2>
+      <p>${text}</p>
+      <a class="primary" href="${escapeHtml(casePath(target.id))}">Открыть проект →</a>
+    </section>`;
+  }
+  return `<section class="hero">
+    <p class="eyebrow">Следующий шаг</p>
+    <h2>Заведите первый проект</h2>
+    <p>Заказчик и проект записываются вместе.</p>
+    <button type="button" class="primary" data-open="new-customer">Новый проект</button>
+  </section>`;
+}
+
+/** Обзор установки: проекты, три шага и путь к последней сессии. */
+function renderOverview(trainer: Trainer): string {
+  const cases = trainer.listCases();
+  const projects =
+    cases.length === 0 ? "<p>Проектов пока нет.</p>" : cases.map((item) => projectCard(trainer, item)).join("");
+  const steps = OVERVIEW_STEPS.map(
+    (step, index) => `<li><span class="step-num">${String(index + 1).padStart(2, "0")}</span> ${step}</li>`,
+  ).join("");
+  return page(
+    "Обзор",
+    `${pageHeading("Обзор", {
+      eyebrow: "Обзор",
+      subtitle: "Тренажёр открыт только на этом компьютере и не спрашивает пароль.",
+      actions: `<a href="/cases">Все проекты</a>${firstProjectForm()}`,
+    })}
+    ${overviewHero(trainer)}
+    <div class="columns">
+      <div class="stack">
+        <section class="card">
+          <h2>Проекты</h2>
+          ${projects}
+        </section>
+        <section class="card">
+          <h2>Последняя сессия</h2>
+          ${latestSessionBlock(trainer)}
+        </section>
+      </div>
+      <section class="card">
+        <h2>Как начать</h2>
+        <p>Три шага до первой сессии.</p>
+        <ol class="steps how-start">${steps}</ol>
+      </section>
+    </div>`,
+    "overview",
+  );
+}
 
 /** Окно оболочки. Запись остаётся у формы внутри, отдельного маршрута у окна нет. */
 function shellDialog(id: string, title: string, body: string): string {
   return `<dialog id="${id}" aria-labelledby="${id}-title">
-    <h2 id="${id}-title">${escapeHtml(title)}</h2>
-    <button type="button" data-close>Закрыть</button>
+    <div class="modal-head">
+      <h2 id="${id}-title">${escapeHtml(title)}</h2>
+      <button type="button" class="close" data-close aria-label="Закрыть">×</button>
+    </div>
     ${body}
   </dialog>`;
 }
 
 /** Первый проект заводится тем же `POST /customers`, что и со страницы проектов. */
 function firstProjectForm(): string {
-  return `<button type="button" data-open="new-customer">Новый проект</button>
+  return `<button type="button" class="primary" data-open="new-customer">Новый проект</button>
     ${shellDialog(
       "new-customer",
       "Новый проект",
@@ -493,59 +674,9 @@ function firstProjectForm(): string {
         <label>Персонажи заказчика, по одному в строке
           <textarea name="characters"></textarea>
         </label>
-        <button type="submit">Завести заказчика и проект</button>
+        <button type="submit" class="primary">Завести заказчика и проект</button>
       </form>`,
     )}`;
-}
-
-/** Карточка читает проект, досье, голоса заказчика и сессии. Отдельной записи у неё нет. */
-function projectCard(trainer: Trainer, item: CaseRecord): string {
-  const approved = trainer.readApprovedDossier(item.id) !== undefined;
-  const voices = customerVoices(item.characters).join(", ");
-  const sessions = trainer.listSessions().filter((session) => session.caseId === item.id).length;
-  return `<article>
-    <h3>${escapeHtml(item.title)}</h3>
-    <p>Заказчик: ${escapeHtml(item.customerName)}</p>
-    <p>${approved ? "Досье утверждено" : "Досье не утверждено"}</p>
-    <p>Персонаж: ${escapeHtml(voices)}</p>
-    <p>Сессий: ${sessions}</p>
-    <a href="${escapeHtml(casePath(item.id))}">Открыть проект</a>
-  </article>`;
-}
-
-/** Последняя открытая сессия установки. Списка сессий эта ссылка не заменяет. */
-function latestSessionBlock(trainer: Trainer): string {
-  const latest = trainer.listSessions().at(-1);
-  if (!latest) {
-    return "<p>Сессий пока нет.</p>";
-  }
-  const item = trainer.readCase(latest.caseId);
-  const title = item ? `${item.customerName} — ${item.title}` : "Сессия";
-  return `<p><a href="/sessions/${encodeURIComponent(latest.id)}">${escapeHtml(title)}: ${escapeHtml(latest.character)}, ${escapeHtml(latest.role)}</a></p>`;
-}
-
-/** Обзор установки: проекты, три шага и путь к последней открытой сессии. */
-function renderOverview(trainer: Trainer): string {
-  const cases = trainer.listCases();
-  const projects =
-    cases.length === 0
-      ? `<p>Проектов пока нет.</p>${firstProjectForm()}`
-      : cases.map((item) => projectCard(trainer, item)).join("");
-  return page(
-    "Обзор",
-    `<h1>Обзор</h1>
-    <p>Тренажёр открыт только на этом компьютере и не спрашивает пароль.</p>
-    <p>${OVERVIEW_STEPS}</p>
-    <section>
-      <h2>Проекты</h2>
-      ${projects}
-    </section>
-    <section>
-      <h2>Последняя сессия</h2>
-      ${latestSessionBlock(trainer)}
-    </section>`,
-    "overview",
-  );
 }
 
 function renderCases(trainer: Trainer, error?: string): string {
@@ -581,26 +712,29 @@ function renderCases(trainer: Trainer, error?: string): string {
           <label>Персонажи заказчика, по одному в строке
             <textarea name="characters"></textarea>
           </label>
-          <button type="submit">Добавить проект</button>
+          <button type="submit" class="primary">Добавить проект</button>
         </form>`,
         )}`;
 
   return page(
     "Проекты",
-    `<h1>Проекты</h1>
-    <p>Заказчик и первый проект заводятся вместе. Следующий проект остаётся у того же заказчика.</p>
+    `${pageHeading("Проекты", {
+      eyebrow: "Проекты",
+      subtitle: "Заказчик и первый проект заводятся вместе. Следующий проект остаётся у того же заказчика.",
+    })}
     ${notice(error)}
-    ${renderProfile(trainer.readProfile())}
-    <section>
+    <section class="card">
       <h2>Новый заказчик</h2>
       ${firstProjectForm()}
     </section>
-    <section>
+    <section class="card">
       <h2>Ещё один проект</h2>
       ${addCase}
     </section>
-    <h2>Все проекты</h2>
-    ${items}`,
+    <section class="card">
+      <h2>Все проекты</h2>
+      ${items}
+    </section>`,
     "projects",
   );
 }
@@ -640,9 +774,9 @@ function projectSessionList(trainer: Trainer, item: CaseRecord): string {
 function approvedBlock(trainer: Trainer, item: CaseRecord, sessionError?: string, layer: DossierLayerName = "material"): string {
   const dossier = trainer.readApprovedDossier(item.id);
   if (!dossier) {
-    return `<section>
+    return `<section class="card">
     <h2>Утверждённое досье</h2>
-    <p>Досье не утверждено</p>
+    <p><span class="status warn">Досье не утверждено</span></p>
     <p>Утверждённого досье ещё нет. Сессия не открывается.</p>
   </section>`;
   }
@@ -683,20 +817,24 @@ function approvedBlock(trainer: Trainer, item: CaseRecord, sessionError?: string
                 .join("")}
             </select>
           </label>
-          <button type="submit">Открыть сессию</button>
+          <button type="submit" class="primary">Открыть сессию</button>
         </form>`;
-  return `<section>
+  return `<section class="card">
     <h2>Утверждённое досье</h2>
-    <p>Досье утверждено</p>
+    <p><span class="status">Досье утверждено</span></p>
     <form method="get" action="${escapeHtml(casePath(item.id))}" aria-label="Слои досье">
       ${buttons}
     </form>
-    <h3>${escapeHtml(LAYER_LABEL[layer])}</h3>
-    <pre>${escapeHtml(dossier[layer])}</pre>
+    <div class="layer-panel">
+      <h3>${escapeHtml(LAYER_LABEL[layer])}</h3>
+      <pre>${escapeHtml(dossier[layer])}</pre>
+    </div>
     <p>Сессия читает это досье и держит его до конца. Персонаж заказчика отвечает по материалу проекта.</p>
-    <h2>Сессия</h2>
-    ${notice(sessionError)}
-    ${form}
+    <div id="open-session">
+      <h2>Сессия</h2>
+      ${notice(sessionError)}
+      ${form}
+    </div>
   </section>`;
 }
 
@@ -735,7 +873,7 @@ function preparationBlock(trainer: Trainer, item: CaseRecord): string {
     }
   }
   const list = rows.length === 0 ? "<p>Ход подготовки пока пуст.</p>" : `<ul id="preparation">${rows.join("")}</ul>`;
-  return `<section>
+  return `<section class="card">
     <h2>Ход подготовки</h2>
     <p>Сигнал следить и расхождение снимает владелец. Пробел закрывает поздний разбор. Правка входит в досье после приёмки.</p>
     ${list}
@@ -747,11 +885,15 @@ function transcriptList(lines: TranscriptLine[]): string {
     return `<p id="empty-transcript">Стенограмма пока пуста.</p>`;
   }
   return `<ol id="transcript">${lines
-    .map((line) => {
-      const who = line.speaker === "персонаж" ? "Персонаж" : "Исполнитель";
-      return `<li><span>${who}</span> ${escapeHtml(line.text)}</li>`;
-    })
+    .map((line) => bubbleItem(line.speaker === "персонаж" ? "Персонаж" : "Исполнитель", escapeHtml(line.text)))
     .join("")}</ol>`;
+}
+
+/** Пузырь стенограммы. Текст уже экранирован. */
+function bubbleItem(who: string, htmlText: string): string {
+  const mine = who === "Исполнитель" ? " mine" : "";
+  const letter = who === "Исполнитель" ? "И" : "П";
+  return `<li class="message${mine}"><span class="avatar" aria-hidden="true">${letter}</span><div class="bubble"><span class="who">${who}</span> ${htmlText}</div></li>`;
 }
 
 /** Поток первого вопроса и вопрос исполнителя. Текст реплики в скрипт не подставляется. */
@@ -774,9 +916,18 @@ function sessionScript(sessionId: string, needsOpening: boolean): string {
         openingBox.before(list);
       }
       const item = document.createElement("li");
+      item.className = "message" + (who === "Исполнитель" ? " mine" : "");
+      const avatar = document.createElement("span");
+      avatar.className = "avatar";
+      avatar.setAttribute("aria-hidden", "true");
+      avatar.textContent = who === "Исполнитель" ? "И" : "П";
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
       const name = document.createElement("span");
+      name.className = "who";
       name.textContent = who;
-      item.append(name, document.createTextNode(" " + text));
+      bubble.append(name, document.createTextNode(" " + text));
+      item.append(avatar, bubble);
       list.append(item);
     }
     function consume(buffer, onEvent) {
@@ -910,12 +1061,19 @@ function unansweredLine(lines: TranscriptLine[]): string {
 function sessionBasis(trainer: Trainer, session: SessionRecord, keyLabel: string): string {
   const dossier = trainer.readDossier(session.dossierId);
   return `<section id="session-basis">
-    <h2>Утверждённое досье</h2>
-    <p>${escapeHtml(`Сторона: ${session.side}. Персонаж: ${session.character}. Роль исполнителя: ${session.role}.`)}</p>
+    <h2>Параметры сессии</h2>
+    <p class="meta-label">Персонаж</p>
+    <p>Персонаж: ${escapeHtml(session.character)}</p>
+    <p class="meta-label">Роль исполнителя</p>
+    <p>Роль исполнителя: ${escapeHtml(session.role)}</p>
+    <p class="meta-label">Основа разговора</p>
+    <p>Утверждённое досье</p>
     <p>Сессия держит это досье до конца.</p>
+    <p class="meta-label">Ключ</p>
+    <p>${escapeHtml(`Сессия помнит ключ: ${keyLabel}`)}</p>
     <h3>Материал проекта</h3>
     <pre id="session-dossier">${escapeHtml(dossier?.material ?? "")}</pre>
-    <p>${escapeHtml(`Сессия помнит ключ: ${keyLabel}`)}</p>
+    <p>${escapeHtml(`Сторона: ${session.side}.`)}</p>
   </section>`;
 }
 
@@ -928,19 +1086,22 @@ function renderSession(trainer: Trainer, session: SessionRecord, error?: string,
   const open = session.status === "open";
   const needsOpening = open && session.side === "заказчик" && !lines.some((line) => line.kind === "вопрос");
   const title = item ? `${item.customerName} — ${item.title}` : "Сессия";
-  const talk = open
+  const ask = open
     ? `<div id="opening"></div>
     <div id="live" aria-live="polite"></div>
+    <div class="chat-form">
     <form id="ask" method="post" action="/sessions/${encodeURIComponent(session.id)}/ask">
       <label>Вопрос
         <textarea name="line" required>${escapeHtml(unansweredLine(lines))}</textarea>
       </label>
-      <button type="submit">Спросить</button>
+      <button type="submit" class="primary">Спросить</button>
     </form>
-    <form method="post" action="/sessions/${encodeURIComponent(session.id)}/finish">
-      <button type="submit">Закончить сессию</button>
-    </form>`
+    </div>`
     : "";
+  const finish = open
+    ? `<form method="post" action="/sessions/${encodeURIComponent(session.id)}/finish"><button type="submit" class="primary">Закончить сессию</button></form>`
+    : "";
+  const back = item ? `<a href="${escapeHtml(casePath(item.id))}">К проекту</a>` : "";
   const reviewText = review
     ? `<h2>Разбор</h2>
     <pre id="review">${escapeHtml(review.text)}</pre>`
@@ -948,19 +1109,24 @@ function renderSession(trainer: Trainer, session: SessionRecord, error?: string,
   const speech = speechError ? `<p class="error" id="speech-error">${escapeHtml(speechError)}</p>` : "";
   return page(
     title,
-    `<h1>${escapeHtml(title)}</h1>
-    <div class="session-columns">
-      <section>
+    `${pageHeading(title, {
+      eyebrow: "Сессия",
+      subtitle: item ? `${item.title} · ${item.customerName}` : undefined,
+      actions: `${back}${finish}`,
+    })}
+    ${speech}
+    ${notice(error)}
+    <div class="chat-layout">
+      <section class="card">
         <h2>Стенограмма</h2>
-        ${speech}
-        ${notice(error)}
         ${transcriptList(lines)}
-        ${talk}
+        ${ask}
         ${reviewText}
       </section>
-      ${sessionBasis(trainer, session, keyLabel)}
+      <div class="context card">
+        ${sessionBasis(trainer, session, keyLabel)}
+      </div>
     </div>
-    ${item ? `<p><a href="${escapeHtml(casePath(item.id))}">К проекту</a></p>` : ""}
     ${open ? sessionScript(session.id, needsOpening) : ""}`,
     "session",
   );
@@ -981,25 +1147,28 @@ function renderSourceFiles(trainer: Trainer, item: CaseRecord, error?: string): 
             const list =
               own.length === 0
                 ? "<p>В этом слое файлов нет.</p>"
-                : `<ul>${own
+                : `<div class="files">${own
                     .map(
                       (file) =>
-                        `<li>${escapeHtml(file.name)} — ${escapeHtml(label)}, ${file.extractedText.length} знаков</li>`,
+                        `<div class="session-row"><span class="mark" aria-hidden="true">▤</span><span>${escapeHtml(file.name)} — ${escapeHtml(label)}, ${file.extractedText.length} знаков</span><span class="status">Прочитан</span></div>`,
                     )
-                    .join("")}</ul>`;
+                    .join("")}</div>`;
             return `<h3>${escapeHtml(label)}</h3>${list}`;
           })
           .join("");
   const unreadItems =
     unread.length === 0
       ? ""
-      : `<h3>Не прочитаны</h3><ul id="unread-files">${unread
-          .map((file) => `<li>${escapeHtml(file.name)} — не прочитан</li>`)
-          .join("")}</ul>`;
+      : `<h3>Не прочитаны</h3><div id="unread-files">${unread
+          .map(
+            (file) =>
+              `<div class="session-row"><span class="mark" aria-hidden="true">▤</span><span>${escapeHtml(file.name)} — не прочитан</span><span class="status warn">Не прочитан</span></div>`,
+          )
+          .join("")}</div>`;
   const options = (Object.entries(LAYER_LABEL) as [DossierLayerName, string][])
     .map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`)
     .join("");
-  return `<section>
+  return `<section class="card">
     <h2>Файлы проекта</h2>
     <p>Слой назначает владелец. Новый файл не меняет утверждённое досье и в сессию не попадает.</p>
     ${notice(error)}
@@ -1019,7 +1188,7 @@ function renderSourceFiles(trainer: Trainer, item: CaseRecord, error?: string): 
           ${options}
         </select>
       </label>
-      <button type="submit">Добавить файл</button>
+      <button type="submit" class="primary">Добавить файл</button>
     </form>`,
     )}
   </section>`;
@@ -1034,7 +1203,7 @@ function assignmentBlock(trainer: Trainer, item: CaseRecord, error?: string): st
       : `<ul id="assignments">${assignments
           .map((assignment) => `<li>${escapeHtml(assignment.executorId)}</li>`)
           .join("")}</ul>`;
-  return `<section>
+  return `<section class="card">
     <h2>Назначение</h2>
     <p>Владелец записывает назначение исполнителя на этот проект. Сессию по своему проекту владелец открывает без назначения. Отдельного входа для исполнителя, который не владелец, нет.</p>
     ${notice(error)}
@@ -1257,29 +1426,44 @@ function renderCase(
                 .join("")}
             </select>
           </label>
-          <button type="submit">Собрать черновик</button>
+          <button type="submit" class="primary">Собрать черновик</button>
         </form>
         ${draftScript()}`;
 
+  const openLink =
+    trainer.readApprovedDossier(item.id) !== undefined && keys.length > 0
+      ? `<a class="primary" href="#open-session">Открыть сессию →</a>`
+      : "";
   return page(
     item.title,
-    `<h1>${escapeHtml(item.customerName)} — ${escapeHtml(item.title)}</h1>
-    <p>${escapeHtml(`Голоса заказчика: ${customerVoices(item.characters).join(", ")}`)}</p>
-    <p>${escapeHtml(item.portfolioSent ? "Отметка «портфолио уже отправлено» стоит." : "Отметка «портфолио уже отправлено» снята.")}</p>
-    <form method="post" action="${escapeHtml(casePath(item.id, "/portfolio"))}">
-      <button type="submit" name="sent" value="1">Поставить отметку «портфолио уже отправлено»</button>
-      <button type="submit" name="sent" value="0">Снять отметку «портфолио уже отправлено»</button>
-    </form>
+    `${pageHeading(`${item.customerName} — ${item.title}`, {
+      eyebrow: "Проекты",
+      subtitle: `Голоса заказчика: ${customerVoices(item.characters).join(", ")}`,
+      actions: `<button type="button" data-open="project-file">Добавить файл</button>${openLink}`,
+    })}
+    <div class="columns">
+      <div class="stack">
+        ${approvedBlock(trainer, item, sessionError, layer)}
+        ${renderSourceFiles(trainer, item, fileError)}
+      </div>
+      <div class="stack">
+        ${preparationBlock(trainer, item)}
+        <section class="card">
+          <h2>Сессии проекта</h2>
+          ${projectSessionList(trainer, item)}
+        </section>
+      </div>
+    </div>
+    <section class="card">
+      <p>${escapeHtml(item.portfolioSent ? "Отметка «портфолио уже отправлено» стоит." : "Отметка «портфолио уже отправлено» снята.")}</p>
+      <form method="post" action="${escapeHtml(casePath(item.id, "/portfolio"))}">
+        <button type="submit" name="sent" value="1">Поставить отметку «портфолио уже отправлено»</button>
+        <button type="submit" name="sent" value="0">Снять отметку «портфолио уже отправлено»</button>
+      </form>
+    </section>
     ${notice(error)}
     ${assignmentBlock(trainer, item, assignmentError)}
-    ${renderSourceFiles(trainer, item, fileError)}
-    ${preparationBlock(trainer, item)}
-    ${approvedBlock(trainer, item, sessionError, layer)}
-    <section>
-      <h2>Сессии проекта</h2>
-      ${projectSessionList(trainer, item)}
-    </section>
-    <section>
+    <section class="card">
       <h2>Черновик</h2>
       <p>В модель уходит вставленный текст и текст файлов того же слоя. Черновик сессия не читает.</p>
       ${draftInventory(trainer, item.id, paste)}
@@ -1303,27 +1487,48 @@ function renderCase(
 function renderDraft(item: CaseRecord, draft: DossierLayers): string {
   return page(
     item.title,
-    `<h1>${escapeHtml(item.customerName)} — ${escapeHtml(item.title)}</h1>
-    <p>Черновик. Сессия его не читает, пока текст не поправлен и не утверждён.</p>
+    `${pageHeading(`${item.customerName} — ${item.title}`, {
+      eyebrow: "Проекты",
+      subtitle: "Черновик. Сессия его не читает, пока текст не поправлен и не утверждён.",
+    })}
+    <div class="card sheet">
     <form method="post" action="${escapeHtml(casePath(item.id, "/approve"))}">
       ${layerAreas(draft)}
-      <button type="submit">Утвердить досье</button>
-    </form>`,
+      <button type="submit" class="primary">Утвердить досье</button>
+    </form>
+    </div>`,
     "projects",
   );
 }
 
-/** Читает тело запроса и не держит в памяти больше заданного предела. */
+/** Читает тело запроса и не держит в памяти больше заданного предела.
+ *  После превышения дочитывает не больше того же предела плюс 64 КиБ и закрывает соединение.
+ */
 async function readRawBody(request: IncomingMessage, limit: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let size = 0;
   let overflow = false;
+  let extra = 0;
+  const extraBudget = limit + 64 * 1024;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    if (overflow) {
+      extra += buffer.length;
+      if (extra > extraBudget) {
+        request.destroy();
+        throw new Error("body too large");
+      }
+      continue;
+    }
     size += buffer.length;
     if (size > limit) {
       overflow = true;
       chunks.length = 0;
+      extra = size - limit;
+      if (extra > extraBudget) {
+        request.destroy();
+        throw new Error("body too large");
+      }
       continue;
     }
     chunks.push(buffer);
