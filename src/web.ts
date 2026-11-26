@@ -407,7 +407,7 @@ function renderProfile(profile: OwnerProfile): string {
   </section>`;
 }
 
-/** Страница профиля. Запись по-прежнему уходит на `/profile` и возвращает к проектам. */
+/** Страница профиля. Запись уходит на `/profile` и возвращает на эту же страницу. */
 function renderProfilePage(trainer: Trainer): string {
   return page("Профиль", `<h1>Профиль</h1>${profileFields(trainer.readProfile())}`, "profile");
 }
@@ -1685,7 +1685,7 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
       portfolio: fields.get("portfolio") ?? "",
       cases: fields.get("cases") ?? "",
     });
-    redirect(response, "/cases");
+    redirect(response, "/profile");
     return;
   }
 

@@ -2300,7 +2300,7 @@ test("оболочка показывает шесть разделов и не 
       body: new URLSearchParams({ resume: "Резюме <script>", portfolio: "Портфолио", cases: "Кейс" }),
     });
     assert.equal(postedProfile.status, 303);
-    assert.equal(postedProfile.headers.get("location"), "/cases");
+    assert.equal(postedProfile.headers.get("location"), "/profile");
     assert.deepEqual(trainer.readProfile(), { resume: "Резюме <script>", portfolio: "Портфолио", cases: "Кейс" });
     const profile = await (await fetch(`${base}/profile`)).text();
     assertShell(profile, "Профиль");
@@ -2312,6 +2312,105 @@ test("оболочка показывает шесть разделов и не 
     assert.equal(await statusWithHost(`${base}/profile`, `evil.example:${address.port}`, "POST", "resume=чужой"), 403);
     assert.equal(trainer.listSessions().length, 2);
     assert.deepEqual(trainer.readProfile(), { resume: "Резюме <script>", portfolio: "Портфолио", cases: "Кейс" });
+  } finally {
+    await close(server);
+  }
+});
+
+test("страница профиля показывает один профиль владельца и после записи остаётся профилем", async () => {
+  const trainer = start(tempDirectory());
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+
+    const empty = await (await fetch(`${base}/profile`)).text();
+    assertShell(empty, "Профиль");
+    assert.match(empty, /<textarea name="resume"><\/textarea>/);
+    assert.match(empty, /<textarea name="portfolio"><\/textarea>/);
+    assert.match(empty, /<textarea name="cases"><\/textarea>/);
+
+    const first = await fetch(`${base}/profile`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({
+        resume: "Первое резюме",
+        portfolio: "Первое портфолио",
+        cases: "Первый кейс",
+      }),
+    });
+    assert.equal(first.status, 303);
+    assert.equal(first.headers.get("location"), "/profile");
+    assert.notEqual(first.headers.get("location"), "/cases");
+
+    const saved = await (await fetch(`${base}/profile`)).text();
+    assert.equal(saved.includes("Первое резюме"), true);
+    assert.equal(saved.includes("Первое портфолио"), true);
+    assert.equal(saved.includes("Первый кейс"), true);
+
+    const replaced = await fetch(`${base}/profile`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({
+        resume: "  Резюме <script> &  ",
+        portfolio: "Портфолио склада",
+        cases: "Кейс кассы",
+      }),
+    });
+    assert.equal(replaced.status, 303);
+    assert.equal(replaced.headers.get("location"), "/profile");
+
+    const shown = await (await fetch(`${base}/profile`)).text();
+    const reopened = await (await fetch(`${base}/profile`)).text();
+    assert.equal(shown, reopened);
+    assert.equal(shown.includes("Резюме &lt;script&gt; &amp;"), true);
+    assert.equal(shown.includes("Резюме <script>"), false);
+    assert.equal(shown.includes("Первое резюме"), false);
+    assert.equal(shown.includes("Портфолио склада"), true);
+    assert.equal(shown.includes("Кейс кассы"), true);
+    assert.equal((shown.match(/<textarea name="resume">/g) ?? []).length, 1);
+    assert.deepEqual(trainer.readProfile(), {
+      resume: "Резюме <script> &",
+      portfolio: "Портфолио склада",
+      cases: "Кейс кассы",
+    });
+
+    await fetch(`${base}/customers`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ customerName: "Север", title: "Склад", characters: "" }),
+    });
+    const customerId = trainer.listCases()[0]?.customerId;
+    assert.ok(customerId);
+    await fetch(`${base}/cases`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ customerId, title: "Касса", characters: "Анна" }),
+    });
+    assert.equal(trainer.listCases().length, 2);
+    assert.deepEqual(trainer.readProfile(), {
+      resume: "Резюме <script> &",
+      portfolio: "Портфолио склада",
+      cases: "Кейс кассы",
+    });
+    const afterProjects = await (await fetch(`${base}/profile`)).text();
+    assert.equal(afterProjects, shown);
+
+    const foreign = await fetch(`${base}/profile`, {
+      method: "POST",
+      headers: { ...headers, origin: "https://evil.example" },
+      body: new URLSearchParams({ resume: "чужое", portfolio: "чужое", cases: "чужое" }),
+    });
+    assert.equal(foreign.status, 403);
+    assert.deepEqual(trainer.readProfile(), {
+      resume: "Резюме <script> &",
+      portfolio: "Портфолио склада",
+      cases: "Кейс кассы",
+    });
   } finally {
     await close(server);
   }
