@@ -275,6 +275,9 @@ test("ошибка записи не останавливает веб", async (
     readApprovedDossier() {
       return undefined;
     },
+    readDossier() {
+      return undefined;
+    },
     openSession() {
       return { ok: false, reason: "missing" };
     },
@@ -3039,5 +3042,395 @@ test("черновик с пустыми полями и ошибки сборк
     assert.equal(back.includes('name="keyId"'), false);
   } finally {
     await close(approveServer);
+  }
+});
+
+test("сессия держит досье, с которым её открыли, и реплика со script остаётся текстом", async () => {
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, {
+    async *complete() {
+      yield "Склад принимает паллеты.";
+    },
+  });
+  opened.push(trainer);
+  const secret = "sk-ant-api03-secret-WXYZ";
+  assert.equal(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret,
+    }).ok,
+    true,
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+  assert.equal(saved.ok, true);
+  if (!saved.ok) {
+    return;
+  }
+  const approved = trainer.approveDossier({
+    caseId: saved.caseRecord.id,
+    material: "СТАРОЕ<script>",
+    serviceLayer: "СЛУЖЕБНЫЙ-СЕКРЕТ",
+    crib: "ШПАРГАЛКА-СЕССИИ",
+  });
+  assert.equal(approved.ok, true);
+  if (!approved.ok) {
+    return;
+  }
+  const openedSession = trainer.openSession({
+    caseId: saved.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.equal(openedSession.ok, true);
+  if (!openedSession.ok) {
+    return;
+  }
+  assert.equal(
+    trainer.approveDossier({
+      caseId: saved.caseRecord.id,
+      material: "НОВОЕ-ДОСЬЕ",
+      serviceLayer: "СЛУЖЕБНЫЙ-ПОЗЖЕ",
+      crib: "",
+    }).ok,
+    true,
+  );
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    const page = await (await fetch(`${base}/sessions/${openedSession.session.id}`)).text();
+    assert.match(page, /<section id="session-basis">[\s\S]*СТАРОЕ&lt;script&gt;/);
+    assert.equal(page.includes("НОВОЕ-ДОСЬЕ"), false);
+    assert.equal(page.includes("СЛУЖЕБНЫЙ-СЕКРЕТ"), false);
+    assert.equal(page.includes("ШПАРГАЛКА-СЕССИИ"), false);
+    assert.equal(page.includes(secret), false);
+    assert.equal(page.includes("Сессия помнит ключ: Anthropic — claude-sonnet"), true);
+    assert.equal(page.includes("Персонаж: Анна"), true);
+    assert.equal(page.includes("Роль исполнителя: аналитик"), true);
+    assert.equal(trainer.readSession(openedSession.session.id)?.dossierId, approved.dossier.id);
+
+    const asked = await fetch(`${base}/sessions/${openedSession.session.id}/ask`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ line: "<script>alert(1)</script>" }),
+    });
+    const after = await asked.text();
+    const transcript = after.match(/<ol id="transcript">[\s\S]*?<\/ol>/)?.[0] ?? "";
+    assert.equal(transcript.includes("&lt;script&gt;alert(1)&lt;/script&gt;"), true);
+    assert.equal(transcript.includes("<script>alert(1)</script>"), false);
+    assert.equal(after.includes("<script>alert(1)</script>"), false);
+    assert.equal(after.includes("НОВОЕ-ДОСЬЕ"), false);
+    assert.equal(after.includes("СТАРОЕ&lt;script&gt;"), true);
+  } finally {
+    await close(server);
+  }
+});
+
+test("отказ модели и таймаут видны отдельно от речи, реплика остаётся в поле", async () => {
+  const calls: string[] = [];
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, {
+    async *complete(call) {
+      const line = (call.messages[0]?.text ?? "").split("\n\n").at(-1) ?? "";
+      calls.push(line);
+      if (line === "таймаут") {
+        throw new ModelFailure("timeout");
+      }
+      if (line === "сбой") {
+        yield "Срок ";
+        throw new ModelFailure("model");
+      }
+      yield "речь персонажа";
+    },
+  });
+  opened.push(trainer);
+  const secret = "sk-ant-api03-secret-WXYZ";
+  assert.equal(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret,
+    }).ok,
+    true,
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+  assert.equal(saved.ok, true);
+  if (!saved.ok) {
+    return;
+  }
+  const approved = trainer.approveDossier({
+    caseId: saved.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: "Маржа подрядчика 12%.",
+    crib: "Спросить про сроки.",
+  });
+  assert.equal(approved.ok, true);
+  if (!approved.ok) {
+    return;
+  }
+  const openedSession = trainer.openSession({
+    caseId: saved.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.equal(openedSession.ok, true);
+  if (!openedSession.ok) {
+    return;
+  }
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    const ask = (line: string, accept?: string) =>
+      fetch(`${base}/sessions/${openedSession.session.id}/ask`, {
+        method: "POST",
+        headers: accept ? { ...headers, accept } : headers,
+        body: new URLSearchParams({ line }),
+      });
+
+    const timed = await ask("таймаут");
+    const timedPage = await timed.text();
+    const timedTranscript = timedPage.match(/<ol id="transcript">[\s\S]*?<\/ol>/)?.[0] ?? "";
+    assert.equal(timedPage.includes('<p class="error" id="speech-error">Модель не ответила вовремя.</p>'), true);
+    assert.equal(timedTranscript.includes("Модель не ответила вовремя."), false);
+    assert.equal(timedTranscript.includes("таймаут"), true);
+    assert.match(timedPage, /<textarea name="line" required>таймаут<\/textarea>/);
+    assert.equal(timedPage.includes("речь персонажа"), false);
+    assert.equal(timedPage.includes(secret), false);
+    assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
+    assert.equal(trainer.readReview(openedSession.session.id), undefined);
+
+    const streamed = await ask("сбой", "text/event-stream");
+    const body = await streamed.text();
+    assert.equal(streamed.headers.get("content-type"), "text/event-stream; charset=utf-8");
+    assert.equal(body.includes("data: Срок"), true);
+    assert.equal(body.includes("event: failure\ndata: Модель вернула ошибку."), true);
+    const failedPage = await (await fetch(`${base}/sessions/${openedSession.session.id}`)).text();
+    const failedTranscript = failedPage.match(/<ol id="transcript">[\s\S]*?<\/ol>/)?.[0] ?? "";
+    assert.equal(failedTranscript.includes("Срок"), false);
+    assert.equal(failedTranscript.includes("Модель вернула ошибку."), false);
+    assert.equal(failedTranscript.includes("сбой"), true);
+    assert.match(failedPage, /<textarea name="line" required>сбой<\/textarea>/);
+    assert.match(failedPage, /if \(!failed\) \{\s*remember\("Исполнитель", question\);[\s\S]*field\.value = "";/);
+    assert.equal(calls.includes("таймаут"), true);
+    assert.equal(calls.includes("сбой"), true);
+  } finally {
+    await close(server);
+  }
+});
+
+test("обрыв потока вопроса останавливает модель и оставляет реплику в поле", async () => {
+  let signal: AbortSignal | undefined;
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, {
+    async *complete(_call, incoming) {
+      signal = incoming;
+      yield "Срок ";
+      await new Promise<void>((resolve) => {
+        if (incoming.aborted) {
+          resolve();
+          return;
+        }
+        incoming.addEventListener("abort", () => resolve(), { once: true });
+      });
+    },
+  });
+  opened.push(trainer);
+  assert.equal(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-WXYZ",
+    }).ok,
+    true,
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: ["Анна"] });
+  assert.equal(saved.ok, true);
+  if (!saved.ok) {
+    return;
+  }
+  const approved = trainer.approveDossier({
+    caseId: saved.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: "",
+    crib: "",
+  });
+  assert.equal(approved.ok, true);
+  if (!approved.ok) {
+    return;
+  }
+  const openedSession = trainer.openSession({
+    caseId: saved.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.equal(openedSession.ok, true);
+  if (!openedSession.ok) {
+    return;
+  }
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    await new Promise<void>((resolve) => {
+      const req = httpRequest(
+        {
+          hostname: "127.0.0.1",
+          port: address.port,
+          path: `/sessions/${openedSession.session.id}/ask`,
+          method: "POST",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            origin: `http://127.0.0.1:${address.port}`,
+            accept: "text/event-stream",
+          },
+        },
+        (res) => {
+          res.on("data", () => req.destroy());
+          res.on("error", () => resolve());
+          res.on("close", () => resolve());
+        },
+      );
+      req.on("error", () => resolve());
+      req.end(new URLSearchParams({ line: "Какой срок?" }).toString());
+    });
+    const stopped = await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(signal?.aborted === true), 1000);
+      const mark = (): void => {
+        if (signal?.aborted) {
+          clearTimeout(timer);
+          resolve(true);
+        }
+      };
+      if (signal) {
+        signal.addEventListener("abort", mark, { once: true });
+      }
+      mark();
+    });
+    assert.equal(stopped, true);
+    const page = await (await fetch(`http://127.0.0.1:${address.port}/sessions/${openedSession.session.id}`)).text();
+    const transcript = page.match(/<ol id="transcript">[\s\S]*?<\/ol>/)?.[0] ?? "";
+    assert.equal(transcript.includes("Срок"), false);
+    assert.match(page, /<textarea name="line" required>Какой срок\?<\/textarea>/);
+    assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
+  } finally {
+    await close(server);
+  }
+});
+
+test("сессия не открывается без досье, без ключа и не на стороне заказчика", async () => {
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory);
+  opened.push(trainer);
+  const bare = trainer.saveCase({ customerName: "Север", title: "Пустой склад", characters: ["Анна"] });
+  assert.equal(bare.ok, true);
+  if (!bare.ok) {
+    return;
+  }
+  const saved = trainer.saveCase({ customerName: "Юг", title: "Внедрение склада", characters: ["Анна"] });
+  assert.equal(saved.ok, true);
+  if (!saved.ok) {
+    return;
+  }
+  assert.equal(
+    trainer.approveDossier({
+      caseId: saved.caseRecord.id,
+      material: "Склад принимает паллеты.",
+      serviceLayer: "",
+      crib: "",
+    }).ok,
+    true,
+  );
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    const withoutDossier = await (await fetch(`${base}/cases/${bare.caseRecord.id}`)).text();
+    assert.equal(withoutDossier.includes("Утверждённого досье ещё нет. Сессия не открывается."), true);
+    const refusedDossier = await fetch(`${base}/cases/${bare.caseRecord.id}/session`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ side: "заказчик", character: "Анна", role: "аналитик", keyId: "нет" }),
+    });
+    assert.equal(refusedDossier.status, 404);
+    assert.equal(trainer.listOpenSessions().length, 0);
+
+    const withoutKey = await (await fetch(`${base}/cases/${saved.caseRecord.id}`)).text();
+    assert.equal(withoutKey.includes("Сначала сохраните ключ."), true);
+    assert.equal(withoutKey.includes("Открыть сессию"), false);
+    const refusedKey = await fetch(`${base}/cases/${saved.caseRecord.id}/session`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ side: "заказчик", character: "Анна", role: "аналитик", keyId: "" }),
+    });
+    const refusedKeyPage = await refusedKey.text();
+    assert.equal(refusedKeyPage.includes("Заполните проект, сторону, персонажа, роль исполнителя и ключ."), true);
+    const missingKey = await fetch(`${base}/cases/${saved.caseRecord.id}/session`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ side: "заказчик", character: "Анна", role: "аналитик", keyId: "нет-ключа" }),
+    });
+    const missingKeyPage = await missingKey.text();
+    assert.equal(missingKeyPage.includes("Проект, досье или ключ не найдены."), true);
+    assert.equal(trainer.listOpenSessions().length, 0);
+
+    assert.equal(
+      trainer.saveKey({
+        protocol: "anthropic",
+        baseAddress: "https://api.anthropic.com",
+        modelName: "claude-sonnet",
+        secret: "sk-ant-api03-secret-WXYZ",
+      }).ok,
+      true,
+    );
+    const keyId = trainer.listKeys()[0]?.id;
+    assert.ok(keyId);
+    const wrongSide = await fetch(`${base}/cases/${saved.caseRecord.id}/session`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ side: "внутренняя команда", character: "Анна", role: "аналитик", keyId }),
+    });
+    const wrongSidePage = await wrongSide.text();
+    assert.equal(wrongSidePage.includes("Сессия этой страницы открывается на стороне заказчика."), true);
+    assert.equal(trainer.listOpenSessions().length, 0);
+
+    const wrongRole = await fetch(`${base}/cases/${saved.caseRecord.id}/session`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ side: "заказчик", character: "Анна", role: "дирижёр", keyId }),
+    });
+    const wrongRolePage = await wrongRole.text();
+    assert.equal(wrongRolePage.includes("Выберите роль исполнителя."), true);
+    assert.equal(trainer.listOpenSessions().length, 0);
+  } finally {
+    await close(server);
   }
 });

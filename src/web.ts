@@ -67,6 +67,7 @@ type Trainer = {
   ): Promise<DraftDossierResult>;
   approveDossier(draft: { caseId: string } & DossierLayers): ApproveDossierResult;
   readApprovedDossier(caseId: string): DossierRecord | undefined;
+  readDossier(dossierId: string): DossierRecord | undefined;
   openSession(draft: {
     caseId: string;
     dossierId: string;
@@ -128,6 +129,13 @@ const SESSION_ERROR: Record<Exclude<OpenSessionResult, { ok: true }>["reason"] |
   open: "Сессия этой тройки уже открыта.",
   assignment: "Назначения на этот проект нет.",
   character: "Выберите персонажа заказчика.",
+};
+
+const SPEECH_ERROR: Record<"timeout" | "model" | "missing" | "secret", string> = {
+  timeout: "Модель не ответила вовремя.",
+  model: "Модель вернула ошибку.",
+  missing: "Сессия не найдена.",
+  secret: "Секрет ключа не читается.",
 };
 
 const DRAFT_ERROR: Record<Exclude<DraftDossierResult, { ok: true }>["reason"], string> = {
@@ -274,6 +282,7 @@ function page(title: string, body: string, section: ShellSection): string {
     code { letter-spacing: 0.04em; }
     section { margin: 1.5rem 0; }
     ol { padding-left: 1.2rem; }
+    .session-columns { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(16rem, 0.9fr); gap: 28px; align-items: start; }
     @media (max-width: 1000px) {
       header { padding: 0 24px; }
       main { padding: 28px 24px 50px; }
@@ -287,6 +296,7 @@ function page(title: string, body: string, section: ShellSection): string {
       header { min-height: 54px; padding: 0 16px; }
       main { padding: 24px 16px 40px; }
       h1 { font-size: 25px; }
+      .session-columns { display: block; }
     }
   </style>
 </head>
@@ -851,7 +861,29 @@ function sessionFailureText(reason: string | null, detail: string | null, baseAd
   return "Вызов не дошёл до текста разбора. Проверьте базовый адрес, имя модели и секрет на странице ключей, затем закончите сессию ещё раз. Текст ответа на страницу не выводится. Сессия осталась открытой, разбор не записан.";
 }
 
-function renderSession(trainer: Trainer, session: SessionRecord, error?: string): string {
+/** Реплика, на которую персонаж не ответил. После срыва она остаётся в поле. */
+function unansweredLine(lines: TranscriptLine[]): string {
+  const last = lines.at(-1);
+  if (last?.speaker === "исполнитель" && last.kind === "реплика") {
+    return last.text;
+  }
+  return "";
+}
+
+/** Досье, с которым открыта сессия. Позднее утверждение сюда не подставляется. */
+function sessionBasis(trainer: Trainer, session: SessionRecord, keyLabel: string): string {
+  const dossier = trainer.readDossier(session.dossierId);
+  return `<section id="session-basis">
+    <h2>Утверждённое досье</h2>
+    <p>${escapeHtml(`Сторона: ${session.side}. Персонаж: ${session.character}. Роль исполнителя: ${session.role}.`)}</p>
+    <p>Сессия держит это досье до конца.</p>
+    <h3>Материал проекта</h3>
+    <pre id="session-dossier">${escapeHtml(dossier?.material ?? "")}</pre>
+    <p>${escapeHtml(`Сессия помнит ключ: ${keyLabel}`)}</p>
+  </section>`;
+}
+
+function renderSession(trainer: Trainer, session: SessionRecord, error?: string, speechError?: string): string {
   const item = trainer.readCase(session.caseId);
   const lines = trainer.readTranscript(session.id) ?? [];
   const review = trainer.readReview(session.id);
@@ -865,7 +897,7 @@ function renderSession(trainer: Trainer, session: SessionRecord, error?: string)
     <div id="live"></div>
     <form id="ask" method="post" action="/sessions/${encodeURIComponent(session.id)}/ask">
       <label>Вопрос
-        <textarea name="line" required></textarea>
+        <textarea name="line" required>${escapeHtml(unansweredLine(lines))}</textarea>
       </label>
       <button type="submit">Спросить</button>
     </form>
@@ -877,16 +909,21 @@ function renderSession(trainer: Trainer, session: SessionRecord, error?: string)
     ? `<h2>Разбор</h2>
     <pre id="review">${escapeHtml(review.text)}</pre>`
     : "";
+  const speech = speechError ? `<p class="error" id="speech-error">${escapeHtml(speechError)}</p>` : "";
   return page(
     title,
     `<h1>${escapeHtml(title)}</h1>
-    <p>${escapeHtml(`Сторона: ${session.side}. Персонаж: ${session.character}. Роль исполнителя: ${session.role}.`)}</p>
-    <p>${escapeHtml(`Сессия помнит ключ: ${keyLabel}`)}</p>
-    ${notice(error)}
-    <h2>Стенограмма</h2>
-    ${transcriptList(lines)}
-    ${talk}
-    ${reviewText}
+    <div class="session-columns">
+      <section>
+        <h2>Стенограмма</h2>
+        ${speech}
+        ${notice(error)}
+        ${transcriptList(lines)}
+        ${talk}
+        ${reviewText}
+      </section>
+      ${sessionBasis(trainer, session, keyLabel)}
+    </div>
     ${item ? `<p><a href="${escapeHtml(casePath(item.id))}">К проекту</a></p>` : ""}
     ${open ? sessionScript(session.id, needsOpening) : ""}`,
     "session",
@@ -1378,6 +1415,13 @@ function knownCaseError(reason: string | null): string | undefined {
   return undefined;
 }
 
+function knownSpeechError(reason: string | null): string | undefined {
+  if (reason === "timeout" || reason === "model" || reason === "missing" || reason === "secret") {
+    return SPEECH_ERROR[reason];
+  }
+  return undefined;
+}
+
 function knownSessionError(reason: string | null): string | undefined {
   if (
     reason === "incomplete" ||
@@ -1653,7 +1697,7 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
     }
     const key = trainer.listKeys().find((item) => item.id === open.keyId);
     const message = sessionFailureText(url.searchParams.get("error"), url.searchParams.get("detail"), key?.baseAddress);
-    sendHtml(response, renderSession(trainer, open, message));
+    sendHtml(response, renderSession(trainer, open, message, knownSpeechError(url.searchParams.get("speech"))));
     return;
   }
 
@@ -1905,7 +1949,7 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
     redirect(
       response,
       failureReason
-        ? `/sessions/${encodeURIComponent(open.id)}?error=${failureReason}`
+        ? `/sessions/${encodeURIComponent(open.id)}?speech=${failureReason}`
         : `/sessions/${encodeURIComponent(open.id)}`,
     );
     return;
