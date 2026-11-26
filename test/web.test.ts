@@ -2569,3 +2569,131 @@ test("обзор читает установку, а ключ и прокси о
     await close(server);
   }
 });
+
+test("раздел проектов показывает проекты установки и записывает их существующей формой", async () => {
+  const trainer = start(tempDirectory());
+  const server = await startWeb(trainer);
+  const mockupPhrases = [
+    "Внедрение системы учёта",
+    "Северная компания",
+    "Пример проекта",
+    "демоданные",
+    "Это демонстрационный проект",
+    "В примере форма не создаёт",
+    "Демонстрация",
+  ];
+  const withoutMockup = (html: string): void => {
+    for (const phrase of mockupPhrases) {
+      assert.equal(html.includes(phrase), false);
+    }
+  };
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+
+    const empty = await (await fetch(`${base}/cases`)).text();
+    assertShell(empty, "Проекты");
+    assert.equal(empty.includes("Проектов пока нет."), true);
+    assert.match(empty, /<form method="post" action="\/customers">/);
+    assert.match(empty, /<textarea name="characters"><\/textarea>/);
+    assert.equal(empty.includes("по одному в строке"), true);
+    assert.equal(empty.includes("Сначала заведите заказчика."), true);
+    assert.equal(empty.includes('<form method="post" action="/cases">'), false);
+    withoutMockup(empty);
+
+    const blank = await fetch(`${base}/customers`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ customerName: "  ", title: "Касса", characters: "Анна" }),
+    });
+    assert.equal(blank.status, 303);
+    assert.equal(blank.headers.get("location"), "/cases?error=incomplete");
+    assert.equal(trainer.listCases().length, 0);
+    assert.equal(trainer.listCustomers().length, 0);
+    const blankPage = await (await fetch(`${base}${blank.headers.get("location")}`)).text();
+    assertShell(blankPage, "Проекты");
+    assert.equal(blankPage.includes("Проектов пока нет."), true);
+    assert.equal(blankPage.includes("Укажите заказчика и название проекта."), true);
+    assert.equal(blankPage.includes("Касса"), false);
+    assert.match(blankPage, /<form method="post" action="\/customers">/);
+
+    const created = await fetch(`${base}/customers`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ customerName: "Север", title: "Пустой склад", characters: " \n " }),
+    });
+    assert.equal(created.status, 303);
+    const first = trainer.listCases()[0];
+    assert.ok(first);
+    assert.equal(created.headers.get("location"), `/cases/${first.id}`);
+    assert.deepEqual(first.characters, []);
+    assert.deepEqual(trainer.listCustomers(), [{ id: first.customerId, name: "Север" }]);
+    const opened = await (await fetch(`${base}${created.headers.get("location")}`)).text();
+    assert.equal(opened.includes("Голоса заказчика: заказчик"), true);
+    assert.equal(opened.includes("Пустой склад"), true);
+
+    const listed = await (await fetch(`${base}/cases`)).text();
+    assert.equal(listed.includes("Проектов пока нет."), false);
+    assert.equal(listed.includes("Пустой склад"), true);
+    assert.equal(listed.includes(`/cases/${first.id}`), true);
+    assert.match(listed, /<form method="post" action="\/cases">/);
+    assert.match(listed, new RegExp(`<option value="${first.customerId}">Север</option>`));
+    withoutMockup(listed);
+
+    const untitled = await fetch(`${base}/cases`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ customerId: first.customerId, title: "   ", characters: "Анна" }),
+    });
+    assert.equal(untitled.status, 303);
+    assert.equal(untitled.headers.get("location"), "/cases?error=incomplete");
+    assert.equal(trainer.listCases().length, 1);
+    const untitledPage = await (await fetch(`${base}${untitled.headers.get("location")}`)).text();
+    assertShell(untitledPage, "Проекты");
+    assert.equal(untitledPage.includes("Укажите заказчика и название проекта."), true);
+    assert.equal(untitledPage.includes("Пустой склад"), true);
+
+    const second = await fetch(`${base}/cases`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({
+        customerId: first.customerId,
+        title: "Касса",
+        characters: "Анна\nБорис",
+      }),
+    });
+    assert.equal(second.status, 303);
+    const added = trainer.listCases().find((item) => item.title === "Касса");
+    assert.ok(added);
+    assert.equal(second.headers.get("location"), `/cases/${added.id}`);
+    assert.equal(added.customerId, first.customerId);
+    assert.deepEqual(added.characters, ["Анна", "Борис"]);
+    assert.deepEqual(trainer.listCustomers(), [{ id: first.customerId, name: "Север" }]);
+    const addedPage = await (await fetch(`${base}${second.headers.get("location")}`)).text();
+    assert.equal(addedPage.includes("Голоса заказчика: Анна, Борис"), true);
+
+    const both = await (await fetch(`${base}/cases`)).text();
+    assert.equal(both.includes("Пустой склад"), true);
+    assert.equal(both.includes("Касса"), true);
+    assert.equal(both.includes("Север"), true);
+    assert.equal((both.match(/<option /g) ?? []).length, 1);
+    withoutMockup(both);
+
+    const foreign = await fetch(`${base}/cases`, {
+      method: "POST",
+      headers: { ...headers, origin: "https://evil.example" },
+      body: new URLSearchParams({ customerId: first.customerId, title: "Чужой проект", characters: "" }),
+    });
+    assert.equal(foreign.status, 403);
+    assert.equal(trainer.listCases().length, 2);
+    assert.equal(trainer.listCustomers().length, 1);
+  } finally {
+    await close(server);
+  }
+});
