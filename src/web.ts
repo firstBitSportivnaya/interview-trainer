@@ -305,7 +305,7 @@ function page(title: string, body: string, section: ShellSection): string {
     .message { display: flex; gap: 10px; max-width: 80%; margin: 12px 0; }
     .message.mine { margin-left: auto; flex-direction: row-reverse; }
     .message .avatar { width: 32px; height: 32px; flex: none; display: grid; place-items: center; border-radius: 10px; background: var(--soft); color: var(--purple); font-weight: 800; }
-    .bubble { background: #f4f5f8; border-radius: 14px; padding: 10px 14px; }
+    .bubble { background: #f4f5f8; border-radius: 14px; padding: 10px 14px; min-width: 0; overflow-wrap: anywhere; }
     .message.mine .bubble { background: var(--soft); }
     .who { display: block; font-size: 12px; font-weight: 700; color: var(--muted); }
     .chat-form form { display: flex; gap: 8px; align-items: flex-end; border: 1px solid var(--line); border-radius: 14px; padding: 8px; }
@@ -885,15 +885,17 @@ function transcriptList(lines: TranscriptLine[]): string {
     return `<p id="empty-transcript">Стенограмма пока пуста.</p>`;
   }
   return `<ol id="transcript">${lines
-    .map((line) => bubbleItem(line.speaker === "персонаж" ? "Персонаж" : "Исполнитель", escapeHtml(line.text)))
+    .map((line) =>
+      bubbleItem(line.speaker === "персонаж" ? "Персонаж" : "Исполнитель", escapeHtml(line.text), line.kind),
+    )
     .join("")}</ol>`;
 }
 
 /** Пузырь стенограммы. Текст уже экранирован. */
-function bubbleItem(who: string, htmlText: string): string {
+function bubbleItem(who: string, htmlText: string, kind: TranscriptLine["kind"]): string {
   const mine = who === "Исполнитель" ? " mine" : "";
   const letter = who === "Исполнитель" ? "И" : "П";
-  return `<li class="message${mine}"><span class="avatar" aria-hidden="true">${letter}</span><div class="bubble"><span class="who">${who}</span> ${htmlText}</div></li>`;
+  return `<li class="message${mine}" data-kind="${kind}"><span class="avatar" aria-hidden="true">${letter}</span><div class="bubble"><span class="who">${who}</span> ${htmlText}</div></li>`;
 }
 
 /** Поток первого вопроса и вопрос исполнителя. Текст реплики в скрипт не подставляется. */
@@ -905,11 +907,25 @@ function sessionScript(sessionId: string, needsOpening: boolean): string {
     const field = form.querySelector("textarea");
     const openingUrl = ${JSON.stringify(`/sessions/${encodeURIComponent(sessionId)}/opening`)};
     let asking = false;
-    function remember(who, text) {
+    function unansweredShown(list, text) {
+      const items = list.children;
+      for (let i = items.length - 1; i >= 0; i--) {
+        const kind = items[i].getAttribute("data-kind");
+        if (kind === "ответ") return false;
+        if (kind === "вопрос") continue;
+        if (kind === "реплика") {
+          const bubble = items[i].querySelector(".bubble");
+          return bubble !== null && bubble.textContent === "Исполнитель " + text;
+        }
+      }
+      return false;
+    }
+    function remember(who, text, kind) {
       if (!text) return;
+      let list = document.getElementById("transcript");
+      if (kind === "реплика" && list && unansweredShown(list, text)) return;
       const empty = document.getElementById("empty-transcript");
       if (empty) empty.remove();
-      let list = document.getElementById("transcript");
       if (!list) {
         list = document.createElement("ol");
         list.id = "transcript";
@@ -917,6 +933,7 @@ function sessionScript(sessionId: string, needsOpening: boolean): string {
       }
       const item = document.createElement("li");
       item.className = "message" + (who === "Исполнитель" ? " mine" : "");
+      item.setAttribute("data-kind", kind);
       const avatar = document.createElement("span");
       avatar.className = "avatar";
       avatar.setAttribute("aria-hidden", "true");
@@ -960,7 +977,7 @@ function sessionScript(sessionId: string, needsOpening: boolean): string {
       if (openingFailed) return;
       const spoken = openingBox.textContent;
       openingBox.textContent = "";
-      remember("Персонаж", spoken);
+      remember("Персонаж", spoken, "вопрос");
     });`
         : ""
     }
@@ -991,10 +1008,10 @@ function sessionScript(sessionId: string, needsOpening: boolean): string {
           });
         }
         if (!failed) {
-          remember("Исполнитель", question);
+          remember("Исполнитель", question, "реплика");
           const answer = live.textContent;
           live.textContent = "";
-          remember("Персонаж", answer);
+          remember("Персонаж", answer, "ответ");
           field.value = "";
         }
         asking = false;
@@ -1048,11 +1065,19 @@ function sessionFailureText(reason: string | null, detail: string | null, baseAd
   return "Вызов не дошёл до текста разбора. Проверьте базовый адрес, имя модели и секрет на странице ключей, затем закончите сессию ещё раз. Текст ответа на страницу не выводится. Сессия осталась открытой, разбор не записан.";
 }
 
-/** Реплика, на которую персонаж не ответил. После срыва она остаётся в поле. */
+/** Реплика, на которую персонаж не ответил. Вопрос персонажа между попытками поле не очищает. */
 function unansweredLine(lines: TranscriptLine[]): string {
-  const last = lines.at(-1);
-  if (last?.speaker === "исполнитель" && last.kind === "реплика") {
-    return last.text;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (!line) {
+      continue;
+    }
+    if (line.speaker === "персонаж" && line.kind === "ответ") {
+      return "";
+    }
+    if (line.speaker === "исполнитель" && line.kind === "реплика") {
+      return line.text;
+    }
   }
   return "";
 }

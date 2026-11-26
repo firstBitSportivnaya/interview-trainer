@@ -1458,6 +1458,86 @@ test("таймаут и ошибка модели не становятся ре
   assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
 });
 
+test("вопрос персонажа между попытками не даёт записать ту же реплику второй раз", async () => {
+  let asks = 0;
+  const trainer = start(tempDirectory(), {
+    async *complete(call) {
+      const task = (call.messages[0]?.text ?? "").split("\n\n").at(-1) ?? "";
+      if (task === "ещё раз") {
+        asks += 1;
+        if (asks < 3) {
+          throw new ModelFailure("timeout");
+        }
+        yield "речь";
+        return;
+      }
+      if (task.startsWith("Задай один вопрос")) {
+        yield "Как принимаете паллеты?";
+        return;
+      }
+      yield "речь";
+    },
+  });
+  const prepared = prepare(trainer);
+  const openedSession = openAnalyst(trainer, prepared);
+  assert.ok(openedSession.ok);
+
+  await take(trainer.reply(openedSession.session.id, "ещё раз"));
+  await take(trainer.openingQuestion(openedSession.session.id));
+  await take(trainer.reply(openedSession.session.id, "ещё раз"));
+  const lines = trainer.readTranscript(openedSession.session.id) ?? [];
+  assert.equal(lines.filter((line) => line.text === "ещё раз").length, 1);
+  assert.equal(lines.some((line) => line.kind === "вопрос"), true);
+  assert.equal(lines.some((line) => line.kind === "ответ"), false);
+
+  await take(trainer.reply(openedSession.session.id, "ещё раз"));
+  const answered = trainer.readTranscript(openedSession.session.id) ?? [];
+  assert.equal(answered.filter((line) => line.speaker === "исполнитель" && line.text === "ещё раз").length, 1);
+  assert.equal(answered.filter((line) => line.kind === "ответ").length, 1);
+
+  await take(trainer.reply(openedSession.session.id, "ещё раз"));
+  const again = trainer.readTranscript(openedSession.session.id) ?? [];
+  assert.equal(again.filter((line) => line.speaker === "исполнитель" && line.text === "ещё раз").length, 2);
+  assert.equal(again.filter((line) => line.kind === "ответ").length, 2);
+});
+
+test("два одновременных одинаковых вопроса оба остаются в стенограмме", { timeout: 5000 }, async () => {
+  let entered = 0;
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const trainer = start(tempDirectory(), {
+    async *complete() {
+      entered += 1;
+      await gate;
+      yield "речь";
+    },
+  });
+  const prepared = prepare(trainer);
+  const openedSession = openAnalyst(trainer, prepared);
+  assert.ok(openedSession.ok);
+
+  const first = trainer.reply(openedSession.session.id, "один")[Symbol.asyncIterator]();
+  const started = first.next();
+  for (let attempt = 0; attempt < 50 && entered < 1; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(entered, 1);
+  const second = trainer.reply(openedSession.session.id, "один")[Symbol.asyncIterator]();
+  const secondStarted = second.next();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(entered, 1);
+  release();
+  assert.deepEqual((await started).value, { kind: "speech", text: "речь" });
+  assert.equal((await first.next()).done, true);
+  assert.deepEqual((await secondStarted).value, { kind: "speech", text: "речь" });
+  assert.equal((await second.next()).done, true);
+  const lines = trainer.readTranscript(openedSession.session.id) ?? [];
+  assert.equal(lines.filter((line) => line.speaker === "исполнитель" && line.text === "один").length, 2);
+  assert.equal(lines.filter((line) => line.kind === "ответ").length, 2);
+});
+
 test("оборванная фраза персонажа не попадает в стенограмму", async () => {
   const trainer = start(tempDirectory(), {
     async *complete() {

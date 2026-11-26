@@ -2141,6 +2141,24 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     );
   }
 
+  /** Та же реплика исполнителя, после которой персонаж ещё не ответил. Вопрос персонажа ответом не считается. */
+  function sameUnanswered(sessionId: string, text: string): boolean {
+    const rows = readTranscriptRows(sessionId);
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+      const row = rows[index];
+      if (!row) {
+        continue;
+      }
+      if (row.speaker === "персонаж" && row.kind === "ответ") {
+        return false;
+      }
+      if (row.speaker === "исполнитель" && row.kind === "реплика") {
+        return row.text === text;
+      }
+    }
+    return false;
+  }
+
   function appendTranscript(sessionId: string, speaker: TranscriptSpeaker, kind: TranscriptKind, text: string): void {
     const row = database
       .prepare("SELECT COALESCE(MAX(ordinal), 0) AS ordinal FROM transcript WHERE session_id = ?")
@@ -2709,6 +2727,8 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
   let closed = false;
   /** Сессии, у которых первый вопрос уже пошёл к модели и ещё не записан. */
   const openingReservations = new Set<string>();
+  /** Хвост очереди вопросов сессии. Пока предыдущий ход не записан, следующий его реплику повтором срыва не считает. */
+  const replyTail = new Map<string, Promise<void>>();
   /** Сессии, у которых разбор уже пошёл к модели и ещё не записан. */
   const finishing = new Set<string>();
 
@@ -3484,6 +3504,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
      * Исполнитель может спросить, не дожидаясь вопроса персонажа.
      * Речь приходит кусками. Ошибка модели в речь не подмешивается.
      * signal обрывает генерацию, когда страница закрыла поток.
+     * Вопросы одной сессии идут по очереди, чтобы ход, который ещё идёт, не считался повтором срыва.
      */
     async *reply(sessionId: string, line: string, signal?: AbortSignal): AsyncIterable<SpeechEvent> {
       const session = loadSession(sessionId);
@@ -3498,21 +3519,37 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       if (!text) {
         return;
       }
-      const task = characterTask(session, text, await fragmentsForTurn(session, text));
-      if (!task.ok) {
-        yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
-        return;
-      }
-      const pending = readTranscriptRows(session.id).at(-1);
-      const sameUnanswered =
-        pending?.speaker === "исполнитель" && pending.kind === "реплика" && pending.text === text;
-      if (!sameUnanswered) {
-        appendTranscript(session.id, "исполнитель", "реплика", text);
-      }
-      const spoken = { text: "", failed: false };
-      yield* streamKey(session, [{ role: "user", text: task.text }], spoken, signal);
-      if (!spoken.failed && spoken.text && !signal?.aborted) {
-        appendTranscript(session.id, "персонаж", "ответ", spoken.text);
+      const previous = replyTail.get(session.id) ?? Promise.resolve();
+      let release = (): void => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const tail = previous.then(() => gate);
+      replyTail.set(session.id, tail);
+      try {
+        await previous;
+        const current = loadSession(session.id);
+        if (!current || current.status !== "open") {
+          return;
+        }
+        const task = characterTask(current, text, await fragmentsForTurn(current, text));
+        if (!task.ok) {
+          yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
+          return;
+        }
+        if (!sameUnanswered(current.id, text)) {
+          appendTranscript(current.id, "исполнитель", "реплика", text);
+        }
+        const spoken = { text: "", failed: false };
+        yield* streamKey(current, [{ role: "user", text: task.text }], spoken, signal);
+        if (!spoken.failed && spoken.text && !signal?.aborted) {
+          appendTranscript(current.id, "персонаж", "ответ", spoken.text);
+        }
+      } finally {
+        release();
+        if (replyTail.get(session.id) === tail) {
+          replyTail.delete(session.id);
+        }
       }
     },
 

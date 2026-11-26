@@ -3225,6 +3225,16 @@ test("отказ модели и таймаут видны отдельно от
     assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
     assert.equal(trainer.readReview(openedSession.session.id), undefined);
 
+    for await (const event of trainer.openingQuestion(openedSession.session.id)) {
+      assert.equal(event.kind, "speech");
+    }
+    const withQuestion = await (await fetch(`${base}/sessions/${openedSession.session.id}`)).text();
+    assert.match(withQuestion, /<textarea name="line" required>таймаут<\/textarea>/);
+    assert.equal(
+      trainer.readTranscript(openedSession.session.id)?.filter((line) => line.kind === "вопрос").length,
+      1,
+    );
+
     const repeated = await ask("таймаут");
     const repeatedPage = await repeated.text();
     assert.equal(
@@ -3244,7 +3254,7 @@ test("отказ модели и таймаут видны отдельно от
     assert.equal(failedTranscript.includes("Модель вернула ошибку."), false);
     assert.equal(failedTranscript.includes("сбой"), true);
     assert.match(failedPage, /<textarea name="line" required>сбой<\/textarea>/);
-    assert.match(failedPage, /if \(!failed\) \{\s*remember\("Исполнитель", question\);[\s\S]*field\.value = "";/);
+    assert.match(failedPage, /if \(!failed\) \{\s*remember\("Исполнитель", question, "реплика"\);[\s\S]*field\.value = "";/);
     assert.equal(calls.includes("таймаут"), true);
     assert.equal(calls.includes("сбой"), true);
     const answered = await ask("ещё раз");
