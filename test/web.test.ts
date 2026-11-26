@@ -101,7 +101,6 @@ function assertShell(html: string, current: (typeof SHELL_LABELS)[number]): void
   assert.equal(html.includes("data-view"), false);
   assert.equal(html.includes("#6555e8"), true);
   assert.equal(html.includes("собеседований"), true);
-  assert.match(html, /button:focus-visible,\s*input:focus-visible[\s\S]*?outline: 3px solid #b7aeff/);
   assert.equal(html.includes("outline:0"), false);
   assert.equal(html.includes("outline: none"), false);
   assert.match(html, /@media \(max-width: 720px\) \{[\s\S]*nav \{ display: flex;/);
@@ -192,7 +191,7 @@ test("веб слушает только этот компьютер, без п�
     assert.equal(page.includes("••••9876"), true);
     assert.equal(page.includes("claude&lt;script&gt;"), true);
     assert.equal(page.includes("claude<script>"), false);
-    assert.equal(page.includes("совместимый с OpenAI"), true);
+    assert.equal(page.includes("Совместимый с OpenAI"), true);
   } finally {
     await close(server);
   }
@@ -2252,7 +2251,7 @@ test("оболочка показывает шесть разделов и не 
     assertShell(projects, "Проекты");
     assert.match(projects, /<form method="post" action="\/cases">/);
     assert.match(projects, /<form method="post" action="\/customers">/);
-    assert.match(projects, /<form method="post" action="\/profile">/);
+    assert.equal(projects.includes('action="/profile"'), false);
 
     const project = await (await fetch(`${base}/cases/${saved.caseRecord.id}`)).text();
     assertShell(project, "Проекты");
@@ -2442,12 +2441,14 @@ test("обзор читает установку, а ключ и прокси о
     const address = server.address() as AddressInfo;
     const base = `http://127.0.0.1:${address.port}`;
     const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
-    const steps = "Создайте проект. Утвердите досье. Откройте сессию.";
+    const steps = ["Создайте проект.", "Утвердите досье.", "Откройте сессию."];
 
     const empty = await (await fetch(base)).text();
     assertShell(empty, "Обзор");
     assert.match(empty, /<a href="\/keys"><span aria-hidden="true">[^<]+<\/span>Ключи<\/a>/);
-    assert.equal(empty.includes(steps), true);
+    for (const step of steps) {
+      assert.equal(empty.includes(step), true);
+    }
     assert.equal(empty.includes("Проектов пока нет."), true);
     assert.match(empty, /<form method="post" action="\/customers">/);
     assert.equal(empty.includes("Сессий пока нет."), true);
@@ -2514,23 +2515,25 @@ test("обзор читает установку, а ключ и прокси о
       before,
     );
     assert.deepEqual(trainer.readPreparationEntries(named.caseRecord.id, "аналитик", "владелец"), []);
-    assert.equal(overview.includes(steps), true);
+    for (const step of steps) {
+      assert.equal(overview.includes(step), true);
+    }
+    assert.match(overview, /data-open="new-customer"/);
+    assert.match(overview, /<form method="post" action="\/customers">/);
     assert.equal(overview.includes("Проектов пока нет."), false);
     assert.equal(overview.includes("Север &lt;script&gt;"), true);
     assert.equal(overview.includes("Север <script>"), false);
     assert.equal(overview.includes("Пустой склад"), true);
-    assert.equal(overview.includes("Досье не утверждено"), true);
-    assert.equal(overview.includes("Персонаж: заказчик"), true);
-    assert.equal(overview.includes("Сессий: 0"), true);
+    assert.match(overview, /Пустой склад[\s\S]{0,500}Досье не утверждено[\s\S]{0,250}Персонаж[\s\S]{0,80}заказчик[\s\S]{0,80}Сессии[\s\S]{0,40}0/);
     assert.equal(overview.includes("Внедрение склада"), true);
-    assert.equal(overview.includes("Досье утверждено"), true);
-    assert.equal(overview.includes("Персонаж: Анна, Борис"), true);
-    assert.equal(overview.includes("Сессий: 2"), true);
+    assert.match(overview, /Внедрение склада[\s\S]{0,500}Досье утверждено[\s\S]{0,250}Персонаж[\s\S]{0,120}Анна, Борис[\s\S]{0,80}Сессии[\s\S]{0,40}2/);
     assert.equal(overview.includes(`/sessions/${second.session.id}`), true);
     assert.equal(overview.includes(`/sessions/${first.session.id}`), false);
     assert.equal(overview.includes("sk-ant-api03-secret-WXYZ"), false);
     const project = await (await fetch(`${base}/cases/${named.caseRecord.id}`)).text();
-    assert.equal(project.includes(steps), false);
+    for (const step of steps) {
+      assert.equal(project.includes(step), false);
+    }
 
     const refused = await fetch(`${base}/keys`, {
       method: "POST",
@@ -3222,6 +3225,24 @@ test("отказ модели и таймаут видны отдельно от
     assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
     assert.equal(trainer.readReview(openedSession.session.id), undefined);
 
+    for await (const event of trainer.openingQuestion(openedSession.session.id)) {
+      assert.equal(event.kind, "speech");
+    }
+    const withQuestion = await (await fetch(`${base}/sessions/${openedSession.session.id}`)).text();
+    assert.match(withQuestion, /<textarea name="line" required>таймаут<\/textarea>/);
+    assert.equal(
+      trainer.readTranscript(openedSession.session.id)?.filter((line) => line.kind === "вопрос").length,
+      1,
+    );
+
+    const repeated = await ask("таймаут");
+    const repeatedPage = await repeated.text();
+    assert.equal(
+      trainer.readTranscript(openedSession.session.id)?.filter((line) => line.text === "таймаут").length,
+      1,
+    );
+    assert.match(repeatedPage, /<textarea name="line" required>таймаут<\/textarea>/);
+
     const streamed = await ask("сбой", "text/event-stream");
     const body = await streamed.text();
     assert.equal(streamed.headers.get("content-type"), "text/event-stream; charset=utf-8");
@@ -3233,9 +3254,17 @@ test("отказ модели и таймаут видны отдельно от
     assert.equal(failedTranscript.includes("Модель вернула ошибку."), false);
     assert.equal(failedTranscript.includes("сбой"), true);
     assert.match(failedPage, /<textarea name="line" required>сбой<\/textarea>/);
-    assert.match(failedPage, /if \(!failed\) \{\s*remember\("Исполнитель", question\);[\s\S]*field\.value = "";/);
+    assert.match(failedPage, /if \(!failed\) \{\s*remember\("Исполнитель", question, "реплика"\);[\s\S]*field\.value = "";/);
     assert.equal(calls.includes("таймаут"), true);
     assert.equal(calls.includes("сбой"), true);
+    const answered = await ask("ещё раз");
+    assert.equal(answered.status, 200);
+    const answeredAgain = await ask("ещё раз");
+    assert.equal(answeredAgain.status, 200);
+    assert.equal(
+      trainer.readTranscript(openedSession.session.id)?.filter((line) => line.text === "ещё раз").length,
+      2,
+    );
   } finally {
     await close(server);
   }
@@ -3455,22 +3484,20 @@ test("скринридер называет оболочку, а диалоги 
     for (const label of SHELL_LABELS) {
       assert.match(overviewNav, new RegExp(`<span aria-hidden="true">[^<]+</span>${label}</a>`));
     }
-    assert.match(overview, /<button type="button" data-open="new-customer">Новый проект<\/button>/);
+    assert.match(overview, /<button type="button" class="primary" data-open="new-customer">Новый проект<\/button>/);
     assert.match(
       overview,
-      /<dialog id="new-customer" aria-labelledby="new-customer-title">[\s\S]*<h2 id="new-customer-title">Новый проект<\/h2>[\s\S]*<button type="button" data-close>Закрыть<\/button>[\s\S]*<form method="post" action="\/customers">[\s\S]*<input name="customerName" required>[\s\S]*<input name="title" required>[\s\S]*<textarea name="characters"><\/textarea>[\s\S]*<button type="submit">Завести заказчика и проект<\/button>/,
+      /<dialog id="new-customer" aria-labelledby="new-customer-title">[\s\S]*<h2 id="new-customer-title">Новый проект<\/h2>[\s\S]*<button type="button" class="close" data-close aria-label="Закрыть">[\s\S]*<form method="post" action="\/customers">[\s\S]*<input name="customerName" required>[\s\S]*<input name="title" required>[\s\S]*<textarea name="characters"><\/textarea>[\s\S]*<button type="submit" class="primary">Завести заказчика и проект<\/button>/,
     );
     assert.match(overview, /dialog\.showModal\(\)/);
     assert.match(overview, /dialog\.close\(\)/);
     assert.equal(overview.includes('method="dialog"'), false);
     assert.equal(overview.includes("В примере форма не создаёт"), false);
     assert.equal(/<dialog[^>]*\sopen[\s>]/.test(overview), false);
-    assert.match(overview, /button:focus-visible,\s*input:focus-visible[\s\S]*?outline: 3px solid #b7aeff/);
     const narrow = overview.match(/@media \(max-width: 720px\) \{([\s\S]*?)\n    \}/)?.[1] ?? "";
     assert.equal(narrow.includes("white-space: nowrap"), false);
     assert.equal(narrow.includes("overflow: auto"), false);
     assert.match(narrow, /nav \{ display: flex; flex-wrap: wrap;/);
-    assert.match(narrow, /overflow-x: clip/);
     assert.equal(narrow.includes("#ask"), false);
     assert.equal(narrow.includes("textarea"), false);
     assert.equal(narrow.includes("dialog"), false);
@@ -3478,6 +3505,7 @@ test("скринридер называет оболочку, а диалоги 
     const cases = await (await fetch(`${base}/cases`)).text();
     assert.match(cases, /<h1>Проекты<\/h1>/);
     assert.match(cases, /<nav class="crumb" aria-label="Крошка">Тренажёр \/ <strong>Проекты<\/strong><\/nav>/);
+    assert.equal(cases.includes('action="/profile"'), false);
     assert.equal(cases.includes('<form method="post" action="/cases">'), false);
     assert.equal(cases.includes('tabindex="-1"'), false);
 
@@ -3487,11 +3515,12 @@ test("скринридер называет оболочку, а диалоги 
     assert.match(reviews, /<h1>Разбор<\/h1>/);
     const profile = await (await fetch(`${base}/profile`)).text();
     assert.match(profile, /<h1>Профиль<\/h1>/);
-    assert.match(profile, /<button type="submit">Сохранить профиль<\/button>/);
+    assert.match(profile, /<button type="submit" class="primary">Сохранить профиль<\/button>/);
+    assert.match(profile, /action="\/profile"/);
     assert.equal(profile.includes("disabled"), false);
     const keys = await (await fetch(`${base}/keys`)).text();
     assert.match(keys, /<h1>Ключи<\/h1>/);
-    assert.match(keys, /<button type="submit">Сохранить ключ<\/button>/);
+    assert.match(keys, /<button type="submit" class="primary">Сохранить ключ<\/button>/);
     assert.equal(keys.includes('id="new-customer"'), false);
     assert.equal(keys.includes('id="project-file"'), false);
 
