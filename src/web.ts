@@ -180,20 +180,54 @@ function escapeHtml(value: string): string {
     .replaceAll('"', "&quot;");
 }
 
-function page(title: string, body: string): string {
+type ShellSection = "overview" | "projects" | "session" | "review" | "profile" | "keys";
+
+/** Разделы оболочки. «Обзор» и «Ключи» делят `/`, пока обзор не сменит первую страницу. */
+const SHELL_SECTIONS: Array<{ id: ShellSection; label: string; href: string }> = [
+  { id: "overview", label: "Обзор", href: "/" },
+  { id: "projects", label: "Проекты", href: "/cases" },
+  { id: "session", label: "Сессия", href: "/sessions" },
+  { id: "review", label: "Разбор", href: "/reviews" },
+  { id: "profile", label: "Профиль", href: "/profile" },
+  { id: "keys", label: "Ключи", href: "/" },
+];
+
+/** Оболочка установки: шесть разделов, крошка открытого раздела и подпись локальной установки. */
+function page(title: string, body: string, section: ShellSection): string {
+  const current = SHELL_SECTIONS.find((item) => item.id === section) ?? SHELL_SECTIONS[0];
+  const links = SHELL_SECTIONS.map((item) => {
+    const mark = item.id === section ? ` aria-current="page"` : "";
+    return `<a href="${item.href}"${mark}>${item.label}</a>`;
+  }).join("");
   return `<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(title)}</title>
   <style>
-    body { font: 16px/1.45 system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; color: #1c1917; }
+    body { margin: 0; font: 16px/1.45 system-ui, sans-serif; color: #1c1917; background: #f5f6fa; }
+    .shell { min-height: 100vh; display: grid; grid-template-columns: 15rem minmax(0, 1fr); }
+    aside { background: #fff; border-right: 1px solid #e7e5e4; padding: 1.25rem 1rem; }
+    .brand { margin: 0 0 1rem; font-weight: 700; }
+    nav { display: grid; gap: 0.25rem; }
+    nav a { display: block; padding: 0.55rem 0.75rem; border-radius: 0.6rem; color: #57534e; text-decoration: none; font-weight: 600; }
+    nav a[aria-current="page"] { color: #1c1917; background: #f5f5f4; }
+    header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.75rem; align-items: center; padding: 1rem 1.5rem; background: #fff; border-bottom: 1px solid #e7e5e4; }
+    .crumb { margin: 0; color: #a8a29e; }
+    .crumb strong { color: #44403c; font-weight: 600; }
+    .local { margin: 0; color: #57534e; }
+    main { padding: 1.5rem 2rem 3rem; max-width: 46rem; }
     label { display: block; margin: 0.8rem 0; }
     input, select, textarea { display: block; width: 100%; box-sizing: border-box; margin-top: 0.25rem; padding: 0.4rem; }
     textarea { min-height: 6rem; }
     button { margin-top: 0.5rem; padding: 0.45rem 0.8rem; }
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible,
+    textarea:focus-visible,
+    a:focus-visible { outline: 3px solid #1c1917; outline-offset: 2px; }
     .error { color: #9f1239; }
-    nav a { margin-right: 1rem; }
     li { margin: 0.4rem 0; }
     pre, #live { white-space: pre-wrap; font: inherit; }
     .layers { list-style: none; padding: 0; margin: 1rem 0; }
@@ -209,11 +243,29 @@ function page(title: string, body: string): string {
     code { letter-spacing: 0.04em; }
     section { margin: 1.5rem 0; }
     ol { padding-left: 1.2rem; }
+    @media (max-width: 720px) {
+      .shell { display: block; }
+      nav { display: flex; overflow: auto; }
+      nav a { white-space: nowrap; }
+    }
   </style>
 </head>
 <body>
-  <nav><a href="/">Ключи</a><a href="/cases">Проекты</a></nav>
-  ${body}
+  <div class="shell">
+    <aside>
+      <p class="brand">Тренажёр</p>
+      <nav aria-label="Разделы">${links}</nav>
+    </aside>
+    <div>
+      <header>
+        <p class="crumb">Тренажёр / <strong>${current.label}</strong></p>
+        <p class="local">Локальная установка владельца</p>
+      </header>
+      <main>
+        ${body}
+      </main>
+    </div>
+  </div>
 </body>
 </html>`;
 }
@@ -286,6 +338,7 @@ function renderKeys(keys: KeySummary[], proxy: string | undefined, error?: strin
   </form>
   <h2>Сохранённые</h2>
   ${items}`,
+    "keys",
   );
 }
 
@@ -306,6 +359,36 @@ function renderProfile(profile: OwnerProfile): string {
       <button type="submit">Сохранить профиль</button>
     </form>
   </section>`;
+}
+
+/** Страница профиля. Запись по-прежнему уходит на `/profile` и возвращает к проектам. */
+function renderProfilePage(trainer: Trainer): string {
+  return page("Профиль", `<h1>Профиль</h1>${renderProfile(trainer.readProfile())}`, "profile");
+}
+
+/** Ссылки на сессии. Список сам не открывает последнюю. */
+function sessionLinks(trainer: Trainer, sessions: SessionRecord[]): string {
+  return `<ul>${sessions
+    .map((session) => {
+      const item = trainer.readCase(session.caseId);
+      const title = item ? `${item.customerName} — ${item.title}` : "Сессия";
+      return `<li><a href="/sessions/${encodeURIComponent(session.id)}">${escapeHtml(title)}: ${escapeHtml(session.character)}, ${escapeHtml(session.role)}</a></li>`;
+    })
+    .join("")}</ul>`;
+}
+
+/** Список сессий установки. Сам не открывает последнюю сессию. */
+function renderSessionIndex(trainer: Trainer): string {
+  const sessions = trainer.listSessions();
+  const items = sessions.length === 0 ? "<p>Сессий пока нет.</p>" : sessionLinks(trainer, sessions);
+  return page("Сессия", `<h1>Сессия</h1>${items}`, "session");
+}
+
+/** Список сессий, у которых уже есть разбор. Сам не открывает последнюю. */
+function renderReviewIndex(trainer: Trainer): string {
+  const sessions = trainer.listSessions().filter((session) => trainer.readReview(session.id));
+  const items = sessions.length === 0 ? "<p>Разбора пока нет.</p>" : sessionLinks(trainer, sessions);
+  return page("Разбор", `<h1>Разбор</h1>${items}`, "review");
 }
 
 function renderCases(trainer: Trainer, error?: string): string {
@@ -367,6 +450,7 @@ function renderCases(trainer: Trainer, error?: string): string {
     </section>
     <h2>Все проекты</h2>
     ${items}`,
+    "projects",
   );
 }
 
@@ -681,6 +765,7 @@ function renderSession(trainer: Trainer, session: SessionRecord, error?: string)
     ${reviewText}
     ${item ? `<p><a href="${escapeHtml(casePath(item.id))}">К проекту</a></p>` : ""}
     ${open ? sessionScript(session.id, needsOpening) : ""}`,
+    "session",
   );
 }
 
@@ -1003,6 +1088,7 @@ function renderCase(
       </div>
       ${draftForm}
     </section>`,
+    "projects",
   );
 }
 
@@ -1016,6 +1102,7 @@ function renderDraft(item: CaseRecord, draft: DossierLayers): string {
       ${layerAreas(draft)}
       <button type="submit">Утвердить досье</button>
     </form>`,
+    "projects",
   );
 }
 
@@ -1368,6 +1455,21 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
 
   if (request.method === "GET" && url.pathname === "/cases") {
     sendHtml(response, renderCases(trainer, knownCaseError(url.searchParams.get("error"))));
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/sessions") {
+    sendHtml(response, renderSessionIndex(trainer));
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/reviews") {
+    sendHtml(response, renderReviewIndex(trainer));
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/profile") {
+    sendHtml(response, renderProfilePage(trainer));
     return;
   }
 
