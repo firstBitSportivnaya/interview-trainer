@@ -257,6 +257,7 @@ function page(title: string, body: string, section: ShellSection): string {
     button:hover { border-color: #c8c3f4; }
     button[type="submit"] { background: var(--purple); border-color: var(--purple); color: #fff; }
     button[type="submit"]:hover { background: var(--purple-dark); }
+    button[type="submit"][aria-pressed="true"] { background: var(--soft); color: var(--purple); border-color: var(--purple); }
     .error { color: #9f1239; }
     li { margin: 0.4rem 0; }
     pre, #live { white-space: pre-wrap; font: inherit; }
@@ -570,23 +571,43 @@ function layerAreas(layers: DossierLayers): string {
     </label>`;
 }
 
-function approvedBlock(trainer: Trainer, item: CaseRecord, sessionError?: string): string {
+function chosenLayer(value: string | null): DossierLayerName {
+  if (value === "material" || value === "serviceLayer" || value === "crib") {
+    return value;
+  }
+  return "material";
+}
+
+function projectSessionList(trainer: Trainer, item: CaseRecord): string {
+  const sessions = trainer.listSessions().filter((session) => session.caseId === item.id);
+  if (sessions.length === 0) {
+    return `<p id="project-sessions">Сессий этого проекта пока нет.</p>`;
+  }
+  return `<ul id="project-sessions">${sessions
+    .map((session) => {
+      const label = session.status === "finished" ? "Разбор" : "Стенограмма";
+      return `<li><a href="/sessions/${encodeURIComponent(session.id)}">${label}: ${escapeHtml(session.character)}, ${escapeHtml(session.role)}</a></li>`;
+    })
+    .join("")}</ul>`;
+}
+
+function approvedBlock(trainer: Trainer, item: CaseRecord, sessionError?: string, layer: DossierLayerName = "material"): string {
   const dossier = trainer.readApprovedDossier(item.id);
   if (!dossier) {
-    return "<p>Утверждённого досье ещё нет. Сессия не открывается.</p>";
+    return `<section>
+    <h2>Утверждённое досье</h2>
+    <p>Досье не утверждено</p>
+    <p>Утверждённого досье ещё нет. Сессия не открывается.</p>
+  </section>`;
   }
   const keys = trainer.listKeys();
   const voices = customerVoices(item.characters);
-  const sessions = trainer.listSessions().filter((session) => session.caseId === item.id);
-  const links =
-    sessions.length === 0
-      ? ""
-      : `<ul>${sessions
-          .map((session) => {
-            const label = session.status === "finished" ? "Разбор" : "Стенограмма";
-            return `<li><a href="/sessions/${encodeURIComponent(session.id)}">${label}: ${escapeHtml(session.character)}, ${escapeHtml(session.role)}</a></li>`;
-          })
-          .join("")}</ul>`;
+  const buttons = (Object.entries(LAYER_LABEL) as [DossierLayerName, string][])
+    .map(
+      ([value, label]) =>
+        `<button type="submit" name="layer" value="${value}" aria-pressed="${value === layer ? "true" : "false"}">${escapeHtml(label)}</button>`,
+    )
+    .join("");
   const form =
     keys.length === 0
       ? "<p>Сначала сохраните ключ.</p>"
@@ -620,17 +641,16 @@ function approvedBlock(trainer: Trainer, item: CaseRecord, sessionError?: string
         </form>`;
   return `<section>
     <h2>Утверждённое досье</h2>
-    <h3>Материал проекта</h3>
-    <pre>${escapeHtml(dossier.material)}</pre>
-    <h3>Служебный слой</h3>
-    <pre>${escapeHtml(dossier.serviceLayer)}</pre>
-    <h3>Шпаргалка проекта</h3>
-    <pre>${escapeHtml(dossier.crib)}</pre>
+    <p>Досье утверждено</p>
+    <form method="get" action="${escapeHtml(casePath(item.id))}" aria-label="Слои досье">
+      ${buttons}
+    </form>
+    <h3>${escapeHtml(LAYER_LABEL[layer])}</h3>
+    <pre>${escapeHtml(dossier[layer])}</pre>
+    <p>Сессия читает это досье и держит его до конца. Персонаж заказчика отвечает по материалу проекта.</p>
     <h2>Сессия</h2>
-    <p>Сессия читает это досье. Персонаж заказчика отвечает по материалу проекта.</p>
     ${notice(sessionError)}
     ${form}
-    ${links}
   </section>`;
 }
 
@@ -1141,6 +1161,7 @@ function renderCase(
   sessionError?: string,
   fileError?: string,
   assignmentError?: string,
+  layer: DossierLayerName = "material",
 ): string {
   const keys = trainer.listKeys();
   const draftForm =
@@ -1175,7 +1196,11 @@ function renderCase(
     ${assignmentBlock(trainer, item, assignmentError)}
     ${renderSourceFiles(trainer, item, fileError)}
     ${preparationBlock(trainer, item)}
-    ${approvedBlock(trainer, item, sessionError)}
+    ${approvedBlock(trainer, item, sessionError, layer)}
+    <section>
+      <h2>Сессии проекта</h2>
+      ${projectSessionList(trainer, item)}
+    </section>
     <section>
       <h2>Черновик</h2>
       <p>В модель уходит вставленный текст и текст файлов того же слоя. Черновик сессия не читает.</p>
@@ -1214,13 +1239,19 @@ function renderDraft(item: CaseRecord, draft: DossierLayers): string {
 async function readRawBody(request: IncomingMessage, limit: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let size = 0;
+  let overflow = false;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
     if (size > limit) {
-      throw new Error("body too large");
+      overflow = true;
+      chunks.length = 0;
+      continue;
     }
     chunks.push(buffer);
+  }
+  if (overflow) {
+    throw new Error("body too large");
   }
   return Buffer.concat(chunks);
 }
@@ -1598,6 +1629,7 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
         knownSessionError(url.searchParams.get("sessionError")),
         knownFileError(url.searchParams.get("fileError")),
         knownAssignmentError(url.searchParams.get("assignmentError")),
+        chosenLayer(url.searchParams.get("layer")),
       ),
     );
     return;

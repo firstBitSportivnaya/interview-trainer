@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { deflateRawSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { after, test } from "node:test";
 import type { AddressInfo } from "node:net";
 import { request as httpRequest, type Server } from "node:http";
@@ -2695,5 +2696,348 @@ test("раздел проектов показывает проекты уста
     assert.equal(trainer.listCustomers().length, 1);
   } finally {
     await close(server);
+  }
+});
+
+test("страница проекта переключает слои досье кнопками", async () => {
+  const trainer = start(tempDirectory());
+  assert.equal(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-WXYZ",
+    }).ok,
+    true,
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const saved = trainer.saveCase({
+    customerName: "Север",
+    title: "Склад <script>",
+    characters: ["Анна"],
+  });
+  assert.equal(saved.ok, true);
+  if (!saved.ok) {
+    return;
+  }
+  const emptyCase = trainer.saveCase({ customerName: "Юг", title: "Касса", characters: ["Борис"] });
+  assert.equal(emptyCase.ok, true);
+  if (!emptyCase.ok) {
+    return;
+  }
+  const approved = trainer.approveDossier({
+    caseId: saved.caseRecord.id,
+    material: "факт <script>",
+    serviceLayer: "ТЕКСТ-СЛУЖЕБНЫЙ",
+    crib: "ТЕКСТ-ШПАРГАЛКА",
+  });
+  assert.equal(approved.ok, true);
+  if (!approved.ok) {
+    return;
+  }
+  const otherApproved = trainer.approveDossier({
+    caseId: emptyCase.caseRecord.id,
+    material: "ЧУЖОЕ-ДОСЬЕ",
+    serviceLayer: "",
+    crib: "",
+  });
+  assert.equal(otherApproved.ok, true);
+  if (!otherApproved.ok) {
+    return;
+  }
+  const own = trainer.openSession({
+    caseId: saved.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId,
+  });
+  const other = trainer.openSession({
+    caseId: emptyCase.caseRecord.id,
+    dossierId: otherApproved.dossier.id,
+    side: "заказчик",
+    character: "Борис",
+    role: "разработчик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.equal(own.ok, true);
+  assert.equal(other.ok, true);
+  if (!own.ok || !other.ok) {
+    return;
+  }
+  const bare = trainer.saveCase({ customerName: "Запад", title: "Пустой", characters: [] });
+  assert.equal(bare.ok, true);
+  if (!bare.ok) {
+    return;
+  }
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const page = await (await fetch(`${base}/cases/${saved.caseRecord.id}`)).text();
+    assert.equal(page.includes("Склад &lt;script&gt;"), true);
+    assert.equal(page.includes("Склад <script>"), false);
+    assert.equal(page.includes("Досье утверждено"), true);
+    assert.equal(page.includes("Досье не утверждено"), false);
+    assert.match(
+      page,
+      new RegExp(
+        `<form method="get" action="/cases/${saved.caseRecord.id}" aria-label="Слои досье">[\\s\\S]*<button type="submit" name="layer" value="material" aria-pressed="true">Материал проекта</button>[\\s\\S]*<button type="submit" name="layer" value="serviceLayer" aria-pressed="false">Служебный слой</button>[\\s\\S]*<button type="submit" name="layer" value="crib" aria-pressed="false">Шпаргалка проекта</button>`,
+      ),
+    );
+    assert.equal(page.includes("факт &lt;script&gt;"), true);
+    assert.equal(page.includes("факт <script>"), false);
+    assert.equal(page.includes("ТЕКСТ-СЛУЖЕБНЫЙ"), false);
+    assert.equal(page.includes("ТЕКСТ-ШПАРГАЛКА"), false);
+    assert.equal(page.includes("ЧУЖОЕ-ДОСЬЕ"), false);
+    assert.equal(page.includes("Внедрение системы учёта"), false);
+    assert.equal(page.includes(`/sessions/${own.session.id}`), true);
+    assert.equal(page.includes(`/sessions/${other.session.id}`), false);
+    assert.equal(page.includes('value="material" selected'), false);
+
+    const service = await (await fetch(`${base}/cases/${saved.caseRecord.id}?layer=serviceLayer`)).text();
+    assert.match(
+      service,
+      /<button type="submit" name="layer" value="serviceLayer" aria-pressed="true">Служебный слой<\/button>/,
+    );
+    assert.equal(service.includes("ТЕКСТ-СЛУЖЕБНЫЙ"), true);
+    assert.equal(service.includes("факт &lt;script&gt;"), false);
+    assert.equal(service.includes("ТЕКСТ-ШПАРГАЛКА"), false);
+
+    const crib = await (await fetch(`${base}/cases/${saved.caseRecord.id}?layer=crib`)).text();
+    assert.equal(crib.includes("ТЕКСТ-ШПАРГАЛКА"), true);
+    assert.equal(crib.includes("ТЕКСТ-СЛУЖЕБНЫЙ"), false);
+    assert.equal(crib.includes("факт &lt;script&gt;"), false);
+
+    const invented = await (
+      await fetch(`${base}/cases/${saved.caseRecord.id}?layer=${encodeURIComponent("<script>")}`)
+    ).text();
+    assert.match(
+      invented,
+      /<button type="submit" name="layer" value="material" aria-pressed="true">Материал проекта<\/button>/,
+    );
+    assert.equal(invented.includes("факт &lt;script&gt;"), true);
+    assert.equal(invented.includes('value="<script>"'), false);
+    assert.equal(invented.includes("ТЕКСТ-СЛУЖЕБНЫЙ"), false);
+
+    const blank = await (await fetch(`${base}/cases/${bare.caseRecord.id}`)).text();
+    assert.equal(blank.includes("Досье не утверждено"), true);
+    assert.equal(blank.includes("Утверждённого досье ещё нет. Сессия не открывается."), true);
+    assert.equal(blank.includes("Досье утверждено"), false);
+    assert.equal(blank.includes('<form method="get"'), false);
+    assert.equal(blank.includes("факт &lt;script&gt;"), false);
+    assert.equal(blank.includes("Сессий этого проекта пока нет."), true);
+    assert.equal(blank.includes(`/sessions/${own.session.id}`), false);
+  } finally {
+    await close(server);
+  }
+});
+
+test("черновик с пустыми полями и ошибки сборки оставляют ввод, утверждение возвращает на проект", async () => {
+  const calls: string[] = [];
+  const directory = tempDirectory();
+  const trainer = openTrainer(directory, {
+    async *complete(call) {
+      const text = call.messages[0]?.text ?? "";
+      calls.push(text);
+      if (text.includes("МЕТКА-ТАЙМАУТ")) {
+        throw new ModelFailure("timeout");
+      }
+      if (text.includes("МЕТКА-МОДЕЛЬ")) {
+        throw new ModelFailure("model");
+      }
+      yield JSON.stringify({
+        material: "ЧЕРНОВИК-ИЗ-ФАЙЛА",
+        serviceLayer: "",
+        crib: "",
+      });
+    },
+  });
+  opened.push(trainer);
+  assert.equal(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-WXYZ",
+    }).ok,
+    true,
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const saved = trainer.saveCase({ customerName: "Север", title: "Внедрение склада", characters: [] });
+  assert.equal(saved.ok, true);
+  if (!saved.ok) {
+    return;
+  }
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    const postDraft = (body: Record<string, string>) =>
+      fetch(`${base}/cases/${saved.caseRecord.id}/draft`, {
+        method: "POST",
+        headers,
+        body: new URLSearchParams(body),
+      });
+
+    const empty = await postDraft({ material: "", serviceLayer: "", crib: "", keyId });
+    const emptyPage = await empty.text();
+    assert.equal(empty.status, 200);
+    assert.equal(calls.length, 0);
+    assert.equal(emptyPage.includes("Вставьте текст хотя бы одного слоя и выберите ключ."), true);
+    assert.equal(emptyPage.includes(`value="${keyId}" selected`), true);
+    assert.match(emptyPage, /<textarea name="material"><\/textarea>/);
+    assert.equal(emptyPage.includes("Утвердить досье"), false);
+    assert.equal(trainer.readApprovedDossier(saved.caseRecord.id), undefined);
+
+    assert.ok(trainer.noteUnreadFile({ caseId: saved.caseRecord.id, name: "скан.pdf" }).ok);
+    const unread = await postDraft({ material: "", serviceLayer: "", crib: "", keyId });
+    const unreadPage = await unread.text();
+    assert.equal(unread.status, 200);
+    assert.equal(calls.length, 0);
+    assert.equal(unreadPage.includes("Вставьте текст хотя бы одного слоя и выберите ключ."), true);
+    assert.equal(unreadPage.includes("скан.pdf — не прочитан"), true);
+    assert.equal(trainer.readApprovedDossier(saved.caseRecord.id), undefined);
+
+    assert.ok(
+      trainer.addSourceFile({
+        caseId: saved.caseRecord.id,
+        name: "протокол.txt",
+        layer: "material",
+        extractedText: "ТЕКСТ-ПРОЧИТАННОГО-ФАЙЛА",
+      }).ok,
+    );
+    const drafted = await postDraft({ material: "", serviceLayer: "", crib: "", keyId });
+    const draftPage = await drafted.text();
+    assert.equal(drafted.status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.includes("ТЕКСТ-ПРОЧИТАННОГО-ФАЙЛА"), true);
+    assert.equal(draftPage.includes("Черновик. Сессия его не читает"), true);
+    assert.equal(draftPage.includes("ЧЕРНОВИК-ИЗ-ФАЙЛА"), true);
+    assert.equal(draftPage.includes("Утверждённое досье"), false);
+    assert.equal(draftPage.includes('name="keyId"'), false);
+    assert.match(draftPage, new RegExp(`<form method="post" action="/cases/${saved.caseRecord.id}/approve">`));
+    assert.equal(trainer.readApprovedDossier(saved.caseRecord.id), undefined);
+
+    const kept = "СОХРАНИТЬ-ПОЛЕ";
+    const missing = await postDraft({ material: kept, serviceLayer: "СЛОЙ-2", crib: "СЛОЙ-3", keyId: "нет-ключа" });
+    const missingPage = await missing.text();
+    assert.equal(missingPage.includes("Проект или ключ не найдены."), true);
+    assert.equal(missingPage.includes(`name="material">${kept}</textarea>`), true);
+    assert.equal(missingPage.includes('name="serviceLayer">СЛОЙ-2</textarea>'), true);
+    assert.equal(missingPage.includes('name="crib">СЛОЙ-3</textarea>'), true);
+    assert.equal(missingPage.includes("Утвердить досье"), false);
+    assert.equal(trainer.readApprovedDossier(saved.caseRecord.id), undefined);
+
+    const timed = await postDraft({ material: "МЕТКА-ТАЙМАУТ", serviceLayer: "", crib: "", keyId });
+    const timedPage = await timed.text();
+    assert.equal(timedPage.includes("Модель не ответила вовремя"), true);
+    assert.equal(timedPage.includes('name="material">МЕТКА-ТАЙМАУТ</textarea>'), true);
+    assert.equal(timedPage.includes(`value="${keyId}" selected`), true);
+    assert.equal(timedPage.includes("Утвердить досье"), false);
+    assert.equal(trainer.readApprovedDossier(saved.caseRecord.id), undefined);
+
+    const model = await postDraft({ material: "МЕТКА-МОДЕЛЬ", serviceLayer: "", crib: "", keyId });
+    const modelPage = await model.text();
+    assert.equal(modelPage.includes("Вызов не дошёл до текста черновика."), true);
+    assert.equal(modelPage.includes('name="material">МЕТКА-МОДЕЛЬ</textarea>'), true);
+    assert.equal(modelPage.includes(`value="${keyId}" selected`), true);
+    assert.equal(modelPage.includes("Утвердить досье"), false);
+
+    trainer.close();
+    const database = new DatabaseSync(join(directory, "store.sqlite"));
+    const row = database.prepare("SELECT secret FROM keys WHERE id = ?").get(keyId) as { secret: string };
+    const at = row.secret.length - 5;
+    const flipped = `${row.secret.slice(0, at)}${row.secret[at] === "A" ? "B" : "A"}${row.secret.slice(at + 1)}`;
+    database.prepare("UPDATE keys SET secret = ? WHERE id = ?").run(flipped, keyId);
+    database.close();
+    const again = openTrainer(directory, {
+      async *complete() {
+        yield "не должен вызваться";
+      },
+    });
+    opened.push(again);
+    const secretServer = await startWeb(again);
+    try {
+      const secretAddress = secretServer.address() as AddressInfo;
+      const secretBase = `http://127.0.0.1:${secretAddress.port}`;
+      const secretPage = await (
+        await fetch(`${secretBase}/cases/${saved.caseRecord.id}/draft`, {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded", origin: secretBase },
+          body: new URLSearchParams({ material: "СЕКРЕТ-ПОЛЕ", serviceLayer: "", crib: "", keyId }),
+        })
+      ).text();
+      assert.equal(secretPage.includes("Секрет ключа не читается."), true);
+      assert.equal(secretPage.includes('name="material">СЕКРЕТ-ПОЛЕ</textarea>'), true);
+      assert.equal(secretPage.includes(`value="${keyId}" selected`), true);
+      assert.equal(secretPage.includes("sk-ant"), false);
+      assert.equal(secretPage.includes("Утвердить досье"), false);
+      assert.equal(again.readApprovedDossier(saved.caseRecord.id), undefined);
+    } finally {
+      await close(secretServer);
+    }
+  } finally {
+    await close(server);
+  }
+
+  const approveTrainer = start(tempDirectory());
+  const project = approveTrainer.saveCase({ customerName: "Север", title: "Пустые слои", characters: [] });
+  assert.equal(project.ok, true);
+  if (!project.ok) {
+    return;
+  }
+  const approveServer = await startWeb(approveTrainer);
+  try {
+    const address = approveServer.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    const unknown = await fetch(`${base}/cases/${encodeURIComponent("нет-такого-проекта")}/approve`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ material: "чужое", serviceLayer: "", crib: "" }),
+    });
+    assert.equal(unknown.status, 404);
+
+    const filler = "я".repeat(Math.ceil(TEXT_BODY_LIMIT / 3));
+    const tooBig = await fetch(`${base}/cases/${project.caseRecord.id}/approve`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ material: filler, serviceLayer: "", crib: "" }),
+    });
+    assert.equal(tooBig.status, 413);
+    assert.equal(approveTrainer.readApprovedDossier(project.caseRecord.id), undefined);
+
+    const approved = await fetch(`${base}/cases/${project.caseRecord.id}/approve`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ material: "", serviceLayer: "", crib: "" }),
+    });
+    assert.equal(approved.status, 303);
+    assert.equal(approved.headers.get("location"), `/cases/${project.caseRecord.id}`);
+    assert.equal(approved.headers.get("location")?.includes("keyId"), false);
+    const stored = approveTrainer.readApprovedDossier(project.caseRecord.id);
+    assert.deepEqual(
+      stored && { material: stored.material, serviceLayer: stored.serviceLayer, crib: stored.crib },
+      { material: "", serviceLayer: "", crib: "" },
+    );
+    const back = await (await fetch(`${base}/cases/${project.caseRecord.id}`)).text();
+    assert.equal(back.includes("Досье утверждено"), true);
+    assert.equal(back.includes("<pre></pre>"), true);
+    assert.equal(back.includes("Утверждённого досье ещё нет"), false);
+    assert.equal(back.includes('name="keyId"'), false);
+  } finally {
+    await close(approveServer);
   }
 });
