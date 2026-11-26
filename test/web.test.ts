@@ -175,9 +175,15 @@ test("веб слушает только этот компьютер, без п�
       }),
     });
 
-    const page = await (await fetch(base)).text();
+    const page = await (await fetch(`${base}/keys`)).text();
+    assert.equal(page.includes('value="anthropic"'), true);
+    assert.equal(page.includes('value="openai-compatible"'), true);
     assert.equal(page.includes(firstSecret), false);
     assert.equal(page.includes(secondSecret), false);
+    const overview = await (await fetch(base)).text();
+    assert.equal(overview.includes(firstSecret), false);
+    assert.equal(overview.includes(secondSecret), false);
+    assert.equal(overview.includes("••••WXYZ"), false);
     assert.equal(page.includes("••••WXYZ"), true);
     assert.equal(page.includes("••••9876"), true);
     assert.equal(page.includes("claude&lt;script&gt;"), true);
@@ -396,7 +402,17 @@ test("чужой Host не открывает страницу и не сохр�
     }).toString();
 
     assert.equal(await statusWithHost(base, `evil.example:${address.port}`, "GET"), 403);
+    assert.equal(await statusWithHost(`${base}/keys`, `evil.example:${address.port}`, "GET"), 403);
     assert.equal(await statusWithHost(`${base}/keys`, `evil.example:${address.port}`, "POST", body), 403);
+    assert.equal(
+      await statusWithHost(
+        `${base}/proxy`,
+        `evil.example:${address.port}`,
+        "POST",
+        new URLSearchParams({ proxyUrl: "http://127.0.0.1:9", act: "save" }).toString(),
+      ),
+      403,
+    );
     assert.equal(await statusWithHost(base, `127.0.0.1:1`, "GET"), 403);
     assert.equal(trainer.listKeys().length, 0);
 
@@ -2100,7 +2116,7 @@ test("страница записывает прокси и не показыв�
     const address = server.address() as AddressInfo;
     const base = `http://127.0.0.1:${address.port}`;
     const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
-    const empty = await (await fetch(base)).text();
+    const empty = await (await fetch(`${base}/keys`)).text();
     assert.equal(empty.includes("Прямое соединение, прокси не записан."), true);
 
     const foreign = await fetch(`${base}/proxy`, {
@@ -2113,31 +2129,44 @@ test("страница записывает прокси и не показыв�
 
     const bad = await fetch(`${base}/proxy`, {
       method: "POST",
+      redirect: "manual",
       headers,
       body: new URLSearchParams({ proxyUrl: "не адрес", act: "save" }),
     });
-    const badPage = await bad.text();
+    assert.equal(bad.status, 303);
+    assert.equal(bad.headers.get("location"), "/keys?proxyError=address");
+    const badPage = await (await fetch(`${base}/keys?proxyError=address`)).text();
     assert.equal(badPage.includes("Укажите адрес прокси"), true);
+    assert.equal(badPage.includes("Тренажёр / <strong>Ключи</strong>"), true);
     assert.equal(trainer.proxyPreview(), undefined);
 
     const saved = await fetch(`${base}/proxy`, {
       method: "POST",
+      redirect: "manual",
       headers,
       body: new URLSearchParams({ proxyUrl: "http://owner:secret-proxy@127.0.0.1:9", act: "save" }),
     });
-    const page = await saved.text();
-    assert.equal(page.includes("http://127.0.0.1:9"), true);
+    assert.equal(saved.status, 303);
+    assert.equal(saved.headers.get("location"), "/keys");
+    const page = await (await fetch(`${base}/keys`)).text();
+    assert.equal(page.includes("Прокси записан."), true);
+    assert.equal(page.includes("127.0.0.1"), false);
     assert.equal(page.includes("secret-proxy"), false);
     assert.equal(page.includes("owner:"), false);
+    assert.equal(trainer.proxyPreview(), "http://127.0.0.1:9");
 
     const cleared = await fetch(`${base}/proxy`, {
       method: "POST",
+      redirect: "manual",
       headers,
       body: new URLSearchParams({ act: "clear" }),
     });
-    const afterClear = await cleared.text();
+    assert.equal(cleared.status, 303);
+    assert.equal(cleared.headers.get("location"), "/keys");
+    const afterClear = await (await fetch(`${base}/keys`)).text();
     assert.equal(trainer.proxyPreview(), undefined);
     assert.equal(afterClear.includes("Прямое соединение, прокси не записан."), true);
+    assert.equal(afterClear.includes("127.0.0.1"), false);
   } finally {
     await close(server);
   }
@@ -2201,7 +2230,11 @@ test("оболочка показывает шесть разделов и не 
     const base = `http://127.0.0.1:${address.port}`;
     const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
 
-    const keys = await (await fetch(base)).text();
+    const overviewPage = await (await fetch(base)).text();
+    assertShell(overviewPage, "Обзор");
+    assert.equal(overviewPage.includes('<form method="post" action="/keys">'), false);
+
+    const keys = await (await fetch(`${base}/keys`)).text();
     assertShell(keys, "Ключи");
     assert.equal(keys.includes('<a href="/">Обзор</a>'), true);
     assert.match(keys, /<form method="post" action="\/keys">/);
@@ -2256,7 +2289,7 @@ test("оболочка показывает шесть разделов и не 
       }),
     });
     assert.equal(postedKey.status, 303);
-    assert.equal(postedKey.headers.get("location"), "/");
+    assert.equal(postedKey.headers.get("location"), "/keys");
     assert.equal(trainer.listKeys().length, 2);
     assert.equal(JSON.stringify(trainer.listKeys()).includes("sk-deepseek-secret-9876"), false);
 
@@ -2279,6 +2312,160 @@ test("оболочка показывает шесть разделов и не 
     assert.equal(await statusWithHost(`${base}/profile`, `evil.example:${address.port}`, "POST", "resume=чужой"), 403);
     assert.equal(trainer.listSessions().length, 2);
     assert.deepEqual(trainer.readProfile(), { resume: "Резюме <script>", portfolio: "Портфолио", cases: "Кейс" });
+  } finally {
+    await close(server);
+  }
+});
+
+test("обзор читает установку, а ключ и прокси остаются на своей странице", async () => {
+  const trainer = start(tempDirectory());
+  assert.equal(
+    trainer.saveKey({
+      protocol: "anthropic",
+      baseAddress: "https://api.anthropic.com",
+      modelName: "claude-sonnet",
+      secret: "sk-ant-api03-secret-WXYZ",
+    }).ok,
+    true,
+  );
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+    const steps = "Создайте проект. Утвердите досье. Откройте сессию.";
+
+    const empty = await (await fetch(base)).text();
+    assertShell(empty, "Обзор");
+    assert.equal(empty.includes('<a href="/keys">Ключи</a>'), true);
+    assert.equal(empty.includes(steps), true);
+    assert.equal(empty.includes("Проектов пока нет."), true);
+    assert.match(empty, /<form method="post" action="\/customers">/);
+    assert.equal(empty.includes("Сессий пока нет."), true);
+    assert.equal(empty.includes('<form method="post" action="/keys">'), false);
+    assert.equal(empty.includes("sk-ant-api03-secret-WXYZ"), false);
+
+    const created = await fetch(`${base}/customers`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ customerName: "Север <script>", title: "Пустой склад", characters: "" }),
+    });
+    assert.equal(created.status, 303);
+    const bare = trainer.listCases().find((item) => item.title === "Пустой склад");
+    assert.ok(bare);
+    assert.deepEqual(bare.characters, []);
+
+    const named = trainer.addCase({
+      customerId: bare.customerId,
+      title: "Внедрение склада",
+      characters: ["Анна", "Борис"],
+    });
+    assert.equal(named.ok, true);
+    if (!named.ok) {
+      return;
+    }
+    const approved = trainer.approveDossier({
+      caseId: named.caseRecord.id,
+      material: "Склад принимает паллеты.",
+      serviceLayer: "",
+      crib: "",
+    });
+    assert.equal(approved.ok, true);
+    if (!approved.ok) {
+      return;
+    }
+    const first = trainer.openSession({
+      caseId: named.caseRecord.id,
+      dossierId: approved.dossier.id,
+      side: "заказчик",
+      character: "Анна",
+      role: "аналитик",
+      executorId: "владелец",
+      keyId,
+    });
+    const second = trainer.openSession({
+      caseId: named.caseRecord.id,
+      dossierId: approved.dossier.id,
+      side: "заказчик",
+      character: "Борис",
+      role: "разработчик",
+      executorId: "владелец",
+      keyId,
+    });
+    assert.equal(first.ok && second.ok, true);
+    if (!first.ok || !second.ok) {
+      return;
+    }
+
+    const before = trainer.listCases().map((item) => item.id);
+    const overview = await (await fetch(base)).text();
+    assert.deepEqual(
+      trainer.listCases().map((item) => item.id),
+      before,
+    );
+    assert.deepEqual(trainer.readPreparationEntries(named.caseRecord.id, "аналитик", "владелец"), []);
+    assert.equal(overview.includes(steps), true);
+    assert.equal(overview.includes("Проектов пока нет."), false);
+    assert.equal(overview.includes("Север &lt;script&gt;"), true);
+    assert.equal(overview.includes("Север <script>"), false);
+    assert.equal(overview.includes("Пустой склад"), true);
+    assert.equal(overview.includes("Досье не утверждено"), true);
+    assert.equal(overview.includes("Персонаж: заказчик"), true);
+    assert.equal(overview.includes("Сессий: 0"), true);
+    assert.equal(overview.includes("Внедрение склада"), true);
+    assert.equal(overview.includes("Досье утверждено"), true);
+    assert.equal(overview.includes("Персонаж: Анна, Борис"), true);
+    assert.equal(overview.includes("Сессий: 2"), true);
+    assert.equal(overview.includes(`/sessions/${second.session.id}`), true);
+    assert.equal(overview.includes(`/sessions/${first.session.id}`), false);
+    assert.equal(overview.includes("sk-ant-api03-secret-WXYZ"), false);
+    const project = await (await fetch(`${base}/cases/${named.caseRecord.id}`)).text();
+    assert.equal(project.includes(steps), false);
+
+    const refused = await fetch(`${base}/keys`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({
+        protocol: "smtp",
+        baseAddress: "https://api.example",
+        modelName: "none",
+        secret: "secret-value-1234",
+      }),
+    });
+    assert.equal(refused.status, 303);
+    assert.equal(refused.headers.get("location"), "/keys?error=protocol");
+    const refusedPage = await (await fetch(`${base}${refused.headers.get("location")}`)).text();
+    assertShell(refusedPage, "Ключи");
+    assert.equal(refusedPage.includes("Выберите протокол Anthropic или совместимый с OpenAI."), true);
+    assert.match(refusedPage, /<form method="post" action="\/keys">/);
+    assert.equal(refusedPage.includes("secret-value-1234"), false);
+    assert.equal(trainer.listKeys().length, 1);
+
+    const foreignKey = await fetch(`${base}/keys`, {
+      method: "POST",
+      headers: { ...headers, origin: "https://evil.example" },
+      body: new URLSearchParams({
+        protocol: "openai-compatible",
+        baseAddress: "https://api.deepseek.com",
+        modelName: "deepseek-chat",
+        secret: "sk-deepseek-secret-9876",
+      }),
+    });
+    assert.equal(foreignKey.status, 403);
+    const foreignProxy = await fetch(`${base}/proxy`, {
+      method: "POST",
+      headers: { ...headers, origin: "https://evil.example" },
+      body: new URLSearchParams({ proxyUrl: "http://127.0.0.1:9", act: "save" }),
+    });
+    assert.equal(foreignProxy.status, 403);
+    assert.equal(trainer.listKeys().length, 1);
+    assert.equal(trainer.proxyPreview(), undefined);
+    assert.equal(await statusWithHost(`${base}/keys`, `evil.example:${address.port}`, "GET"), 403);
   } finally {
     await close(server);
   }
