@@ -342,10 +342,8 @@ function renderKeys(keys: KeySummary[], proxy: string | undefined, error?: strin
   );
 }
 
-function renderProfile(profile: OwnerProfile): string {
-  return `<section>
-    <h2>Профиль</h2>
-    <p>Резюме, портфолио и кейсы одни на владельца и общие для всех проектов.</p>
+function profileFields(profile: OwnerProfile): string {
+  return `<p>Резюме, портфолио и кейсы одни на владельца и общие для всех проектов.</p>
     <form method="post" action="/profile">
       <label>Резюме
         <textarea name="resume">${escapeHtml(profile.resume)}</textarea>
@@ -357,13 +355,19 @@ function renderProfile(profile: OwnerProfile): string {
         <textarea name="cases">${escapeHtml(profile.cases)}</textarea>
       </label>
       <button type="submit">Сохранить профиль</button>
-    </form>
+    </form>`;
+}
+
+function renderProfile(profile: OwnerProfile): string {
+  return `<section>
+    <h2>Профиль</h2>
+    ${profileFields(profile)}
   </section>`;
 }
 
 /** Страница профиля. Запись по-прежнему уходит на `/profile` и возвращает к проектам. */
 function renderProfilePage(trainer: Trainer): string {
-  return page("Профиль", `<h1>Профиль</h1>${renderProfile(trainer.readProfile())}`, "profile");
+  return page("Профиль", `<h1>Профиль</h1>${profileFields(trainer.readProfile())}`, "profile");
 }
 
 /** Ссылки на сессии. Список сам не открывает последнюю. */
