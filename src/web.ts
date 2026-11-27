@@ -1771,6 +1771,15 @@ function allowsFormPost(origin: string | string[] | undefined, port: number): bo
   );
 }
 
+/** Сегмент адреса. Битый процент — не найденная страница, а не сбой. */
+function decodeSegment(segment: string): string | undefined {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return undefined;
+  }
+}
+
 function caseTarget(pathname: string): { id: string; action?: CaseAction } | undefined {
   const match = pathname.match(
     /^\/cases\/([^/]+)(?:\/(draft|approve|session|file|portfolio|preparation|assignment))?$/,
@@ -1792,7 +1801,11 @@ function caseTarget(pathname: string): { id: string; action?: CaseAction } | und
   ) {
     return undefined;
   }
-  return { id: decodeURIComponent(id), action };
+  const decoded = decodeSegment(id);
+  if (decoded === undefined) {
+    return undefined;
+  }
+  return { id: decoded, action };
 }
 
 function sessionTarget(pathname: string): { id: string; action?: SessionAction } | undefined {
@@ -1805,7 +1818,11 @@ function sessionTarget(pathname: string): { id: string; action?: SessionAction }
   if (action !== undefined && action !== "opening" && action !== "ask" && action !== "finish") {
     return undefined;
   }
-  return { id: decodeURIComponent(id), action };
+  const decoded = decodeSegment(id);
+  if (decoded === undefined) {
+    return undefined;
+  }
+  return { id: decoded, action };
 }
 
 function wantsStream(accept: string | string[] | undefined): boolean {

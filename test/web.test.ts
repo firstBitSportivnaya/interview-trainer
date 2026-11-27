@@ -759,6 +759,7 @@ test("веб открывает сессию заказчика, и стеног
     const filled = await (await fetch(`${base}/sessions/${open.id}`)).text();
     assert.equal(filled.includes("Как принимаете паллеты?"), true);
     assert.equal(filled.includes(secret), false);
+    assert.equal((await fetch(`${base}/sessions/${open.id}`)).status, 200);
 
     const again = await fetch(`${base}/sessions/${open.id}/opening`);
     const second = await again.text();
@@ -3598,6 +3599,37 @@ test("скринридер называет оболочку, а диалоги 
     assert.match(sessionPage, /<form id="ask" method="post" action="\/sessions\/[^"]+\/ask">[\s\S]*<textarea name="line" required>/);
     assert.match(sessionPage, /<div id="live" aria-live="polite"><\/div>/);
     assert.equal(sessionPage.includes('tabindex="-1"'), false);
+  } finally {
+    await close(server);
+  }
+});
+
+test("битый процент в адресе проекта и сессии отвечает 404", async () => {
+  const trainer = start(tempDirectory());
+  const saved = trainer.saveCase({ customerName: "Север", title: "Битый адрес", characters: [] });
+  assert.equal(saved.ok, true);
+  if (!saved.ok) {
+    return;
+  }
+  const server = await startWeb(trainer);
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+
+    for (const path of ["/cases/%", "/cases/%zz", "/cases/%2", "/cases/%E0%A4%A"]) {
+      const broken = await fetch(`${base}${path}`);
+      assert.equal(broken.status, 404, path);
+      await broken.text();
+    }
+    for (const path of ["/sessions/%", "/sessions/%zz"]) {
+      const broken = await fetch(`${base}${path}`);
+      assert.equal(broken.status, 404, path);
+      await broken.text();
+    }
+
+    const normal = await fetch(`${base}/cases/${saved.caseRecord.id}`);
+    assert.equal(normal.status, 200);
+    await normal.text();
   } finally {
     await close(server);
   }
