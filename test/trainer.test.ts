@@ -1858,3 +1858,97 @@ test("прокси установки прячет пароль и неадре�
   assert.deepEqual(trainer.clearProxy(), { ok: true });
   assert.equal(trainer.proxyPreview(), undefined);
 });
+
+test("опоздавшая реплика и первый вопрос не попадают в законченную сессию", async () => {
+  let releaseReply = (): void => {};
+  const replyGate = new Promise<void>((resolve) => {
+    releaseReply = resolve;
+  });
+  let replyWaiting = (): void => {};
+  const replyEntered = new Promise<void>((resolve) => {
+    replyWaiting = resolve;
+  });
+  let releaseOpening = (): void => {};
+  const openingGate = new Promise<void>((resolve) => {
+    releaseOpening = resolve;
+  });
+  let openingWaiting = (): void => {};
+  const openingEntered = new Promise<void>((resolve) => {
+    openingWaiting = resolve;
+  });
+  const trainer = start(tempDirectory(), {
+    async *complete(call) {
+      const text = call.messages[0]?.text ?? "";
+      if (text.includes("Разбери законченную сессию")) {
+        yield "Разбор без опоздавшей реплики.";
+        return;
+      }
+      const task = text.split("\n\n").at(-1) ?? "";
+      if (task.startsWith("Задай один вопрос")) {
+        openingWaiting();
+        await openingGate;
+        yield "ПЕРВЫЙ-ВОПРОС";
+        return;
+      }
+      if (task === "ПОЗДНИЙ-ВОПРОС") {
+        replyWaiting();
+        await replyGate;
+        yield "ОТВЕТ-ОПОЗДАЛ";
+        return;
+      }
+      yield "Срок — июнь.";
+    },
+  });
+  const prepared = prepare(trainer);
+  const opened = openAnalyst(trainer, prepared);
+  assert.ok(opened.ok);
+
+  await take(trainer.reply(opened.session.id, "Какой срок?"));
+  assert.equal(
+    trainer.readTranscript(opened.session.id)?.some((line) => line.text === "Какой срок?"),
+    true,
+  );
+  assert.equal(
+    trainer.readTranscript(opened.session.id)?.some((line) => line.text === "Срок — июнь."),
+    true,
+  );
+
+  const late = take(trainer.reply(opened.session.id, "ПОЗДНИЙ-ВОПРОС"));
+  await replyEntered;
+  const finished = await trainer.finishSession(opened.session.id);
+  assert.equal(finished.ok, true);
+  if (finished.ok) {
+    assert.equal(finished.review.text.includes("ПОЗДНИЙ-ВОПРОС"), false);
+    assert.equal(finished.review.text.includes("ОТВЕТ-ОПОЗДАЛ"), false);
+  }
+  releaseReply();
+  await late;
+  const transcript = trainer.readTranscript(opened.session.id) ?? [];
+  assert.equal(transcript.some((line) => line.text === "ПОЗДНИЙ-ВОПРОС"), false);
+  assert.equal(transcript.some((line) => line.text === "ОТВЕТ-ОПОЗДАЛ"), false);
+  assert.deepEqual(trainer.readPreparationEntries(prepared.caseId, "аналитик", "владелец"), []);
+
+  const second = trainer.openSession({
+    caseId: prepared.caseId,
+    dossierId: prepared.dossierId,
+    side: "заказчик",
+    character: "заказчик",
+    role: "разработчик",
+    executorId: "владелец",
+    keyId: prepared.keyId,
+  });
+  assert.ok(second.ok);
+  const opening = take(trainer.openingQuestion(second.session.id));
+  await openingEntered;
+  const finishedOpening = await trainer.finishSession(second.session.id);
+  assert.equal(finishedOpening.ok, true);
+  if (finishedOpening.ok) {
+    assert.equal(finishedOpening.review.text.includes("ПЕРВЫЙ-ВОПРОС"), false);
+  }
+  releaseOpening();
+  await opening;
+  assert.equal(
+    trainer.readTranscript(second.session.id)?.some((line) => line.text === "ПЕРВЫЙ-ВОПРОС"),
+    false,
+  );
+});
