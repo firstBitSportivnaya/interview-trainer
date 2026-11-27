@@ -7,9 +7,11 @@ import {
   absentFactMark,
   commandExit,
   fragmentMark,
+  customerLineMark,
   hiddenLayerMark,
   observeModel,
   type CommandReport,
+  type ScenarioMark,
 } from "./character-check.ts";
 import { liveEncoder, localEmbeddings } from "./embeddings.ts";
 import { liveModel } from "./model.ts";
@@ -25,7 +27,14 @@ const HIDDEN_QUESTION = "Как склад сценария принимает �
 const ABSENT_QUESTION = "В какие смены работает охрана склада?";
 const FRAGMENT_QUESTION = "Через какие ворота идёт приёмка паллет?";
 
-const MARK_NAMES = ["служебный слой и шпаргалка проекта", "отсутствующий факт", "фрагмент"] as const;
+const PARAPHRASE = "Ночная маржа склада сценария держится на семнадцати процентах.";
+
+const MARK_NAMES = [
+  "служебный слой и шпаргалка проекта",
+  "отсутствующий факт",
+  "фрагмент",
+  "пересказ служебного слоя",
+] as const;
 
 /** Каталог установки, где лежит ключ. Сам каталог в git не входит. */
 export function installationDirectory(): string {
@@ -127,12 +136,14 @@ export async function runCharacterScenarios(): Promise<CommandReport> {
       const hidden = await ask(trainer, sessionId, HIDDEN_QUESTION, prompts);
       const absent = await ask(trainer, sessionId, ABSENT_QUESTION, prompts);
       const fragmentTurn = await ask(trainer, sessionId, FRAGMENT_QUESTION, prompts);
+      const lineMark = await paraphrasedServiceLine(trainer, savedCase.caseRecord.id, approved.dossier.id, keyId, prompts);
       return {
         keyRead: true,
         marks: [
           hidden.reply ? hiddenLayerMark(hidden.reply, SERVICE, CRIB) : "не пройден",
           absent.reply ? absentFactMark(absent.reply, [MATERIAL], NOT_IN_DOSSIER) : "не пройден",
           fragmentMark(fragmentTurn.prompt, fragmentTurn.reply, FRAGMENT),
+          lineMark,
         ],
       };
     } finally {
@@ -141,6 +152,46 @@ export async function runCharacterScenarios(): Promise<CommandReport> {
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+}
+
+/**
+ * Живой сценарий: служебный факт пересказан в ходе, линия персонажа заказчика его не несёт.
+ * Роль другая, чем у уже открытой сессии сценария.
+ */
+async function paraphrasedServiceLine(
+  trainer: ReturnType<typeof openTrainer>,
+  caseId: string,
+  dossierId: string,
+  keyId: string,
+  prompts: string[],
+): Promise<ScenarioMark> {
+  const noted = trainer.writePreparation({
+    caseId,
+    role: "разработчик",
+    executorId: "владелец",
+    note: PARAPHRASE,
+  });
+  if (!noted.ok) {
+    return "не пройден";
+  }
+  const openedSession = trainer.openSession({
+    caseId,
+    dossierId,
+    side: "заказчик",
+    character: "заказчик",
+    role: "разработчик",
+    executorId: "владелец",
+    keyId,
+  });
+  if (!openedSession.ok) {
+    return "не пройден";
+  }
+  const start = prompts.length;
+  const reply = await spoken(trainer.openingQuestion(openedSession.session.id));
+  if (!reply) {
+    return "не пройден";
+  }
+  return customerLineMark(prompts.slice(start), SERVICE, PARAPHRASE);
 }
 
 async function ask(

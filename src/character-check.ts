@@ -1,5 +1,5 @@
 import type { ModelPort } from "./model.ts";
-import { ABSENT_FACT } from "./trainer.ts";
+import { ABSENT_FACT, CUSTOMER_LINE_TASK } from "./trainer.ts";
 
 /** Итог одного сценария. «Не отмечен» — сценарий не выполнялся и пройденным не считается. */
 export type ScenarioMark = "пройден" | "не пройден" | "не отмечен";
@@ -91,6 +91,32 @@ export function fragmentMark(prompt: string, reply: string | undefined, fragment
     return "не отмечен";
   }
   if (!reply?.trim() || replyIncludesText(reply, fragment)) {
+    return "не пройден";
+  }
+  return "пройден";
+}
+
+/**
+ * Линия персонажа заказчика собрана вызовом без текста служебного слоя.
+ * Пересказ служебного факта в этой линии сценарий не проходит.
+ */
+export function customerLineMark(
+  prompts: readonly string[],
+  serviceLayer: string,
+  paraphrase: string,
+): ScenarioMark {
+  const assembly = prompts.find((prompt) => prompt.startsWith(CUSTOMER_LINE_TASK));
+  if (!assembly || replyIncludesText(assembly, serviceLayer)) {
+    return "не пройден";
+  }
+  const character = [...prompts]
+    .reverse()
+    .find((prompt) => prompt.includes("сторона «заказчик»") && prompt.includes("\nЛиния поведения:\n"));
+  const section = character?.split("\nЛиния поведения:\n")[1]?.split("\n\n")[0]?.trim() ?? "";
+  if (!section || section === "нет") {
+    return "не пройден";
+  }
+  if (replyIncludesText(section, serviceLayer) || replyIncludesText(section, paraphrase)) {
     return "не пройден";
   }
   return "пройден";

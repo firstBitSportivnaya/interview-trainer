@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 
 import { type ModelCall, ModelFailure, type ModelPort } from "../src/model.ts";
-import { ABSENT_FACT, openTrainer, type SpeechEvent } from "../src/trainer.ts";
+import { ABSENT_FACT, CUSTOMER_LINE_TASK, openTrainer, type SpeechEvent } from "../src/trainer.ts";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -52,6 +52,10 @@ function recorded(calls: ModelCall[]): ModelPort {
         messages: call.messages.map((message) => ({ role: message.role, text: message.text })),
       });
       const text = call.messages[0]?.text ?? "";
+      if (text.startsWith(CUSTOMER_LINE_TASK)) {
+        yield (text.split("\nЧерновик линии:\n")[1] ?? "").trim();
+        return;
+      }
       const task = text.split("\n\n").at(-1) ?? "";
       if (task.startsWith("Задай один вопрос")) {
         yield "Как ";
@@ -217,15 +221,16 @@ test("ответ берётся из материала, а факта вне м
     { kind: "speech", text: ABSENT_FACT },
   ]);
 
-  const factCall = calls[0]?.messages[0]?.text ?? "";
-  const absentCall = calls[1]?.messages[0]?.text ?? "";
+  const characterCalls = calls.filter((call) => !call.messages[0]?.text.startsWith(CUSTOMER_LINE_TASK));
+  const factCall = characterCalls[0]?.messages[0]?.text ?? "";
+  const absentCall = characterCalls[1]?.messages[0]?.text ?? "";
   assert.equal(materialOf(factCall), "Склад принимает паллеты.");
   assert.equal(factCall.includes("Маржа подрядчика 12%."), false);
   assert.equal(factCall.includes("Спросить про сроки."), false);
   assert.equal(factCall.includes("Давить на маржу."), true);
   assert.equal(factCall.includes(ABSENT_FACT), true);
-  assert.equal(calls[0]?.secret, keyDraft.secret);
-  assert.equal(calls[0]?.modelName, "claude-sonnet");
+  assert.equal(characterCalls[0]?.secret, keyDraft.secret);
+  assert.equal(characterCalls[0]?.modelName, "claude-sonnet");
   assert.equal(absentCall.includes("Давить на маржу."), true);
   assert.equal(absentCall.includes("Маржа подрядчика 12%."), false);
   assert.equal(
