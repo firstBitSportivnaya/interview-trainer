@@ -2316,6 +2316,25 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       .run(randomUUID(), sessionId, integerColumn(row, "ordinal") + 1, speaker, kind, text);
   }
 
+  /** Пишет реплики, только если сессия к этому моменту ещё открыта. Законченная сессия стенограмму не получает. */
+  function recordWhileOpen(
+    sessionId: string,
+    lines: readonly { speaker: TranscriptSpeaker; kind: TranscriptKind; text: string }[],
+  ): void {
+    if (lines.length === 0) {
+      return;
+    }
+    inTransaction(database, () => {
+      const still = loadSession(sessionId);
+      if (!still || still.status !== "open") {
+        return;
+      }
+      for (const line of lines) {
+        appendTranscript(sessionId, line.speaker, line.kind, line.text);
+      }
+    });
+  }
+
   /**
    * Зовёт модель ключом сессии и отдаёт речь кусками.
    * spoken собирает куски. failed — вызов оборвался, и целая реплика не сложилась.
@@ -3639,7 +3658,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         const spoken = { text: "", failed: false };
         yield* streamKey(session, [{ role: "user", text: task.text }], spoken, signal);
         if (!spoken.failed && spoken.text && !signal?.aborted) {
-          appendTranscript(session.id, "персонаж", "вопрос", spoken.text);
+          recordWhileOpen(session.id, [{ speaker: "персонаж", kind: "вопрос", text: spoken.text }]);
         }
       } finally {
         openingReservations.delete(session.id);
@@ -3685,14 +3704,17 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
           yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
           return;
         }
-        if (!sameUnanswered(current.id, text)) {
-          appendTranscript(current.id, "исполнитель", "реплика", text);
-        }
+        const duplicate = sameUnanswered(current.id, text);
         const spoken = { text: "", failed: false };
         yield* streamKey(current, [{ role: "user", text: task.text }], spoken, signal);
-        if (!spoken.failed && spoken.text && !signal?.aborted) {
-          appendTranscript(current.id, "персонаж", "ответ", spoken.text);
+        const lines: { speaker: TranscriptSpeaker; kind: TranscriptKind; text: string }[] = [];
+        if (!duplicate) {
+          lines.push({ speaker: "исполнитель", kind: "реплика", text });
         }
+        if (!spoken.failed && spoken.text && !signal?.aborted) {
+          lines.push({ speaker: "персонаж", kind: "ответ", text: spoken.text });
+        }
+        recordWhileOpen(current.id, lines);
       } finally {
         release();
         if (replyTail.get(session.id) === tail) {
