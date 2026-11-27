@@ -168,6 +168,8 @@ export type DossierRecord = {
   serviceLayer: string;
   /** Шпаргалка проекта. */
   crib: string;
+  /** Время записи версии. У версии прежней формы оно пустое. */
+  createdAt: string;
 };
 
 /** Отказ утвердить досье: проекта нет или досье утверждает не владелец. */
@@ -189,6 +191,8 @@ export type SessionRecord = {
   executorId: string;
   keyId: string;
   status: SessionStatus;
+  /** Время открытия. Чтение его не сдвигает. У сессии прежней формы оно пустое. */
+  createdAt: string;
 };
 
 /** Текст разбора. Числовой оценки в нём нет. */
@@ -246,6 +250,8 @@ export type TranscriptLine = {
   speaker: TranscriptSpeaker;
   kind: TranscriptKind;
   text: string;
+  /** Время записи реплики. Не раньше предыдущей. У реплики прежней формы оно пустое. */
+  createdAt: string;
 };
 
 /**
@@ -402,8 +408,8 @@ const LEGACY_KEYS = "keys.json";
 const LEGACY_STAGING = "keys.json.migrating";
 const STORE_FILE = "store.sqlite";
 /** Текущая версия формы хранилища. Растёт вместе с шагом в списке `STORE_MIGRATIONS`. */
-export const STORE_VERSION = 1;
-const SESSION_COLUMNS = "id, case_id, dossier_id, side, character_name, role, executor_id, key_id, status";
+export const STORE_VERSION = 2;
+const SESSION_COLUMNS = "id, case_id, dossier_id, side, character_name, role, executor_id, key_id, status, created_at";
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 const SQLITE_NOTADB = 26;
 
@@ -461,7 +467,8 @@ function schemaSql(): string {
       case_id TEXT NOT NULL REFERENCES cases(id),
       material TEXT NOT NULL,
       service_layer TEXT NOT NULL,
-      crib TEXT NOT NULL
+      crib TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT ''
     ) STRICT;
 
     CREATE TABLE IF NOT EXISTS source_files (
@@ -521,7 +528,8 @@ function schemaSql(): string {
       executor_id TEXT NOT NULL,
       key_id TEXT NOT NULL REFERENCES keys(id),
       status TEXT NOT NULL CHECK (status IN ('open', 'finished')),
-      review TEXT
+      review TEXT,
+      created_at TEXT NOT NULL DEFAULT ''
     ) STRICT;
 
     CREATE UNIQUE INDEX IF NOT EXISTS sessions_one_open
@@ -592,7 +600,8 @@ function schemaSql(): string {
       ordinal INTEGER NOT NULL,
       speaker TEXT NOT NULL CHECK (speaker IN ('персонаж', 'исполнитель')),
       kind TEXT NOT NULL CHECK (kind IN ('вопрос', 'ответ', 'реплика')),
-      body TEXT NOT NULL
+      body TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT ''
     ) STRICT;
 
     CREATE INDEX IF NOT EXISTS transcript_session
@@ -706,6 +715,12 @@ function isNotDatabase(error: unknown): boolean {
 
 function isUniqueConstraint(error: unknown): boolean {
   return !!error && typeof error === "object" && "errcode" in error && error.errcode === SQLITE_CONSTRAINT_UNIQUE;
+}
+
+/** Время записи. Не раньше предыдущей записи: часы машины могут идти назад. */
+function recordTime(previous = ""): string {
+  const now = new Date().toISOString();
+  return previous !== "" && previous > now ? previous : now;
 }
 
 /** Берёт текстовую колонку. Число или NULL значит, что файл хранилища разошёлся со схемой. */
@@ -875,7 +890,30 @@ const STORE_MIGRATIONS: readonly StoreMigration[] = [
       ensureRecognizedShape(database);
     },
   },
+  {
+    version: 2,
+    apply(database) {
+      addTextColumn(database, "dossiers", "created_at");
+      addTextColumn(database, "sessions", "created_at");
+      addTextColumn(database, "transcript", "created_at");
+    },
+  },
 ];
+
+/**
+ * Догоняет текстовую колонку. Уже записанные строки получают пустое значение:
+ * текст на месте, время появится только у новых записей.
+ */
+function addTextColumn(database: DatabaseSync, table: string, column: string): void {
+  const rows = database.prepare(`PRAGMA table_info(${table})`).all() as Row[];
+  if (rows.length === 0) {
+    return;
+  }
+  const names = new Set(rows.map((row) => textColumn(row, "name")));
+  if (!names.has(column)) {
+    database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+  }
+}
 
 function storeVersion(database: DatabaseSync): number {
   const row = database.prepare("PRAGMA user_version").get() as Row | undefined;
@@ -1999,6 +2037,7 @@ function readDossierRecord(row: Row): DossierRecord {
     material: textColumn(row, "material"),
     serviceLayer: textColumn(row, "service_layer"),
     crib: textColumn(row, "crib"),
+    createdAt: textColumn(row, "created_at"),
   };
 }
 
@@ -2061,6 +2100,7 @@ function readSessionRecord(row: Row): SessionRecord {
     executorId: textColumn(row, "executor_id"),
     keyId: textColumn(row, "key_id"),
     status,
+    createdAt: textColumn(row, "created_at"),
   };
 }
 
@@ -2255,7 +2295,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
 
   function loadDossier(dossierId: string): DossierRecord | undefined {
     const row = database
-      .prepare("SELECT id, case_id, material, service_layer, crib FROM dossiers WHERE id = ?")
+      .prepare("SELECT id, case_id, material, service_layer, crib, created_at FROM dossiers WHERE id = ?")
       .get(dossierId) as Row | undefined;
     return row ? readDossierRecord(row) : undefined;
   }
@@ -2270,7 +2310,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
 
   function readTranscriptRows(sessionId: string): TranscriptLine[] {
     const rows = database
-      .prepare("SELECT speaker, kind, body FROM transcript WHERE session_id = ? ORDER BY ordinal")
+      .prepare("SELECT speaker, kind, body, created_at FROM transcript WHERE session_id = ? ORDER BY ordinal")
       .all(sessionId) as Row[];
     return rows.map((row) => {
       const speaker = textColumn(row, "speaker");
@@ -2278,7 +2318,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       if (!isTranscriptSpeaker(speaker) || !isTranscriptKind(kind)) {
         throw new Error("Запись хранилища повреждена");
       }
-      return { speaker, kind, text: textColumn(row, "body") };
+      return { speaker, kind, text: textColumn(row, "body"), createdAt: textColumn(row, "created_at") };
     });
   }
 
@@ -2311,9 +2351,22 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     const row = database
       .prepare("SELECT COALESCE(MAX(ordinal), 0) AS ordinal FROM transcript WHERE session_id = ?")
       .get(sessionId) as Row;
+    const previous = database
+      .prepare("SELECT created_at FROM transcript WHERE session_id = ? ORDER BY ordinal DESC LIMIT 1")
+      .get(sessionId) as Row | undefined;
     database
-      .prepare("INSERT INTO transcript (id, session_id, ordinal, speaker, kind, body) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(randomUUID(), sessionId, integerColumn(row, "ordinal") + 1, speaker, kind, text);
+      .prepare(
+        "INSERT INTO transcript (id, session_id, ordinal, speaker, kind, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        randomUUID(),
+        sessionId,
+        integerColumn(row, "ordinal") + 1,
+        speaker,
+        kind,
+        text,
+        recordTime(previous ? textColumn(previous, "created_at") : ""),
+      );
   }
 
   /**
@@ -3327,17 +3380,20 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         material: draft.material,
         serviceLayer: draft.serviceLayer,
         crib: draft.crib,
+        createdAt: recordTime(),
       };
       database
-        .prepare("INSERT INTO dossiers (id, case_id, material, service_layer, crib) VALUES (?, ?, ?, ?, ?)")
-        .run(dossier.id, dossier.caseId, dossier.material, dossier.serviceLayer, dossier.crib);
+        .prepare(
+          "INSERT INTO dossiers (id, case_id, material, service_layer, crib, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .run(dossier.id, dossier.caseId, dossier.material, dossier.serviceLayer, dossier.crib, dossier.createdAt);
       return { ok: true, dossier };
     },
 
     /** Возвращает утверждённое досье. Нет идентификатора — досье нет. */
     readDossier(dossierId: string): DossierRecord | undefined {
       const row = database
-        .prepare("SELECT id, case_id, material, service_layer, crib FROM dossiers WHERE id = ?")
+        .prepare("SELECT id, case_id, material, service_layer, crib, created_at FROM dossiers WHERE id = ?")
         .get(dossierId) as Row | undefined;
       return row ? readDossierRecord(row) : undefined;
     },
@@ -3349,7 +3405,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     readApprovedDossier(caseId: string): DossierRecord | undefined {
       const row = database
         .prepare(
-          `SELECT id, case_id, material, service_layer, crib
+          `SELECT id, case_id, material, service_layer, crib, created_at
            FROM dossiers WHERE case_id = ? ORDER BY rowid DESC LIMIT 1`,
         )
         .get(caseId) as Row | undefined;
@@ -3464,14 +3520,15 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         executorId,
         keyId,
         status: "open",
+        createdAt: recordTime(),
       };
       try {
         inTransaction(database, () => {
           database
             .prepare(
               `INSERT INTO sessions (
-                 id, case_id, dossier_id, side, character_name, role, executor_id, key_id, status
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')`,
+                 id, case_id, dossier_id, side, character_name, role, executor_id, key_id, status, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`,
             )
             .run(
               session.id,
@@ -3482,6 +3539,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
               session.role,
               session.executorId,
               session.keyId,
+              session.createdAt,
             );
           rememberSessionFiles(session.id, caseId);
         });
@@ -3764,7 +3822,7 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       }
       const current = database
         .prepare(
-          `SELECT id, case_id, material, service_layer, crib
+          `SELECT id, case_id, material, service_layer, crib, created_at
            FROM dossiers WHERE case_id = ? ORDER BY rowid DESC LIMIT 1`,
         )
         .get(entry.caseId) as Row | undefined;
@@ -3779,11 +3837,14 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         material: layer === "material" ? appendLayer(dossier.material, entry.text) : dossier.material,
         serviceLayer: layer === "serviceLayer" ? appendLayer(dossier.serviceLayer, entry.text) : dossier.serviceLayer,
         crib: dossier.crib,
+        createdAt: recordTime(),
       };
       inTransaction(database, () => {
         database
-          .prepare("INSERT INTO dossiers (id, case_id, material, service_layer, crib) VALUES (?, ?, ?, ?, ?)")
-          .run(next.id, next.caseId, next.material, next.serviceLayer, next.crib);
+          .prepare(
+            "INSERT INTO dossiers (id, case_id, material, service_layer, crib, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+          )
+          .run(next.id, next.caseId, next.material, next.serviceLayer, next.crib, next.createdAt);
         database.prepare("UPDATE preparation_entries SET status = 'accepted' WHERE id = ? AND status = 'open'").run(entry.id);
       });
       const saved = loadPreparationEntry(entry.id);

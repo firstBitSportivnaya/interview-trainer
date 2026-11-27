@@ -11,6 +11,7 @@ import { request as httpRequest, type Server } from "node:http";
 import { ABSENT_FACT, DRAFT_LIMIT, openTrainer } from "../src/trainer.ts";
 import { ModelFailure } from "../src/model.ts";
 import { FILE_BODY_LIMIT, startWeb, TEXT_BODY_LIMIT } from "../src/web.ts";
+import { withoutTime } from "./records.ts";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -550,7 +551,7 @@ test("веб заводит заказчика, проект и утверждё
     assert.equal(approvedPage.includes("Сессия ещё не открывается."), false);
     assert.equal(approvedPage.includes("СЫРЬЁ-МАТЕРИАЛ"), false);
     assert.equal(approvedPage.includes("ЧЕРНОВИК-МАТЕРИАЛ"), false);
-    assert.deepEqual(trainer.readApprovedDossier(first.id), {
+    assert.deepEqual(withoutTime(trainer.readApprovedDossier(first.id)), {
       id: trainer.readApprovedDossier(first.id)?.id,
       caseId: first.id,
       material: "УТВЕРЖДЕНО<script>",
@@ -633,7 +634,7 @@ test("утверждение принимает показанный черно�
       body,
     });
     assert.equal(approved.status, 200);
-    assert.deepEqual(trainer.readApprovedDossier(caseId), {
+    assert.deepEqual(withoutTime(trainer.readApprovedDossier(caseId)), {
       id: trainer.readApprovedDossier(caseId)?.id,
       caseId,
       ...draft,
