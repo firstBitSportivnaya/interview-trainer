@@ -1655,8 +1655,16 @@ async function receiveProjectFile(
   redirect(response, casePath(item.id));
 }
 
+/** Заголовки страницы. Встроить её во фрейм и угадать тип содержимого нельзя. */
+const PAGE_HEADERS = {
+  "content-type": "text/html; charset=utf-8",
+  "x-frame-options": "DENY",
+  "content-security-policy": "frame-ancestors 'none'",
+  "x-content-type-options": "nosniff",
+} as const;
+
 function sendHtml(response: ServerResponse, html: string, status = 200): void {
-  response.writeHead(status, { "content-type": "text/html; charset=utf-8" });
+  response.writeHead(status, PAGE_HEADERS);
   response.end(html);
 }
 
