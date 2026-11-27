@@ -8,13 +8,14 @@ import {
   absentFactMark,
   commandExit,
   fragmentInModelInput,
+  customerLineMark,
   fragmentMark,
   hiddenLayerMark,
   observeModel,
   type ScenarioMark,
 } from "../src/character-check.ts";
 import { installationDirectory, scenarioStoreDirectory } from "../src/character-scenarios.ts";
-import { ABSENT_FACT, openTrainer } from "../src/trainer.ts";
+import { ABSENT_FACT, CUSTOMER_LINE_TASK, openTrainer } from "../src/trainer.ts";
 
 const SERVICE = "Ночная ставка склада сценария — семнадцать процентов маржи.";
 const CRIB = "Спросить на сценарии про штраф за простой ворот.";
@@ -185,6 +186,17 @@ test("ключ читается из хранилища, а список клю�
   assert.equal(JSON.stringify(trainer.listKeys()).includes("live-key-sample-987654"), false);
 });
 
+test("пересказ служебного факта в линии персонажа заказчика не проходит", () => {
+  const assembly = `${CUSTOMER_LINE_TASK}\nЧерновик линии:\n${NOT_IN_DOSSIER}`;
+  const character = `сторона «заказчик»\nЛиния поведения:\nДавить на срок.\n\nМатериал проекта:`;
+  assert.equal(customerLineMark([assembly, character], SERVICE, NOT_IN_DOSSIER), "пройден");
+  assert.equal(customerLineMark([`${assembly}\n${SERVICE}`, character], SERVICE, NOT_IN_DOSSIER), "не пройден");
+  assert.equal(
+    customerLineMark([assembly, character.replace("Давить на срок.", NOT_IN_DOSSIER)], SERVICE, NOT_IN_DOSSIER),
+    "не пройден",
+  );
+});
+
 test("команда персонажа не входит в npm test и npm run verify", () => {
   const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { scripts: Record<string, string> };
   assert.equal(pkg.scripts.test, "node --test");
@@ -195,6 +207,8 @@ test("команда персонажа не входит в npm test и npm run
   assert.deepEqual(names, ["character-check.test.ts"]);
   const source = readFileSync("src/character-scenarios.ts", "utf8");
   assert.equal(source.includes("liveModel("), true);
+  assert.equal(source.includes("customerLineMark"), true);
+  assert.equal(source.includes("Ночная маржа склада сценария держится на семнадцати процентах."), true);
   assert.equal(source.includes("node:test"), false);
   assert.equal(source.includes("writeFile"), false);
   assert.equal(/sk-[A-Za-z0-9]/.test(source), false);

@@ -74,6 +74,11 @@ function recorded(calls: ModelCall[], reviews: string[]): ModelPort {
         messages: call.messages.map((message) => ({ role: message.role, text: message.text })),
       });
       const text = call.messages[0]?.text ?? "";
+      if (text.startsWith("Собери линию поведения персонажа заказчика.")) {
+        const draft = text.split("\nЧерновик линии:\n")[1] ?? "";
+        yield draft.trim();
+        return;
+      }
       if (text.includes("Разбери законченную сессию")) {
         yield reviews.shift() ?? reviewText({});
         return;
@@ -371,6 +376,10 @@ test("линия заказчика теряет отдельное предло
         messages: call.messages.map((message) => ({ role: message.role, text: message.text })),
       });
       const text = call.messages[0]?.text ?? "";
+      if (text.startsWith("Собери линию поведения персонажа заказчика.")) {
+        yield (text.split("\nЧерновик линии:\n")[1] ?? "").trim();
+        return;
+      }
       if (text.includes("Разбери законченную сессию")) {
         yield reviewText({
           line: `Давить на срок. ${privateSentence} ${proposal}`,

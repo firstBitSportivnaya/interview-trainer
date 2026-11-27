@@ -7,7 +7,14 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 
 import { DRAFT_TOKENS, ModelFailure, REPLY_TOKENS, REVIEW_TOKENS, type ModelCall, type ModelPort } from "../src/model.ts";
-import { customerVoices, DRAFT_LIMIT, openTrainer, type OpenSessionResult, type SpeechEvent } from "../src/trainer.ts";
+import {
+  CUSTOMER_LINE_TASK,
+  customerVoices,
+  DRAFT_LIMIT,
+  openTrainer,
+  type OpenSessionResult,
+  type SpeechEvent,
+} from "../src/trainer.ts";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -1648,7 +1655,7 @@ test("обрыв по длине не заканчивает сессию, не 
   assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
   assert.equal(trainer.readReview(openedSession.session.id), undefined);
   assert.deepEqual(trainer.readPreparation(prepared.caseId, "аналитик", "владелец"), notes);
-  assert.deepEqual(limits, [REPLY_TOKENS, DRAFT_TOKENS, REVIEW_TOKENS]);
+  assert.deepEqual(limits, [REPLY_TOKENS, REPLY_TOKENS, DRAFT_TOKENS, REVIEW_TOKENS]);
   assert.ok(DRAFT_TOKENS >= DRAFT_LIMIT);
   assert.notEqual(DRAFT_TOKENS, REPLY_TOKENS);
   assert.notEqual(REVIEW_TOKENS, REPLY_TOKENS);
@@ -1857,4 +1864,97 @@ test("прокси установки прячет пароль и неадре�
   assert.deepEqual(trainer.clearProxy({ executorId: "чужой" }), { ok: false, reason: "forbidden" });
   assert.deepEqual(trainer.clearProxy(), { ok: true });
   assert.equal(trainer.proxyPreview(), undefined);
+});
+
+test("линия персонажа заказчика собирается вызовом без текста служебного слоя", async () => {
+  const secret = "СЕКРЕТ-МАРЖА-64 ночная ставка склада.";
+  const paraphrase = "Ночная маржа склада завышена и вслух не называется.";
+  const crib = "ШПАРГАЛКА-64 спросить про ворота.";
+  const calls: ModelCall[] = [];
+  const trainer = start(tempDirectory(), {
+    async *complete(call) {
+      calls.push({
+        protocol: call.protocol,
+        baseAddress: call.baseAddress,
+        modelName: call.modelName,
+        secret: call.secret,
+        messages: call.messages.map((message) => ({ role: message.role, text: message.text })),
+      });
+      const text = call.messages[0]?.text ?? "";
+      if (text.startsWith(CUSTOMER_LINE_TASK)) {
+        yield "Давить на срок.";
+        return;
+      }
+      yield "Какой срок внедрения?";
+    },
+  });
+  assert.deepEqual(trainer.saveKey(keyDraft), { ok: true });
+  const keyId = trainer.listKeys()[0]?.id;
+  assert.ok(keyId);
+  const savedCase = trainer.saveCase({
+    customerName: "Север",
+    title: "Внедрение склада",
+    characters: ["Анна"],
+  });
+  assert.ok(savedCase.ok);
+  const approved = trainer.approveDossier({
+    caseId: savedCase.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: secret,
+    crib,
+  });
+  assert.ok(approved.ok);
+  assert.deepEqual(
+    trainer.writePreparation({
+      caseId: savedCase.caseRecord.id,
+      role: "аналитик",
+      executorId: "владелец",
+      note: `Давить на срок. ${secret} ${paraphrase}`,
+    }).ok,
+    true,
+  );
+
+  const customer = trainer.openSession({
+    caseId: savedCase.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "заказчик",
+    character: "Анна",
+    role: "аналитик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.ok(customer.ok);
+  await take(trainer.openingQuestion(customer.session.id));
+
+  const lineCall = calls.find((call) => call.messages[0]?.text.startsWith(CUSTOMER_LINE_TASK));
+  assert.ok(lineCall);
+  const lineRequest = lineCall.messages[0]?.text ?? "";
+  assert.equal(lineRequest.includes(secret), false);
+  assert.equal(lineRequest.includes(crib), false);
+  assert.equal(lineRequest.includes(paraphrase), true);
+
+  const customerPrompt = calls.at(-1)?.messages[0]?.text ?? "";
+  assert.equal(customerPrompt.startsWith(CUSTOMER_LINE_TASK), false);
+  assert.equal(customerPrompt.includes("Давить на срок."), true);
+  assert.equal(customerPrompt.includes(paraphrase), false);
+  assert.equal(customerPrompt.includes(secret), false);
+  const stored = trainer.readPreparation(savedCase.caseRecord.id, "аналитик", "владелец");
+  assert.equal(stored?.notes[0]?.includes(secret), true);
+  assert.equal(stored?.notes[0]?.includes(paraphrase), true);
+
+  const internal = trainer.openSession({
+    caseId: savedCase.caseRecord.id,
+    dossierId: approved.dossier.id,
+    side: "внутренняя команда",
+    character: "функциональный архитектор",
+    role: "разработчик",
+    executorId: "владелец",
+    keyId,
+  });
+  assert.ok(internal.ok);
+  await take(trainer.openingQuestion(internal.session.id));
+  const internalPrompt = calls.at(-1)?.messages[0]?.text ?? "";
+  assert.equal(internalPrompt.includes("Служебный слой:"), true);
+  assert.equal(internalPrompt.includes(secret), true);
+  assert.equal(calls.filter((call) => call.messages[0]?.text.startsWith(CUSTOMER_LINE_TASK)).length, 1);
 });

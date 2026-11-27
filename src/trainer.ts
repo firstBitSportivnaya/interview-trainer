@@ -1691,6 +1691,30 @@ function withoutServiceText(text: string, secrets: readonly string[]): string {
   return next.trim();
 }
 
+/** Первая строка вызова, который собирает линию персонажа заказчика. Служебный слой в этот вызов не входит. */
+export const CUSTOMER_LINE_TASK = "Собери линию поведения персонажа заказчика.";
+
+/**
+ * Запрос линии для персонажа заказчика.
+ * В тексте нет служебного слоя: черновик уже без дословных служебных кусков.
+ * Пересказ служебного факта другими словами этот вызов должен отбросить.
+ */
+function customerLinePrompt(material: string, draft: string): string {
+  return [
+    CUSTOMER_LINE_TASK,
+    "Служебный слой в этот запрос не входит.",
+    "Черновик мог пересказать служебный факт другими словами. Такой факт в линию не переноси.",
+    "Оставь только как вести разговор. Фактов из черновика не добавляй.",
+    "Верни только текст линии.",
+    "",
+    "Материал проекта:",
+    material,
+    "",
+    "Черновик линии:",
+    draft,
+  ].join("\n");
+}
+
 /** Убирает из линии текст служебного слоя и служебные записи любого статуса. */
 function behaviorLine(notes: readonly string[], entries: readonly PreparationEntry[], serviceLayer: string): string {
   const secrets = hiddenServiceTexts(serviceLayer, entries);
@@ -2797,9 +2821,47 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     return { ...keepDisputedNumbers(ranked, visible, claimsByLayer), edges };
   }
 
+  /** Линия заказчика, уже собранная вызовом без служебного слоя. Ключ — черновик и материал. */
+  const customerLines = new Map<string, string>();
+
+  /**
+   * Собирает линию персонажа заказчика вызовом, в который служебный слой не входит.
+   * Вырезание подстроки готовит черновик и остаётся вторым фильтром, не единственной гарантией.
+   * Пустой черновик вызов не делает. Сбой вызова оставляет черновик.
+   */
+  async function assembleCustomerLine(
+    session: SessionRecord,
+    material: string,
+    draft: string,
+    secrets: readonly string[],
+  ): Promise<string> {
+    const cacheKey = `${session.caseId}\u0000${session.role}\u0000${session.executorId}\u0000${material}\u0000${draft}`;
+    const cached = customerLines.get(cacheKey);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const spoken = { text: "", failed: false };
+    for await (const event of streamKey(
+      session,
+      [{ role: "user", text: customerLinePrompt(material, draft) }],
+      spoken,
+    )) {
+      if (event.kind === "failure") {
+        spoken.failed = true;
+      }
+    }
+    const assembled = withoutServiceText(spoken.text, secrets);
+    const line = spoken.failed || !assembled ? draft : assembled;
+    if (!spoken.failed && assembled) {
+      customerLines.set(cacheKey, line);
+    }
+    return line;
+  }
+
   /**
    * Задание персонажу открытой сессии.
-   * Заказчик получает линию без текста служебного слоя. Внутренняя команда читает ход целиком.
+   * Заказчик с непустым черновиком линии ещё ждёт вызов без служебного слоя: текст задания тогда пуст.
+   * Внутренняя команда читает ход целиком и служебный слой.
    * Профиль исполнителя этой сессии входит персонажу заказчика только при стоящей отметке.
    * Фрагмент берётся из текстов, с которыми сессия открыта, и фактом не называется.
    */
@@ -2807,7 +2869,8 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
     session: SessionRecord,
     task: string,
     turn: TurnFragments,
-  ): { ok: true; text: string } | { ok: false } {
+    preparedLine?: string,
+  ): { ok: true; text: string; customerLine?: { material: string; draft: string; secrets: readonly string[] } } | { ok: false } {
     const dossier = loadDossier(session.dossierId);
     const caseRow = database.prepare(`${caseQuery} WHERE cases.id = ?`).get(session.caseId) as Row | undefined;
     if (!dossier || !caseRow) {
@@ -2835,7 +2898,12 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       };
     }
     const caseRecord = loadCase(caseRow);
-    const behavior = behaviorLine(notes, entries, dossier.serviceLayer);
+    const secrets = hiddenServiceTexts(dossier.serviceLayer, entries);
+    const draft = behaviorLine(notes, entries, dossier.serviceLayer);
+    if (draft && preparedLine === undefined) {
+      return { ok: true, text: "", customerLine: { material: dossier.material, draft, secrets } };
+    }
+    const behavior = preparedLine ?? "";
     return {
       ok: true,
       text: customerPrompt({
@@ -3631,7 +3699,17 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
           session.role,
           session.side === "заказчик" && portfolioMarked(session.caseId),
         );
-        const task = characterTask(session, taskText, await fragmentsForTurn(session, taskText));
+        const turn = await fragmentsForTurn(session, taskText);
+        let task = characterTask(session, taskText, turn);
+        if (task.ok && task.customerLine) {
+          const line = await assembleCustomerLine(
+            session,
+            task.customerLine.material,
+            task.customerLine.draft,
+            task.customerLine.secrets,
+          );
+          task = characterTask(session, taskText, turn, line);
+        }
         if (!task.ok) {
           yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
           return;
@@ -3680,7 +3758,17 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
         if (!current || current.status !== "open") {
           return;
         }
-        const task = characterTask(current, text, await fragmentsForTurn(current, text));
+        const turn = await fragmentsForTurn(current, text);
+        let task = characterTask(current, text, turn);
+        if (task.ok && task.customerLine) {
+          const line = await assembleCustomerLine(
+            current,
+            task.customerLine.material,
+            task.customerLine.draft,
+            task.customerLine.secrets,
+          );
+          task = characterTask(current, text, turn, line);
+        }
         if (!task.ok) {
           yield { kind: "failure", reason: "missing", message: FAILURE_MESSAGE.missing };
           return;
