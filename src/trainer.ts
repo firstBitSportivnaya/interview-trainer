@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
+import { chmodSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { join } from "node:path";
 
@@ -688,6 +688,11 @@ function isMissingFile(error: unknown): boolean {
   return !!error && typeof error === "object" && "code" in error && error.code === "ENOENT";
 }
 
+/** Копия уже лежит. Повторный старт её не трогает. */
+function isAlreadyExists(error: unknown): boolean {
+  return !!error && typeof error === "object" && "code" in error && error.code === "EEXIST";
+}
+
 function isUniqueConstraint(error: unknown): boolean {
   return !!error && typeof error === "object" && "errcode" in error && error.errcode === SQLITE_CONSTRAINT_UNIQUE;
 }
@@ -871,8 +876,18 @@ function setStoreVersion(database: DatabaseSync, version: number): void {
 }
 
 /** Копия файла до первого шага. Имя называет версию, с которой началась миграция. */
+/**
+ * Копия файла до первого шага. Имя называет версию, с которой началась миграция.
+ * Уже лежащую копию не затирает: старт после обрыва шага оставляет копию нетронутой.
+ */
 function backupStore(databaseFile: string, version: number): void {
-  copyFileSync(databaseFile, `${databaseFile}.v${version}.bak`);
+  try {
+    copyFileSync(databaseFile, `${databaseFile}.v${version}.bak`, constants.COPYFILE_EXCL);
+  } catch (error) {
+    if (!isAlreadyExists(error)) {
+      throw error;
+    }
+  }
 }
 
 /**

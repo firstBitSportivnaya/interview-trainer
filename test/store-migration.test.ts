@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -115,6 +115,20 @@ test("копия файла лежит до шага, и версия стано
   assert.deepEqual(readFileSync(backup), before);
   assert.equal(version(directory), STORE_VERSION);
   assert.notDeepEqual(readFileSync(storeFile), before);
+});
+
+test("уже лежащая копия не перезаписывается при повторном старте", () => {
+  const directory = tempDirectory();
+  const ids = seed(directory);
+  forgetVersion(directory);
+
+  const backup = join(directory, "store.sqlite.v0.bak");
+  writeFileSync(backup, "копия до шага");
+
+  const trainer = start(directory);
+  assert.equal(trainer.readCase(ids.caseId)?.title, "Миграция");
+  assert.equal(readFileSync(backup, "utf8"), "копия до шага");
+  assert.equal(version(directory), STORE_VERSION);
 });
 
 test("без копии миграция не начинается и файл не меняется", () => {
