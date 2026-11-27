@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { join } from "node:path";
 
@@ -391,6 +391,8 @@ const LEGACY_KEYS = "keys.json";
 /** Снимок keys.json, уже снятый с пути, куда пишет прежний процесс. */
 const LEGACY_STAGING = "keys.json.migrating";
 const STORE_FILE = "store.sqlite";
+/** Текущая версия формы хранилища. Растёт вместе с шагом в списке `STORE_MIGRATIONS`. */
+export const STORE_VERSION = 1;
 const SESSION_COLUMNS = "id, case_id, dossier_id, side, character_name, role, executor_id, key_id, status";
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
@@ -832,6 +834,65 @@ function ensureSessionShape(database: DatabaseSync): void {
     });
   } finally {
     database.exec("PRAGMA foreign_keys = ON");
+  }
+}
+
+/** Шаг миграции: номер версии после шага и перенос прежней формы. */
+interface StoreMigration {
+  readonly version: number;
+  apply(database: DatabaseSync): void;
+}
+
+/**
+ * Шаги по возрастанию номера. Шаг знает прежнюю форму и не угадывает её по подстроке в DDL.
+ * Повторный запуск на текущей версии шагов не выполняет.
+ */
+const STORE_MIGRATIONS: readonly StoreMigration[] = [
+  {
+    version: 1,
+    apply(database) {
+      database.exec(schemaSql());
+      ensureCaseShape(database);
+      ensureSessionShape(database);
+      ensureProfileShape(database);
+      ensureFragmentShape(database);
+      ensureRecognizedShape(database);
+    },
+  },
+];
+
+function storeVersion(database: DatabaseSync): number {
+  const row = database.prepare("PRAGMA user_version").get() as Row | undefined;
+  return typeof row?.user_version === "number" ? row.user_version : 0;
+}
+
+function setStoreVersion(database: DatabaseSync, version: number): void {
+  database.exec(`PRAGMA user_version = ${version}`);
+}
+
+/** Копия файла до первого шага. Имя называет версию, с которой началась миграция. */
+function backupStore(databaseFile: string, version: number): void {
+  copyFileSync(databaseFile, `${databaseFile}.v${version}.bak`);
+}
+
+/**
+ * Догоняет форму хранилища по номерам. Копия не легла — файл не трогаем.
+ * Свежий файл копии не требует: терять в нём нечего.
+ */
+function migrateStore(database: DatabaseSync, databaseFile: string, existed: boolean): void {
+  const from = storeVersion(database);
+  const pending = STORE_MIGRATIONS.filter((migration) => migration.version > from).sort(
+    (left, right) => left.version - right.version,
+  );
+  if (pending.length === 0) {
+    return;
+  }
+  if (existed) {
+    backupStore(databaseFile, from);
+  }
+  for (const migration of pending) {
+    migration.apply(database);
+    setStoreVersion(database, migration.version);
   }
 }
 
@@ -1927,17 +1988,13 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
   chmodSync(directory, 0o700);
 
   const databaseFile = join(directory, STORE_FILE);
+  const storeExisted = existsSync(databaseFile);
   const database = new DatabaseSync(databaseFile, { enableForeignKeyConstraints: true });
 
   try {
     chmodSync(databaseFile, 0o600);
     database.exec("PRAGMA busy_timeout = 5000");
-    database.exec(schemaSql());
-    ensureCaseShape(database);
-    ensureSessionShape(database);
-    ensureProfileShape(database);
-    ensureFragmentShape(database);
-    ensureRecognizedShape(database);
+    migrateStore(database, databaseFile, storeExisted);
     migrateLegacyKeys(database, directory);
     if (hasPlaintextSecret(database) || vacuumPending(database)) {
       setVacuumPending(database, true);
