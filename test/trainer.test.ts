@@ -8,6 +8,7 @@ import { after, test } from "node:test";
 
 import { DRAFT_TOKENS, ModelFailure, REPLY_TOKENS, REVIEW_TOKENS, type ModelCall, type ModelPort } from "../src/model.ts";
 import { customerVoices, DRAFT_LIMIT, openTrainer, type OpenSessionResult, type SpeechEvent } from "../src/trainer.ts";
+import { withoutTime } from "./records.ts";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -693,7 +694,7 @@ test("в диалог попадает только досье после пра
     crib: drafted.draft.crib,
   });
   assert.ok(approved.ok);
-  assert.deepEqual(trainer.readApprovedDossier(prepared.caseId), {
+  assert.deepEqual(withoutTime(trainer.readApprovedDossier(prepared.caseId)), {
     id: approved.dossier.id,
     caseId: prepared.caseId,
     material: "Паллеты принимают поштучно.",
@@ -1131,14 +1132,14 @@ test("проект, досье, сессия, ход подготовки и к�
     characters: [],
     portfolioSent: false,
   });
-  assert.deepEqual(restarted.readDossier(prepared.dossierId), {
+  assert.deepEqual(withoutTime(restarted.readDossier(prepared.dossierId)), {
     id: prepared.dossierId,
     caseId: prepared.caseId,
     material: "Склад принимает паллеты.",
     serviceLayer: "Маржа подрядчика 12%.",
     crib: "Спросить про сроки.",
   });
-  assert.deepEqual(restarted.readSession(openedSession.session.id), {
+  assert.deepEqual(withoutTime(restarted.readSession(openedSession.session.id)), {
     id: openedSession.session.id,
     caseId: prepared.caseId,
     dossierId: prepared.dossierId,
@@ -1553,7 +1554,7 @@ test("оборванная фраза персонажа не попадает �
     { kind: "speech", text: "Срок поставки — " },
     { kind: "failure", reason: "timeout", message: "Модель не ответила вовремя." },
   ]);
-  assert.deepEqual(trainer.readTranscript(openedSession.session.id), [
+  assert.deepEqual(withoutTime(trainer.readTranscript(openedSession.session.id)), [
     { speaker: "исполнитель", kind: "реплика", text: "Какой срок поставки?" },
   ]);
   assert.equal(trainer.readSession(openedSession.session.id)?.status, "open");
@@ -1588,7 +1589,7 @@ test("договорённая реплика персонажа целиком 
   assert.ok(openedSession.ok);
 
   await take(trainer.reply(openedSession.session.id, "Какой срок поставки?"));
-  assert.deepEqual(trainer.readTranscript(openedSession.session.id), [
+  assert.deepEqual(withoutTime(trainer.readTranscript(openedSession.session.id)), [
     { speaker: "исполнитель", kind: "реплика", text: "Какой срок поставки?" },
     { speaker: "персонаж", kind: "ответ", text: "Срок поставки — июнь." },
   ]);
@@ -1858,3 +1859,101 @@ test("прокси установки прячет пароль и неадре�
   assert.deepEqual(trainer.clearProxy(), { ok: true });
   assert.equal(trainer.proxyPreview(), undefined);
 });
+
+test("время открытия сессии одно и то же при чтении", () => {
+  const directory = tempDirectory();
+  const trainer = start(directory);
+  const prepared = prepare(trainer);
+  const opened = openAnalyst(trainer, prepared);
+  assert.ok(opened.ok);
+
+  const at = trainer.readSession(opened.session.id)?.createdAt;
+  assert.equal(typeof at, "string");
+  assert.equal((at ?? "").length > 0, true);
+  assert.equal(trainer.readSession(opened.session.id)?.createdAt, at);
+
+  trainer.close();
+  const restarted = start(directory);
+  assert.equal(restarted.readSession(opened.session.id)?.createdAt, at);
+});
+
+test("у каждой реплики стенограммы своё время, и вторая не раньше первой", async () => {
+  const trainer = start(tempDirectory(), remember([]));
+  const prepared = prepare(trainer);
+  const opened = openAnalyst(trainer, prepared);
+  assert.ok(opened.ok);
+
+  await take(trainer.reply(opened.session.id, "Какой срок поставки?"));
+  await take(trainer.reply(opened.session.id, "А маржа?"));
+
+  const lines = trainer.readTranscript(opened.session.id) ?? [];
+  assert.equal(lines.length, 4);
+  for (const line of lines) {
+    assert.equal((line.createdAt ?? "").length > 0, true);
+  }
+  assert.equal((lines[1]?.createdAt ?? "") >= (lines[0]?.createdAt ?? ""), true);
+  assert.equal((lines[2]?.createdAt ?? "") >= (lines[1]?.createdAt ?? ""), true);
+  assert.equal((lines[3]?.createdAt ?? "") >= (lines[2]?.createdAt ?? ""), true);
+});
+
+test("у каждой версии досье своё время, а открытая сессия держит прежнюю", () => {
+  const trainer = start(tempDirectory());
+  const prepared = prepare(trainer);
+  const opened = openAnalyst(trainer, prepared);
+  assert.ok(opened.ok);
+
+  const second = trainer.approveDossier({
+    caseId: prepared.caseId,
+    material: "Склад принимает паллеты и коробки.",
+    serviceLayer: "Маржа подрядчика 12%.",
+    crib: "Спросить про сроки.",
+  });
+  assert.ok(second.ok);
+
+  const first = trainer.readDossier(prepared.dossierId);
+  assert.equal((first?.createdAt ?? "").length > 0, true);
+  assert.equal((second.dossier.createdAt ?? "").length > 0, true);
+  assert.notEqual(second.dossier.id, prepared.dossierId);
+  assert.equal(trainer.readApprovedDossier(prepared.caseId)?.id, second.dossier.id);
+  assert.equal(trainer.readSession(opened.session.id)?.dossierId, prepared.dossierId);
+});
+
+test("хранилище без колонок времени открывается и текст не теряет", async () => {
+  const directory = tempDirectory();
+  const trainer = start(directory, remember([]));
+  const prepared = prepare(trainer);
+  const opened = openAnalyst(trainer, prepared);
+  assert.ok(opened.ok);
+  await take(trainer.reply(opened.session.id, "Какой срок поставки?"));
+  trainer.close();
+
+  const database = new DatabaseSync(join(directory, "store.sqlite"));
+  database.exec(`
+    ALTER TABLE sessions DROP COLUMN created_at;
+    ALTER TABLE transcript DROP COLUMN created_at;
+    ALTER TABLE dossiers DROP COLUMN created_at;
+    PRAGMA user_version = 1;
+  `);
+  database.close();
+
+  const restarted = start(directory);
+  const session = restarted.readSession(opened.session.id);
+  assert.equal(session?.createdAt, "");
+  assert.equal(session?.status, "open");
+  assert.equal(session?.dossierId, prepared.dossierId);
+
+  const lines = restarted.readTranscript(opened.session.id) ?? [];
+  assert.equal(lines.length, 2);
+  assert.equal(
+    lines.every((line) => line.createdAt === ""),
+    true,
+  );
+  assert.equal(lines[0]?.text, "Какой срок поставки?");
+  assert.equal(lines[0]?.kind, "реплика");
+
+  const dossier = restarted.readDossier(prepared.dossierId);
+  assert.equal(dossier?.createdAt, "");
+  assert.equal(dossier?.material, "Склад принимает паллеты.");
+  assert.equal(restarted.listKeys().length, 1);
+});
+

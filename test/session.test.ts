@@ -6,6 +6,7 @@ import { after, test } from "node:test";
 
 import { type ModelCall, ModelFailure, type ModelPort } from "../src/model.ts";
 import { ABSENT_FACT, openTrainer, type SpeechEvent } from "../src/trainer.ts";
+import { withoutTime } from "./records.ts";
 
 const directories: string[] = [];
 const opened: Array<ReturnType<typeof openTrainer>> = [];
@@ -152,7 +153,7 @@ test("персонаж задаёт один вопрос и делает пау
   assert.equal(calls[0]?.messages[0]?.text.includes("Спросить про сроки."), false);
   assert.deepEqual(await take(trainer.openingQuestion(openedSession.session.id)), []);
   assert.equal(calls.length, 1);
-  assert.deepEqual(trainer.readTranscript(openedSession.session.id), [
+  assert.deepEqual(withoutTime(trainer.readTranscript(openedSession.session.id)), [
     { speaker: "персонаж", kind: "вопрос", text: "Как принимаете паллеты?" },
   ]);
 });
@@ -176,7 +177,7 @@ test("исполнитель спрашивает, не дожидаясь во�
     { kind: "speech", text: "Склад принимает паллеты." },
   ]);
   assert.equal(calls.length, 1);
-  assert.deepEqual(trainer.readTranscript(openedSession.session.id), [
+  assert.deepEqual(withoutTime(trainer.readTranscript(openedSession.session.id)), [
     { speaker: "исполнитель", kind: "реплика", text: "Какие паллеты принимает склад?" },
     { speaker: "персонаж", kind: "ответ", text: "Склад принимает паллеты." },
   ]);
@@ -280,7 +281,7 @@ test("оборванный первый вопрос не закрывает п�
     { kind: "speech", text: "Как принимаете паллеты?" },
   ]);
   assert.equal(calls, 2);
-  assert.deepEqual(trainer.readTranscript(openedSession.session.id), [
+  assert.deepEqual(withoutTime(trainer.readTranscript(openedSession.session.id)), [
     { speaker: "персонаж", kind: "вопрос", text: "Как принимаете паллеты?" },
   ]);
 });
@@ -363,7 +364,7 @@ test("персонаж внутренней команды читает служ
   assert.equal(replyCall.includes("Маржа подрядчика 12%."), true);
   assert.equal(replyCall.includes("Спросить про сроки."), false);
   assert.equal(replyCall === "Какая маржа?", false);
-  assert.deepEqual(trainer.readTranscript(openedSession.session.id), [
+  assert.deepEqual(withoutTime(trainer.readTranscript(openedSession.session.id)), [
     { speaker: "исполнитель", kind: "реплика", text: "Какая маржа?" },
     { speaker: "персонаж", kind: "ответ", text: "Маржа подрядчика 12%." },
   ]);
@@ -600,11 +601,11 @@ test("две открытые тройки одного проекта не см
     { kind: "speech", text: "ответ: Вопрос разработчика" },
   ]);
 
-  assert.deepEqual(trainer.readTranscript(analyst.session.id), [
+  assert.deepEqual(withoutTime(trainer.readTranscript(analyst.session.id)), [
     { speaker: "исполнитель", kind: "реплика", text: "Вопрос аналитика" },
     { speaker: "персонаж", kind: "ответ", text: "ответ: Вопрос аналитика" },
   ]);
-  assert.deepEqual(trainer.readTranscript(developer.session.id), [
+  assert.deepEqual(withoutTime(trainer.readTranscript(developer.session.id)), [
     { speaker: "исполнитель", kind: "реплика", text: "Вопрос разработчика" },
     { speaker: "персонаж", kind: "ответ", text: "ответ: Вопрос разработчика" },
   ]);
