@@ -3028,11 +3028,22 @@ test("черновик с пустыми полями и ошибки сборк
     assert.equal(tooBig.status, 413);
     assert.equal(approveTrainer.readApprovedDossier(project.caseRecord.id), undefined);
 
-    const approved = await fetch(`${base}/cases/${project.caseRecord.id}/approve`, {
+    const emptyApprove = await fetch(`${base}/cases/${project.caseRecord.id}/approve`, {
       method: "POST",
       redirect: "manual",
       headers,
       body: new URLSearchParams({ material: "", serviceLayer: "", crib: "" }),
+    });
+    assert.equal(emptyApprove.status, 200);
+    const emptyApprovePage = await emptyApprove.text();
+    assert.equal(emptyApprovePage.includes("Пустое досье не утверждается"), true);
+    assert.equal(approveTrainer.readApprovedDossier(project.caseRecord.id), undefined);
+
+    const approved = await fetch(`${base}/cases/${project.caseRecord.id}/approve`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ material: "Паллеты принимают поштучно.", serviceLayer: "", crib: "" }),
     });
     assert.equal(approved.status, 303);
     assert.equal(approved.headers.get("location"), `/cases/${project.caseRecord.id}`);
@@ -3040,11 +3051,11 @@ test("черновик с пустыми полями и ошибки сборк
     const stored = approveTrainer.readApprovedDossier(project.caseRecord.id);
     assert.deepEqual(
       stored && { material: stored.material, serviceLayer: stored.serviceLayer, crib: stored.crib },
-      { material: "", serviceLayer: "", crib: "" },
+      { material: "Паллеты принимают поштучно.", serviceLayer: "", crib: "" },
     );
     const back = await (await fetch(`${base}/cases/${project.caseRecord.id}`)).text();
     assert.equal(back.includes("Досье утверждено"), true);
-    assert.equal(back.includes("<pre></pre>"), true);
+    assert.equal(back.includes("<pre>Паллеты принимают поштучно.</pre>"), true);
     assert.equal(back.includes("Утверждённого досье ещё нет"), false);
     assert.equal(back.includes('name="keyId"'), false);
   } finally {
@@ -3653,6 +3664,100 @@ test("битый процент в адресе проекта и сессии �
     const normal = await fetch(`${base}/cases/${saved.caseRecord.id}`);
     assert.equal(normal.status, 200);
     await normal.text();
+  } finally {
+    await close(server);
+  }
+});
+
+test("заказчик и проект заводятся без ложной ошибки, пустое досье не утверждается", async () => {
+  const trainer = start(tempDirectory());
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+
+    const created = await fetch(`${base}/customers`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ customerName: "Север", title: "Внедрение склада", characters: "" }),
+    });
+    assert.equal(created.status, 303);
+    const location = created.headers.get("location") ?? "";
+    assert.match(location, /^\/cases\/[^/?]+$/);
+    assert.equal(location.includes("error="), false);
+
+    const projectId = location.slice("/cases/".length);
+    const project = await (await fetch(`${base}${location}`)).text();
+    assert.equal(project.includes("Внедрение склада"), true);
+    assert.equal(project.includes("Укажите заказчика и название проекта."), false);
+
+    const emptyName = await fetch(`${base}/customers`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ customerName: "  ", title: "Пустой заказчик" }),
+    });
+    assert.equal(emptyName.status, 303);
+    assert.equal(emptyName.headers.get("location"), "/cases?error=incomplete");
+    assert.equal(trainer.listCases().length, 1);
+    const errorPage = await (await fetch(`${base}/cases?error=incomplete`)).text();
+    assert.equal(errorPage.includes("Укажите заказчика и название проекта."), true);
+
+    const emptyApprove = await fetch(`${base}/cases/${projectId}/approve`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ material: "", serviceLayer: "", crib: " " }),
+    });
+    assert.notEqual(emptyApprove.status, 404);
+    const emptyPage = await emptyApprove.text();
+    assert.equal(emptyPage.includes("Пустое досье не утверждается"), true);
+    assert.equal(trainer.readApprovedDossier(projectId), undefined);
+
+    const filled = await fetch(`${base}/cases/${projectId}/approve`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ material: "Склад принимает паллеты.", serviceLayer: "", crib: "" }),
+    });
+    assert.equal(filled.status, 303);
+    assert.equal(filled.headers.get("location"), `/cases/${projectId}`);
+    assert.equal(trainer.readApprovedDossier(projectId)?.material, "Склад принимает паллеты.");
+  } finally {
+    await close(server);
+  }
+});
+
+test("отказ сохранения по чужой причине не подписан как пустая форма", async () => {
+  const trainer = start(tempDirectory());
+  const server = await startWeb({
+    ...trainer,
+    saveCase() {
+      return { ok: false as const, reason: "forbidden" as const };
+    },
+  });
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { "content-type": "application/x-www-form-urlencoded", origin: base };
+
+    const refused = await fetch(`${base}/customers`, {
+      method: "POST",
+      redirect: "manual",
+      headers,
+      body: new URLSearchParams({ customerName: "Север", title: "Внедрение склада" }),
+    });
+    assert.equal(refused.status, 303);
+    assert.equal(refused.headers.get("location"), "/cases?error=forbidden");
+
+    const page = await (await fetch(`${base}/cases?error=forbidden`)).text();
+    assert.equal(page.includes("Проект создаёт владелец."), true);
+    assert.equal(page.includes("Укажите заказчика и название проекта."), false);
+    assert.equal(trainer.listCases().length, 0);
   } finally {
     await close(server);
   }

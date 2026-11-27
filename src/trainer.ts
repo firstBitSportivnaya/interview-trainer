@@ -170,10 +170,10 @@ export type DossierRecord = {
   crib: string;
 };
 
-/** Отказ утвердить досье: проекта нет или досье утверждает не владелец. */
+/** Отказ утвердить досье: проекта нет, досье утверждает не владелец или все три слоя пусты. */
 export type ApproveDossierResult =
   | { ok: true; dossier: DossierRecord }
-  | { ok: false; reason: "missing" | "forbidden" };
+  | { ok: false; reason: "missing" | "forbidden" | "incomplete" };
 
 /** Сессия. Законченная хранит разбор отдельно от стенограммы. */
 export type SessionStatus = "open" | "finished";
@@ -3320,6 +3320,9 @@ export function openTrainer(directory: string, model: ModelPort = liveModel(), e
       }
       if (!caseExists(draft.caseId)) {
         return { ok: false, reason: "missing" };
+      }
+      if (!draft.material.trim() && !draft.serviceLayer.trim() && !draft.crib.trim()) {
+        return { ok: false, reason: "incomplete" };
       }
       const dossier: DossierRecord = {
         id: randomUUID(),

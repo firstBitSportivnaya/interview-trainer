@@ -1858,3 +1858,24 @@ test("прокси установки прячет пароль и неадре�
   assert.deepEqual(trainer.clearProxy(), { ok: true });
   assert.equal(trainer.proxyPreview(), undefined);
 });
+
+test("досье из трёх пустых слоёв не утверждается", () => {
+  const trainer = start(tempDirectory());
+  const saved = trainer.saveCase({ customerName: "Юг", title: "Пустое досье", characters: [] });
+  assert.ok(saved.ok);
+
+  assert.deepEqual(
+    trainer.approveDossier({ caseId: saved.caseRecord.id, material: "", serviceLayer: " ", crib: "\n" }),
+    { ok: false, reason: "incomplete" },
+  );
+  assert.equal(trainer.readApprovedDossier(saved.caseRecord.id), undefined);
+
+  const filled = trainer.approveDossier({
+    caseId: saved.caseRecord.id,
+    material: "Склад принимает паллеты.",
+    serviceLayer: "",
+    crib: "",
+  });
+  assert.ok(filled.ok);
+  assert.equal(trainer.readApprovedDossier(saved.caseRecord.id)?.material, "Склад принимает паллеты.");
+});

@@ -121,6 +121,11 @@ const CASE_ERROR: Record<Exclude<SaveCaseResult, { ok: true }>["reason"], string
   forbidden: "Проект создаёт владелец.",
 };
 
+const APPROVE_ERROR: Record<"incomplete" | "forbidden", string> = {
+  incomplete: "Пустое досье не утверждается: заполните хотя бы один слой.",
+  forbidden: "Досье утверждает владелец.",
+};
+
 const SESSION_ERROR: Record<Exclude<OpenSessionResult, { ok: true }>["reason"] | "character", string> = {
   incomplete: "Заполните проект, сторону, персонажа, роль исполнителя и ключ.",
   missing: "Проект, досье или ключ не найдены.",
@@ -1509,7 +1514,7 @@ function renderCase(
 }
 
 /** Страница правки. Утверждение записывает текст из этих полей, не ответ модели сам по себе. */
-function renderDraft(item: CaseRecord, draft: DossierLayers): string {
+function renderDraft(item: CaseRecord, draft: DossierLayers, error?: string): string {
   return page(
     item.title,
     `${pageHeading(`${item.customerName} — ${item.title}`, {
@@ -1517,6 +1522,7 @@ function renderDraft(item: CaseRecord, draft: DossierLayers): string {
       subtitle: "Черновик. Сессия его не читает, пока текст не поправлен и не утверждён.",
     })}
     <div class="card sheet">
+    ${notice(error)}
     <form method="post" action="${escapeHtml(casePath(item.id, "/approve"))}">
       ${layerAreas(draft)}
       <button type="submit" class="primary">Утвердить досье</button>
@@ -2067,7 +2073,7 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
       title: fields.get("title") ?? "",
       characters: characterLines(fields.get("characters") ?? ""),
     });
-    redirect(response, saved.ok ? casePath(saved.caseRecord.id) : "/cases?error=incomplete");
+    redirect(response, saved.ok ? casePath(saved.caseRecord.id) : `/cases?error=${saved.reason}`);
     return;
   }
 
@@ -2172,7 +2178,11 @@ async function handle(server: Server, trainer: Trainer, request: IncomingMessage
     }
     const approved = trainer.approveDossier({ caseId: item.id, ...layersFrom(fields) });
     if (!approved.ok) {
-      refuse(request, response, 404);
+      if (approved.reason === "missing") {
+        refuse(request, response, 404);
+        return;
+      }
+      sendHtml(response, renderDraft(item, layersFrom(fields), APPROVE_ERROR[approved.reason]));
       return;
     }
     redirect(response, casePath(item.id));
