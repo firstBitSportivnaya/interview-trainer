@@ -1,5 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, constants, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
+import {
+  chmodSync,
+  constants,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { join } from "node:path";
 
@@ -395,6 +405,7 @@ const STORE_FILE = "store.sqlite";
 export const STORE_VERSION = 1;
 const SESSION_COLUMNS = "id, case_id, dossier_id, side, character_name, role, executor_id, key_id, status";
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
+const SQLITE_NOTADB = 26;
 
 export const PERFORMER_ROLES = [
   "руководитель проекта",
@@ -688,9 +699,9 @@ function isMissingFile(error: unknown): boolean {
   return !!error && typeof error === "object" && "code" in error && error.code === "ENOENT";
 }
 
-/** Копия уже лежит. Повторный старт её не трогает. */
-function isAlreadyExists(error: unknown): boolean {
-  return !!error && typeof error === "object" && "code" in error && error.code === "EEXIST";
+/** Файл есть, но это не база. Такую копию старт не открывает и не переписывает. */
+function isNotDatabase(error: unknown): boolean {
+  return !!error && typeof error === "object" && "errcode" in error && error.errcode === SQLITE_NOTADB;
 }
 
 function isUniqueConstraint(error: unknown): boolean {
@@ -875,19 +886,84 @@ function setStoreVersion(database: DatabaseSync, version: number): void {
   database.exec(`PRAGMA user_version = ${version}`);
 }
 
-/** Копия файла до первого шага. Имя называет версию, с которой началась миграция. */
 /**
  * Копия файла до первого шага. Имя называет версию, с которой началась миграция.
- * Уже лежащую копию не затирает: старт после обрыва шага оставляет копию нетронутой.
+ * Уже лежащую копию повторный старт не затирает. Открытый секрет в новой копии сворачивается.
  */
 function backupStore(databaseFile: string, version: number): void {
-  try {
-    copyFileSync(databaseFile, `${databaseFile}.v${version}.bak`, constants.COPYFILE_EXCL);
-  } catch (error) {
-    if (!isAlreadyExists(error)) {
-      throw error;
-    }
+  const backup = `${databaseFile}.v${version}.bak`;
+  const temporary = `${backup}.partial`;
+  if (existsSync(backup) && statSync(backup).isFile()) {
+    removeStoreFile(temporary);
+  } else {
+    copyStoreExclusive(databaseFile, temporary, backup);
   }
+  sealBackupPlaintext(backup);
+}
+
+/** Пишет копию во временный файл и только потом даёт ей имя. Оборванное копирование копию не оставляет. */
+function copyStoreExclusive(databaseFile: string, temporary: string, backup: string): void {
+  removeStoreFile(temporary);
+  try {
+    copyFileSync(databaseFile, temporary, constants.COPYFILE_EXCL);
+    chmodSync(temporary, 0o600);
+    renameSync(temporary, backup);
+  } catch (error) {
+    removeStoreFile(temporary);
+    throw error;
+  }
+}
+
+function removeStoreFile(path: string): void {
+  if (existsSync(path) && statSync(path).isFile()) {
+    unlinkSync(path);
+  }
+}
+
+/** Сворачивает открытый секрет в копии-базе. Свёрнутую копию и файл, который базой не является, побайтно не трогает. */
+function sealBackupPlaintext(backupFile: string): void {
+  let keepsPlaintext = false;
+  try {
+    keepsPlaintext = backupKeepsPlaintext(backupFile);
+  } catch (error) {
+    if (isNotDatabase(error)) {
+      return;
+    }
+    throw error;
+  }
+  if (!keepsPlaintext) {
+    return;
+  }
+  const database = new DatabaseSync(backupFile);
+  try {
+    sealPlaintextSecrets(database);
+    database.exec("VACUUM");
+    if (tableExists(database, "store_flags")) {
+      setVacuumPending(database, false);
+    }
+  } finally {
+    database.close();
+  }
+  chmodSync(backupFile, 0o600);
+}
+
+function backupKeepsPlaintext(backupFile: string): boolean {
+  const database = new DatabaseSync(backupFile, { readOnly: true });
+  try {
+    if (!tableExists(database, "keys")) {
+      return false;
+    }
+    if (hasPlaintextSecret(database)) {
+      return true;
+    }
+    return tableExists(database, "store_flags") && vacuumPending(database);
+  } finally {
+    database.close();
+  }
+}
+
+function tableExists(database: DatabaseSync, name: string): boolean {
+  return database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
 }
 
 /**
