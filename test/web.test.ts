@@ -3467,6 +3467,29 @@ test("сессия не открывается без досье, без клю�
   }
 });
 
+test("страницы нельзя встроить во фрейм, и браузер не угадывает тип", async () => {
+  const trainer = start(tempDirectory());
+  const server = await startWeb(trainer);
+
+  try {
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+
+    for (const path of ["/", "/keys"]) {
+      const page = await fetch(`${base}${path}`);
+      assert.equal(page.status, 200, path);
+      assert.equal(page.headers.get("x-frame-options"), "DENY", path);
+      assert.equal(page.headers.get("content-security-policy"), "frame-ancestors 'none'", path);
+      assert.equal(page.headers.get("x-content-type-options"), "nosniff", path);
+      await page.text();
+    }
+
+    assert.equal((await fetch(`${base}/нет-страницы`)).status, 404);
+  } finally {
+    await close(server);
+  }
+});
+
 test("скринридер называет оболочку, а диалоги проекта и файла открываются с клавиатуры", async () => {
   const trainer = start(tempDirectory());
   const server = await startWeb(trainer);
