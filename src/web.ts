@@ -185,7 +185,8 @@ function escapeHtml(value: string): string {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 type ShellSection = "overview" | "projects" | "session" | "review" | "profile" | "keys";
@@ -1526,34 +1527,24 @@ function renderDraft(item: CaseRecord, draft: DossierLayers): string {
   );
 }
 
-/** Читает тело запроса и не держит в памяти больше заданного предела.
- *  После превышения дочитывает не больше того же предела плюс 64 КиБ и закрывает соединение.
+/**
+ * Читает тело запроса и не держит в памяти больше заданного предела.
+ * После превышения остаток дочитывается и выбрасывается: соединение остаётся годным,
+ * иначе ответ 413 уходил бы в оборванный сокет.
  */
 async function readRawBody(request: IncomingMessage, limit: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let size = 0;
   let overflow = false;
-  let extra = 0;
-  const extraBudget = limit + 64 * 1024;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     if (overflow) {
-      extra += buffer.length;
-      if (extra > extraBudget) {
-        request.destroy();
-        throw new Error("body too large");
-      }
       continue;
     }
     size += buffer.length;
     if (size > limit) {
       overflow = true;
       chunks.length = 0;
-      extra = size - limit;
-      if (extra > extraBudget) {
-        request.destroy();
-        throw new Error("body too large");
-      }
       continue;
     }
     chunks.push(buffer);

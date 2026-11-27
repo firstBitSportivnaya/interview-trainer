@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, test } from "node:test";
 import type { AddressInfo } from "node:net";
-import { request as httpRequest, type Server } from "node:http";
+import { Agent, request as httpRequest, type Server } from "node:http";
 
 import { ABSENT_FACT, DRAFT_LIMIT, openTrainer } from "../src/trainer.ts";
 import { ModelFailure } from "../src/model.ts";
@@ -3654,6 +3654,84 @@ test("битый процент в адресе проекта и сессии �
     assert.equal(normal.status, 200);
     await normal.text();
   } finally {
+    await close(server);
+  }
+});
+
+test("апостроф в тексте владельца не становится разметкой", async () => {
+  const trainer = start(tempDirectory());
+  const saved = trainer.saveCase({ customerName: "Север", title: "Апостроф", characters: [] });
+  assert.ok(saved.ok);
+  if (!saved.ok) {
+    return;
+  }
+  const approved = trainer.approveDossier({
+    caseId: saved.caseRecord.id,
+    material: "Дон'т сломает разметку",
+    serviceLayer: "",
+    crib: "",
+  });
+  assert.ok(approved.ok);
+
+  const server = await startWeb(trainer);
+  try {
+    const { port } = server.address() as AddressInfo;
+    const page = await (await fetch(`http://127.0.0.1:${port}/cases/${saved.caseRecord.id}`)).text();
+    assert.equal(page.includes("Дон&#39;т сломает разметку"), true);
+    assert.equal(page.includes("Дон'т"), false);
+  } finally {
+    await close(server);
+  }
+});
+
+test("ответ 413 дочитывает тело, и следующая просьба идёт по тому же соединению", async () => {
+  const trainer = start(tempDirectory());
+  const server = await startWeb(trainer);
+  const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+
+  try {
+    const { port } = server.address() as AddressInfo;
+    const send = (body?: string) =>
+      new Promise<{ status: number; localPort?: number }>((resolve, reject) => {
+        const request = httpRequest(
+          {
+            host: "127.0.0.1",
+            port,
+            method: body === undefined ? "GET" : "POST",
+            path: body === undefined ? "/" : "/cases",
+            agent,
+            headers:
+              body === undefined
+                ? {}
+                : {
+                    "content-type": "application/x-www-form-urlencoded",
+                    "content-length": Buffer.byteLength(body),
+                    origin: `http://127.0.0.1:${port}`,
+                  },
+          },
+          (response) => {
+            const localPort = response.socket?.localPort;
+            response.resume();
+            response.on("end", () => resolve({ status: response.statusCode ?? 0, localPort }));
+          },
+        );
+        request.on("error", reject);
+        request.end(body);
+      });
+
+    const big = `material=${"я".repeat(Math.ceil((TEXT_BODY_LIMIT * 3) / 2))}`;
+    const tooBig = await send(big);
+    assert.equal(tooBig.status, 413);
+
+    const next = await send();
+    assert.equal(next.status, 200);
+    assert.equal(typeof tooBig.localPort, "number");
+    assert.equal(next.localPort, tooBig.localPort);
+
+    const small = await send("material=текст");
+    assert.notEqual(small.status, 413);
+  } finally {
+    agent.destroy();
     await close(server);
   }
 });
