@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -36,4 +36,48 @@ test("без файла распознавателя надписи нет и с
     assert.equal(calls.length, 0);
     assert.equal(text, "");
   });
+});
+
+test("распознавание завершает воркер и не копит их", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "trainer-recognize-"));
+  directories.push(directory);
+  writeFileSync(join(directory, "rus.traineddata"), "данные");
+
+  let opened = 0;
+  let terminated = 0;
+  const recognizer = liveRecognizer(directory, async () => {
+    opened += 1;
+    return {
+      async recognize() {
+        return "НАДПИСЬ";
+      },
+      async terminate() {
+        terminated += 1;
+      },
+    };
+  });
+
+  assert.equal(await recognizer.recognize(Uint8Array.of(1)), "НАДПИСЬ");
+  assert.equal(await recognizer.recognize(Uint8Array.of(2)), "НАДПИСЬ");
+  assert.equal(opened, 2);
+  assert.equal(terminated, 2);
+});
+
+test("сбой распознавания тоже завершает воркер", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "trainer-recognize-"));
+  directories.push(directory);
+  writeFileSync(join(directory, "rus.traineddata"), "данные");
+
+  let terminated = 0;
+  const recognizer = liveRecognizer(directory, async () => ({
+    async recognize() {
+      throw new Error("воркер упал");
+    },
+    async terminate() {
+      terminated += 1;
+    },
+  }));
+
+  await assert.rejects(recognizer.recognize(Uint8Array.of(1)));
+  assert.equal(terminated, 1);
 });
